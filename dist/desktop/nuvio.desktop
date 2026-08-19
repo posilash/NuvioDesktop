@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Nuvio
+Comment=A modern media hub
+Exec=nuvio %u
+Icon=nuvio
+Categories=AudioVideo;Player;
+Terminal=false
+StartupNotify=true
+StartupWMClass=Nuvio
+MimeType=x-scheme-handler/nuvio;x-scheme-handler/stremio;
