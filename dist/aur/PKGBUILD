@@ -1,0 +1,72 @@
+# Maintainer: posi <posiibrahim@gmail.com>
+
+pkgname=nuvio-desktop
+_pkgname=nuvio
+pkgver=0.1.20_alpha.r2412.g4652268d
+pkgrel=1
+pkgdesc="A modern media hub desktop application (git)"
+arch=('x86_64')
+url="https://github.com/posilash/NuvioDesktop"
+license=('GPL-3.0-or-later')
+# No Java dependency: the Compose distributable bundles its own jlink runtime.
+# mpv/webkit2gtk/gtk3 back the player bridge; Xi, Xrender and Xtst are what the
+# bundled runtime's AWT toolkit loads.
+depends=('mpv' 'webkit2gtk-4.1' 'gtk3' 'gcc-libs' 'libx11' 'libxext' 'libxcomposite'
+         'libxi' 'libxrender' 'libxtst')
+makedepends=('git' 'java-environment>=17' 'pkgconf')
+provides=("${pkgname}")
+source=("${pkgname}::git+${url}.git#branch=linux")
+sha256sums=('SKIP')
+
+# Backend client config. Anon credentials, compiled into the binary as Kotlin
+# constants, so they are the same in every build; sign-in fails when unset.
+_supabase_url="https://api.nuvio.tv"
+_supabase_anon_key="eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJyb2xlIjoiYW5vbiIsImlzcyI6InN1cGFiYXNlIiwiaWF0IjoxNzgxNTIxMzQ2LCJleHAiOjE5MzkyMDEzNDZ9.tmQaj682pwzehpqlgCDMnySOqiUvpgRbrE43T4VJpDI"
+_supabase_fallback_url="https://api-two.nuvioapp.space"
+
+pkgver() {
+	cd "${srcdir}/${pkgname}"
+	local ver
+	ver=$(grep -oP '(?<=^VERSION_NAME=).*' composeApp/Configuration/DesktopVersion.properties)
+	printf "%s.r%s.g%s" "${ver//-/_}" "$(git rev-list --count HEAD)" "$(git rev-parse --short HEAD)"
+}
+
+prepare() {
+	cd "${srcdir}/${pkgname}"
+
+	# Gitignored, and the build fails without it.
+	cat >local.properties <<EOF
+NUVIO_SUPABASE_URL=${_supabase_url}
+NUVIO_SUPABASE_ANON_KEY=${_supabase_anon_key}
+NUVIO_SUPABASE_FALLBACK_URL=${_supabase_fallback_url}
+TRAKT_CLIENT_ID=
+TRAKT_CLIENT_SECRET=
+EOF
+}
+
+build() {
+	cd "${srcdir}/${pkgname}"
+
+	./gradlew --no-daemon :composeApp:createReleaseDistributable --no-configuration-cache
+}
+
+package() {
+	cd "${srcdir}/${pkgname}"
+
+	install -d "${pkgdir}/opt/${_pkgname}"
+	cp -Rp "composeApp/build/compose/binaries/main-release/app/Nuvio/." \
+		"${pkgdir}/opt/${_pkgname}/"
+
+	# Wrapper rather than a symlink: the launcher resolves the bundled runtime
+	# and the player bridge relative to the application image.
+	install -Dm755 /dev/stdin "${pkgdir}/usr/bin/${_pkgname}" <<'EOF'
+#!/bin/sh
+export LD_LIBRARY_PATH="/opt/nuvio/lib:/opt/nuvio/lib/runtime/lib:${LD_LIBRARY_PATH}"
+exec "/opt/nuvio/bin/Nuvio" "$@"
+EOF
+
+	install -Dm644 dist/desktop/nuvio.desktop \
+		"${pkgdir}/usr/share/applications/${_pkgname}.desktop"
+	install -Dm644 composeApp/src/desktopMain/resources/icons/nuvio-app-icon-transparent.png \
+		"${pkgdir}/usr/share/icons/hicolor/256x256/apps/${_pkgname}.png"
+}
