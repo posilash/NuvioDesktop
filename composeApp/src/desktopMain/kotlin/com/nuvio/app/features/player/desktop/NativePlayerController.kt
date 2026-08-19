@@ -598,6 +598,7 @@ internal class NativePlayerController(
             fontSize = style.toMpvSubtitleFontSize(),
             subPos = style.toMpvSubtitlePosition(),
             useLibass = useLibass,
+            stripSdh = style.stripSdh,
         )
     }
 
