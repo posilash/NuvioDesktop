@@ -1991,9 +1991,14 @@ JNIEXPORT void JNICALL NP(setSubtitleDelayMs)(JNIEnv *, jobject, jlong handle, j
 
 JNIEXPORT void JNICALL NP(applySubtitleStyle)(
     JNIEnv *env, jobject, jlong handle, jstring textColor, jstring /*backgroundColor*/,
-    jstring outlineColor, jfloat outlineSize, jboolean bold, jfloat fontSize, jint subPos) {
+    jstring outlineColor, jfloat outlineSize, jboolean bold, jfloat fontSize, jint subPos,
+    jboolean useLibass, jboolean stripSdh) {
     Player *p = asPlayer(handle);
     if (!p) return;
+    // Keep the track's own ASS styling when libass rendering is on, and let the
+    // settings below take over when it is off (matching the Windows bridge).
+    mpv_set_property_string(p->mpv, "sub-ass-override",
+                            useLibass == JNI_TRUE ? "scale" : "force");
     mpv_set_property_string(p->mpv, "sub-color", jstringToUtf8(env, textColor).c_str());
     mpv_set_property_string(p->mpv, "sub-border-color", jstringToUtf8(env, outlineColor).c_str());
     std::string border = std::to_string(outlineSize);
@@ -2003,6 +2008,9 @@ JNIEXPORT void JNICALL NP(applySubtitleStyle)(
     mpv_set_property_string(p->mpv, "sub-font-size", size.c_str());
     std::string pos = std::to_string(subPos);
     mpv_set_property_string(p->mpv, "sub-pos", pos.c_str());
+    // Strip captions written for deaf and hard-of-hearing viewers.
+    mpv_set_property_string(p->mpv, "sub-filter-sdh", stripSdh == JNI_TRUE ? "yes" : "no");
+    mpv_set_property_string(p->mpv, "sub-filter-sdh-harder", stripSdh == JNI_TRUE ? "yes" : "no");
 }
 
 // ---- Phase 2 stubs: webview controls / window chrome / focus ------------
