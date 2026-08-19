@@ -1418,6 +1418,193 @@ void runEventLoop(Player *player) {
     }
 }
 
+// ---- mpv configuration ---------------------------------------------------
+//
+// Nuvio embeds libmpv in an AWT X11 window and draws its own controls, so it
+// cannot hand the user's mpv setup to the player wholesale. Options are applied
+// in three ordered layers; mpv keeps the last value set for an option, so each
+// layer overrides the one before it:
+//
+//   1. DEFAULTS     a tuned starting point the user is free to override.
+//   2. USER CONFIG  <config-dir>/mpv_nuvio.conf, pulled in via `include`.
+//   3. INVARIANTS   what Nuvio needs to embed and drive playback, plus the
+//                   renderer/GPU context it picked where the user made no usable
+//                   choice; applied last, so no config can break the player.
+//
+// Nuvio reads mpv_nuvio.conf rather than the user's mpv.conf, and never
+// auto-loads scripts: OSC/UI scripts (modernz, uosc, ...) assume mpv owns the
+// window and fight Nuvio's controls overlay. Users keep mpv.conf for standalone
+// mpv and put Nuvio-specific tuning in mpv_nuvio.conf.
+
+// Absolute path of Nuvio's mpv config, or empty when no config dir resolves.
+// NUVIO_MPV_CONFIG_DIR overrides the directory; otherwise mpv's usual location
+// is used ($XDG_CONFIG_HOME/mpv, else ~/.config/mpv).
+std::string nuvioMpvConfigPath() {
+    std::string dir;
+    if (const char *env = getenv("NUVIO_MPV_CONFIG_DIR"); env && *env) {
+        dir = env;
+    } else if (const char *xdg = getenv("XDG_CONFIG_HOME"); xdg && *xdg) {
+        dir = std::string(xdg) + "/mpv";
+    } else if (const char *home = getenv("HOME"); home && *home) {
+        dir = std::string(home) + "/.config/mpv";
+    }
+    return dir.empty() ? std::string() : dir + "/mpv_nuvio.conf";
+}
+
+// One init attempt. Null members mean "leave to the user config", so a value the
+// user pinned is never overwritten by a retry.
+struct MpvAttempt {
+    const char *gpuContext;
+    const char *vo;
+};
+
+// Embedding draws into the host window's X11 "wid", which only mpv's X11 GPU
+// contexts can do. A Wayland/DRM/display context ignores "wid" and opens a
+// window of its own, so such a value is a misconfiguration rather than a
+// preference and must not be honored.
+bool isEmbeddableGpuContext(const std::string &context) {
+    return context == "x11" || context == "x11egl" || context == "x11vk";
+}
+
+// The settings Nuvio's init strategy reasons about, as they stand once
+// mpv_nuvio.conf has been applied.
+struct UserMpvConfig {
+    bool pinsGpuContext = false;
+    bool pinsVo = false;
+    std::string gpuContext;
+    std::string vo;
+    std::string hwdec;
+};
+
+// mpv exposes option values only after mpv_initialize, but the real player needs
+// the user's gpu-context *before* it initializes (the context cannot be changed
+// afterwards). Resolve it on a throwaway headless handle rather than parsing the
+// config file here: mpv applies its own include/profile/comment rules, so this
+// stays correct for configs a hand-written scanner would misread. Costs ~5 ms —
+// no window, no GPU, no audio device.
+UserMpvConfig probeUserMpvConfig(const std::string &confPath) {
+    UserMpvConfig cfg;
+    if (confPath.empty()) return cfg;
+    mpv_handle *m = mpv_create();
+    if (!m) return cfg;
+    mpv_set_option_string(m, "config", "no");
+    mpv_set_option_string(m, "load-scripts", "no");
+    mpv_set_option_string(m, "terminal", "no");
+    // Sentinels: anything still holding these afterwards was not set by the user.
+    mpv_set_option_string(m, "vo", "null");
+    mpv_set_option_string(m, "ao", "null");
+    mpv_set_option_string(m, "include", confPath.c_str());
+    if (mpv_initialize(m) >= 0) {
+        auto read = [&](const char *name, std::string &out) {
+            char *value = nullptr;
+            if (mpv_get_property(m, name, MPV_FORMAT_STRING, &value) >= 0 && value) {
+                out = value;
+                mpv_free(value);
+            }
+        };
+        read("gpu-context", cfg.gpuContext);
+        read("vo", cfg.vo);
+        read("hwdec", cfg.hwdec);
+        // An unset gpu-context reads back empty; vo still reads "null" (ours).
+        // "auto" is mpv's own probe, which may land on Wayland — treat it, and any
+        // context that cannot embed, as unset so Nuvio's X11 probe order applies.
+        cfg.pinsGpuContext = isEmbeddableGpuContext(cfg.gpuContext);
+        cfg.pinsVo = !cfg.vo.empty() && cfg.vo != "null";
+        if (!cfg.gpuContext.empty() && !cfg.pinsGpuContext) {
+            NUVIO_ERR("ignoring gpu-context=%s from %s: it cannot embed into the "
+                      "player window; use x11vk or x11egl",
+                      cfg.gpuContext.c_str(), confPath.c_str());
+        }
+    } else {
+        NUVIO_ERR("could not probe %s; using Nuvio defaults", confPath.c_str());
+    }
+    mpv_destroy(m);
+    return cfg;
+}
+
+// Layer 1 — overridable by mpv_nuvio.conf.
+void applyMpvDefaults(mpv_handle *m) {
+    // Hardware decoding; gpu-hwdec-interop lets the VO take the direct path
+    // instead of copying frames back through system memory.
+    mpv_set_option_string(m, "hwdec", "auto");
+    mpv_set_option_string(m, "gpu-hwdec-interop", "auto");
+    mpv_set_option_string(m, "vd-lavc-threads", "0");
+    mpv_set_option_string(m, "audio-channels", "auto");
+    // Hand the display the source colorimetry where the compositor supports it,
+    // rather than tone-mapping to SDR unconditionally.
+    mpv_set_option_string(m, "target-colorspace-hint", "yes");
+    mpv_set_option_string(m, "target-colorspace-hint-mode", "source");
+}
+
+// Layer 3a — the renderer and GPU context Nuvio selected for this attempt. Both
+// are null whenever the user made a usable choice of their own, so this only ever
+// fills a gap; it runs after the include so a value Nuvio had to reject (an
+// unembeddable gpu-context) cannot survive.
+void applyMpvAttempt(mpv_handle *m, const MpvAttempt &attempt) {
+    // gpu-next (libplacebo) is the modern renderer; it implements the
+    // tone-mapping, gamut-mapping and peak-detection paths vo_gpu falls back on.
+    if (attempt.vo) mpv_set_option_string(m, "vo", attempt.vo);
+    if (attempt.gpuContext) mpv_set_option_string(m, "gpu-context", attempt.gpuContext);
+}
+
+// Layer 3b — applied after the user config, so these always win.
+void applyMpvInvariants(mpv_handle *m, const std::string &wid,
+                        const std::string &headerFields, jlong initialPositionMs,
+                        bool playWhenReady, jint decoderPriority) {
+    // Never read the user's mpv.conf, and never auto-load scripts.
+    mpv_set_option_string(m, "config", "no");
+    mpv_set_option_string(m, "load-scripts", "no");
+    // Embed into the host AWT Canvas's X11 window.
+    if (!wid.empty()) mpv_set_option_string(m, "wid", wid.c_str());
+    // Nuvio renders its own controls: keep mpv silent and non-interactive.
+    mpv_set_option_string(m, "osc", "no");
+    mpv_set_option_string(m, "osd-level", "0");
+    mpv_set_option_string(m, "input-default-bindings", "no");
+    mpv_set_option_string(m, "input-vo-keyboard", "no");
+    mpv_set_option_string(m, "input-cursor", "no");
+    mpv_set_option_string(m, "cursor-autohide", "no");
+    // The app owns playlist and lifecycle; mpv idles instead of exiting at EOF.
+    mpv_set_option_string(m, "keep-open", "yes");
+    mpv_set_option_string(m, "idle", "yes");
+    mpv_set_option_string(m, "force-seekable", "yes");
+    // Bring the VO/OSD up before the first decoded frame so the controls overlay
+    // (including the loading screen) can render via overlay-add while a slow or
+    // non-faststart file is still opening, instead of leaving a black gap. This
+    // also makes mpv_initialize surface the GPU-context failures the attempt loop
+    // relies on.
+    mpv_set_option_string(m, "force-window", "immediate");
+
+    // Decoder priority comes from Nuvio's settings UI, so it outranks the config:
+    // 0 = hardware only, 2 = software only, anything else = hardware with a
+    // software fallback.
+    if (decoderPriority == 0) {
+        mpv_set_option_string(m, "vd-lavc-software-fallback", "no");
+    } else if (decoderPriority == 2) {
+        mpv_set_option_string(m, "hwdec", "no");
+        mpv_set_option_string(m, "vd-lavc-software-fallback", "yes");
+    } else {
+        mpv_set_option_string(m, "vd-lavc-software-fallback", "yes");
+    }
+
+    // NUVIO_MPV_AUDIO_DEVICE pins the output device (names from
+    // `mpv --audio-device=help`) for HDMI/passthrough testing. Unset leaves mpv's
+    // default routing, i.e. the system default sink.
+    if (const char *audioDevice = getenv("NUVIO_MPV_AUDIO_DEVICE");
+        audioDevice && *audioDevice) {
+        mpv_set_option_string(m, "audio-device", audioDevice);
+    }
+
+    // Per-playback state supplied by the caller.
+    if (!headerFields.empty()) {
+        mpv_set_option_string(m, "http-header-fields", headerFields.c_str());
+    }
+    if (initialPositionMs > 0) {
+        std::string start = std::to_string(initialPositionMs / 1000.0);
+        mpv_set_option_string(m, "start", start.c_str());
+    }
+    if (!playWhenReady) mpv_set_option_string(m, "pause", "yes");
+}
+
 } // namespace
 
 extern "C" JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM *vm, void *) {
@@ -1494,115 +1681,74 @@ JNIEXPORT jlong JNICALL NP(create)(
         if (!headers.empty()) headerFields = joinHeaderFields(headers);
     }
 
-    auto configure = [&](mpv_handle *m, const char *gpuCtx, const char *hwdec) {
+    // Resolve the user's config once, then apply the three option layers in order
+    // for every attempt (see the "mpv configuration" note above).
+    const std::string nuvioConf = nuvioMpvConfigPath();
+    const UserMpvConfig userCfg = probeUserMpvConfig(nuvioConf);
+    if (!nuvioConf.empty()) {
+        NUVIO_LOG("mpv config %s: vo=%s gpu-context=%s hwdec=%s", nuvioConf.c_str(),
+                  userCfg.pinsVo ? userCfg.vo.c_str() : "(default)",
+                  userCfg.pinsGpuContext ? userCfg.gpuContext.c_str() : "(default)",
+                  userCfg.hwdec.empty() ? "(default)" : userCfg.hwdec.c_str());
+    }
+
+    auto configure = [&](mpv_handle *m, const MpvAttempt &attempt) {
         // Surface mpv's own diagnostics (drained by the event thread).
         mpv_request_log_messages(m, nuvioDebug() ? "v" : "no");
-        // Embed into the host AWT Canvas's X11 window.
-        if (!wid.empty()) mpv_set_option_string(m, "wid", wid.c_str());
-
-        // Nuvio renders its own controls; keep mpv silent and non-interactive.
-        mpv_set_option_string(m, "osc", "no");
-        mpv_set_option_string(m, "osd-level", "0");
-        mpv_set_option_string(m, "input-default-bindings", "no");
-        mpv_set_option_string(m, "input-vo-keyboard", "no");
-        mpv_set_option_string(m, "input-cursor", "no");
-        mpv_set_option_string(m, "cursor-autohide", "no");
-        mpv_set_option_string(m, "keep-open", "yes");
-        mpv_set_option_string(m, "idle", "yes");
-        mpv_set_option_string(m, "vo", "gpu");
-        // Bring the VO/OSD up immediately (before the first decoded frame) so the
-        // controls overlay — including the loading screen — can render via
-        // overlay-add while a slow/non-faststart file is still opening, instead of
-        // a black gap. (This also makes mpv_initialize itself surface GPU-context
-        // failures, which the attempt loop below relies on.)
-        mpv_set_option_string(m, "force-window", "immediate");
-        // Force an X11 GPU context so mpv embeds into the host window's X11
-        // "wid". Under a Wayland session mpv would otherwise pick its native
-        // Wayland backend, which cannot embed into a foreign surface and opens
-        // a separate window instead. The host AWT window is X11 (XWayland), so
-        // X11 embedding composites correctly inside the Nuvio window.
-        mpv_set_option_string(m, "gpu-context", gpuCtx);
-        mpv_set_option_string(m, "force-seekable", "yes");
-
-        // Decoder config mirrors the macOS bridge for parity (mac: hwdec=auto +
-        // gpu-hwdec-interop=auto + decoderPriority handling). gpu-hwdec-interop=auto
-        // lets vo=gpu use direct hardware decode instead of the slow copy-back path.
-        mpv_set_option_string(m, "audio-channels", "auto");
-        // NUVIO_MPV_AUDIO_DEVICE pins mpv's audio output device (names from
-        // `mpv --audio-device=help`) for HDMI/passthrough testing — same role
-        // as the GPU_CONTEXT/HWDEC overrides below. Unset = mpv's default
-        // routing (the system default sink).
-        const char *audioDevEnv = getenv("NUVIO_MPV_AUDIO_DEVICE");
-        if (audioDevEnv && *audioDevEnv) {
-            mpv_set_option_string(m, "audio-device", audioDevEnv);
-        }
-        mpv_set_option_string(m, "hwdec", hwdec);
-        mpv_set_option_string(m, "gpu-hwdec-interop", "auto");
-        if (decoderPriority == 0) {
-            mpv_set_option_string(m, "vd-lavc-software-fallback", "no");
-        } else if (decoderPriority == 2) {
-            mpv_set_option_string(m, "hwdec", "no");
-            mpv_set_option_string(m, "vd-lavc-software-fallback", "yes");
-        } else {
-            mpv_set_option_string(m, "vd-lavc-software-fallback", "yes");
-        }
-        mpv_set_option_string(m, "vd-lavc-threads", "0");
-        mpv_set_option_string(m, "target-colorspace-hint", "yes");
-        mpv_set_option_string(m, "target-colorspace-hint-mode", "source");
-
-        if (!headerFields.empty()) {
-            mpv_set_option_string(m, "http-header-fields", headerFields.c_str());
-        }
-        if (initialPositionMs > 0) {
-            std::string start = std::to_string(initialPositionMs / 1000.0);
-            mpv_set_option_string(m, "start", start.c_str());
-        }
-        if (!playWhenReady) {
-            mpv_set_option_string(m, "pause", "yes");
-        }
+        applyMpvDefaults(m);
+        if (!nuvioConf.empty()) mpv_set_option_string(m, "include", nuvioConf.c_str());
+        applyMpvAttempt(m, attempt);
+        applyMpvInvariants(m, wid, headerFields, initialPositionMs,
+                           playWhenReady == JNI_TRUE, decoderPriority);
     };
 
-    // Attempt 1: x11egl — the proven path on Mesa (Intel/AMD). Attempt 2: x11vk —
-    // NVIDIA's proprietary EGL refuses to make a context current on the foreign
-    // AWT window (mpv_initialize fails via force-window=immediate), while Vulkan
-    // embeds fine there; its native hwdec interop corrupts frames on NVIDIA, so
-    // the retry pairs it with copy-back NVDEC (harmless elsewhere: unavailable
-    // hwdec just falls back to software). NUVIO_MPV_GPU_CONTEXT / NUVIO_MPV_HWDEC
-    // env overrides pin a single attempt for testing.
-    const char *gpuCtxEnv = getenv("NUVIO_MPV_GPU_CONTEXT");
-    const char *hwdecEnv = getenv("NUVIO_MPV_HWDEC");
-    bool ctxPinned = gpuCtxEnv && *gpuCtxEnv;
-    struct Attempt { const char *ctx; const char *hwdec; };
-    Attempt attempts[2] = {
-        {ctxPinned ? gpuCtxEnv : "x11egl", (hwdecEnv && *hwdecEnv) ? hwdecEnv : "auto"},
-        {"x11vk", (hwdecEnv && *hwdecEnv) ? hwdecEnv : "nvdec-copy"},
-    };
-    int nAttempts = ctxPinned ? 1 : 2;
+    // Nuvio only ever second-guesses its own defaults. Whatever the user pinned in
+    // mpv_nuvio.conf is re-applied by the include layer on every attempt, so a
+    // pinned setting is tried exactly once instead of being retried identically.
+    //
+    // Otherwise probe the two X11 contexts: x11vk first, because NVIDIA's
+    // proprietary EGL refuses to make a context current on the foreign AWT window
+    // (x11egl then fails at mpv_initialize), while Vulkan embeds there correctly;
+    // x11egl second, as the proven path on Mesa and on drivers without Vulkan. The
+    // last entry drops back to the legacy gpu VO for builds whose libmpv has no
+    // libplacebo, and is skipped when the user chose their own VO.
+    std::vector<MpvAttempt> attempts;
+    if (userCfg.pinsGpuContext) {
+        attempts.push_back({nullptr, userCfg.pinsVo ? nullptr : "gpu-next"});
+    } else {
+        attempts.push_back({"x11vk", userCfg.pinsVo ? nullptr : "gpu-next"});
+        attempts.push_back({"x11egl", userCfg.pinsVo ? nullptr : "gpu-next"});
+        if (!userCfg.pinsVo) attempts.push_back({"x11egl", "gpu"});
+    }
+
     int initResult = MPV_ERROR_GENERIC;
-    for (int a = 0; a < nAttempts; ++a) {
+    for (size_t a = 0; a < attempts.size(); ++a) {
         if (!player->mpv) player->mpv = mpv_create();
         if (!player->mpv) {
             NUVIO_ERR("mpv_create() returned NULL on retry");
             break;
         }
-        configure(player->mpv, attempts[a].ctx, attempts[a].hwdec);
+        configure(player->mpv, attempts[a]);
         initResult = mpv_initialize(player->mpv);
         if (initResult >= 0) {
             if (a > 0) {
-                NUVIO_ERR("gpu-context %s failed to initialize; using %s instead",
-                          attempts[0].ctx, attempts[a].ctx);
+                NUVIO_ERR("mpv initialized on fallback attempt %zu (gpu-context=%s vo=%s)",
+                          a + 1, attempts[a].gpuContext ? attempts[a].gpuContext : "(config)",
+                          attempts[a].vo ? attempts[a].vo : "(config)");
             }
             break;
         }
-        NUVIO_ERR("mpv_initialize failed (gpu-context=%s): %s", attempts[a].ctx,
+        NUVIO_ERR("mpv_initialize failed (gpu-context=%s vo=%s): %s",
+                  attempts[a].gpuContext ? attempts[a].gpuContext : "(config)",
+                  attempts[a].vo ? attempts[a].vo : "(config)",
                   mpv_error_string(initResult));
         // Drain any queued log messages explaining the failure.
         for (int i = 0; i < 50; ++i) {
             mpv_event *ev = mpv_wait_event(player->mpv, 0.0);
             if (!ev || ev->event_id == MPV_EVENT_NONE) break;
             if (ev->event_id == MPV_EVENT_LOG_MESSAGE) {
-                auto *m = static_cast<mpv_event_log_message *>(ev->data);
-                if (m) NUVIO_LOG("mpv[%s] %s: %s", m->level, m->prefix, m->text);
+                auto *msg = static_cast<mpv_event_log_message *>(ev->data);
+                if (msg) NUVIO_LOG("mpv[%s] %s: %s", msg->level, msg->prefix, msg->text);
             }
         }
         mpv_destroy(player->mpv);
