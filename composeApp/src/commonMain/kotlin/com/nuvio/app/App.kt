@@ -193,8 +193,11 @@ import com.nuvio.app.features.p2p.P2pConsentDialog
 import com.nuvio.app.features.p2p.P2pSettingsRepository
 import com.nuvio.app.features.player.PlayerLaunch
 import com.nuvio.app.features.player.PlayerLaunchStore
+import com.nuvio.app.features.player.PlayerBackReleaseGuard
+import com.nuvio.app.features.player.PlayerBackRequest
 import com.nuvio.app.features.player.PlayerScreen
 import com.nuvio.app.features.player.PlayerPlaybackSnapshot
+import com.nuvio.app.features.player.dispatchNavigationBack
 import com.nuvio.app.features.player.ExternalPlayerIntentResult
 import com.nuvio.app.features.player.ExternalPlayerPlatform
 import com.nuvio.app.features.player.ExternalPlayerPlaybackRequest
@@ -915,6 +918,9 @@ private fun MainAppContent(
             warmProfileBoundRepositories()
         }
         val currentRoute = navBackStack.lastOrNull() as? AppRoute
+        var registeredPlayerSystemBack by remember {
+            mutableStateOf<Pair<PlayerRoute, () -> Unit>?>(null)
+        }
         val liquidGlassNativeTabBarEnabled by remember {
             ThemeSettingsRepository.liquidGlassNativeTabBarEnabled
         }.collectAsStateWithLifecycle()
@@ -1950,7 +1956,16 @@ private fun MainAppContent(
                 NavDisplay(
                     backStack = navBackStack,
                     modifier = Modifier.fillMaxSize(),
-                    onBack = { navController.popBackStack() },
+                    onBack = {
+                        val routeAtRequest = navController.currentRoute
+                        dispatchNavigationBack(
+                            isPlayerRoute = routeAtRequest is PlayerRoute,
+                            playerBack = registeredPlayerSystemBack
+                                ?.takeIf { (route, _) -> route == routeAtRequest }
+                                ?.second,
+                            pop = { navController.popBackStack() },
+                        )
+                    },
                     entryDecorators = listOf(
                         rememberSaveableStateHolderNavEntryDecorator<NavKey>(),
                         routeDisposalDecorator,
@@ -3049,7 +3064,7 @@ private fun MainAppContent(
                         emptyMap()
                     },
                 ) { route ->
-                    val onBack = rememberGuardedPopBackStack(
+                    val popBack = rememberGuardedPopBackStack(
                         navController = navController,
                         route = route,
                         beforePop = ResumePromptRepository::markPlayerExitedNormally,
@@ -3057,10 +3072,26 @@ private fun MainAppContent(
                     val launch = remember(route.launchId) { PlayerLaunchStore.get(route.launchId) }
                     if (launch == null) {
                         LaunchedEffect(route.launchId) {
-                            onBack()
+                            popBack()
                         }
                         Box(modifier = Modifier.fillMaxSize())
                         return@entry
+                    }
+                    val onBack = rememberGuardedPlayerPopBackStack(
+                        navController = navController,
+                        route = route,
+                        beforePop = ResumePromptRepository::markPlayerExitedNormally,
+                    )
+                    val registerSystemBack = remember(route) {
+                        { handler: (() -> Unit)? ->
+                            if (handler == null) {
+                                if (registeredPlayerSystemBack?.first == route) {
+                                    registeredPlayerSystemBack = null
+                                }
+                            } else {
+                                registeredPlayerSystemBack = route to handler
+                            }
+                        }
                     }
                     LaunchedEffect(launch.videoId) {
                         launch.videoId?.let { ResumePromptRepository.markPlayerEntered(it) }
@@ -3099,6 +3130,7 @@ private fun MainAppContent(
                         initialProgressFraction = launch.initialProgressFraction,
                         contentLanguage = launch.contentLanguage,
                         onBack = onBack,
+                        onSystemBackHandlerChanged = registerSystemBack,
                         onOpenInExternalPlayer = if (externalPlayerSupported) { { request ->
                             val playerLaunch = PlayerLaunch(
                                 profileId = launch.profileId,
@@ -3823,6 +3855,32 @@ private fun rememberGuardedPopBackStack(
                 beforePop()
                 navController.popBackStack(expectedRoute = route)
             }
+        }
+    }
+}
+
+@Composable
+private fun rememberGuardedPlayerPopBackStack(
+    navController: NuvioNavigator,
+    route: AppRoute,
+    beforePop: () -> Unit = {},
+): PlayerBackRequest {
+    val guard = remember(route) { PlayerBackReleaseGuard() }
+
+    return remember(navController, route, beforePop, guard) {
+        { releaseBeforeBack ->
+            guard.request(
+                canStart = {
+                    navController.currentRoute == route &&
+                        navController.canPopBackStack(expectedRoute = route)
+                },
+                releaseBeforeBack = releaseBeforeBack,
+                beforePop = beforePop,
+                pop = {
+                    navController.currentRoute == route &&
+                        navController.popBackStack(expectedRoute = route)
+                },
+            )
         }
     }
 }

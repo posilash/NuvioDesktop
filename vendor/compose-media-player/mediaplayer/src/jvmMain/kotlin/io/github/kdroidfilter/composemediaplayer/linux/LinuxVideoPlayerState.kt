@@ -713,8 +713,11 @@ class LinuxVideoPlayerState : VideoPlayerState {
     }
 
     override fun clearError() {
+        // Main.immediate: when already on the main thread (Compose effects call
+        // this from it) run inline instead of dispatching onto the thread that
+        // runBlocking just parked - plain Dispatchers.Main deadlocks the EDT.
         runBlocking {
-            withContext(Dispatchers.Main) { error = null }
+            withContext(Dispatchers.Main.immediate) { error = null }
         }
     }
 

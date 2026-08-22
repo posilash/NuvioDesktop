@@ -18,6 +18,7 @@ import androidx.compose.ui.window.rememberWindowState
 import androidx.compose.ui.unit.dp
 import com.nuvio.app.core.deeplink.handleAppUrl
 import com.nuvio.app.core.diagnostics.SentryInitializer
+import com.nuvio.app.core.ui.NuvioTheme
 import com.nuvio.app.features.discordrpc.DiscordPresenceManager
 import com.nuvio.app.features.p2p.P2pStreamingEngine
 import com.nuvio.app.features.plugins.configureDesktopQuickJsLibrary
@@ -204,13 +205,17 @@ fun main(args: Array<String>) {
             if (smokePlayerUrl == null) {
                 App()
             } else {
-                PlatformPlayerSurface(
-                    sourceUrl = smokePlayerUrl,
-                    modifier = Modifier.fillMaxSize(),
-                    onControllerReady = {},
-                    onSnapshot = {},
-                    onError = {},
-                )
+                // The player surface reads LocalNuvioPlatformDensity, which only
+                // NuvioTheme provides — the bare smoke harness must supply it too.
+                NuvioTheme {
+                    PlatformPlayerSurface(
+                        sourceUrl = smokePlayerUrl,
+                        modifier = Modifier.fillMaxSize(),
+                        onControllerReady = {},
+                        onSnapshot = {},
+                        onError = {},
+                    )
+                }
             }
         }
     }
