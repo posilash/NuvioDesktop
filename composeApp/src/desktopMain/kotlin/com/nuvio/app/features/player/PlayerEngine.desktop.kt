@@ -55,6 +55,24 @@ actual fun PlatformPlayerSurface(
     onSnapshot: (PlayerPlaybackSnapshot) -> Unit,
     onError: (String?) -> Unit,
 ) {
+    // An AWT-free host renders video itself, into the same GL context Compose
+    // draws into, so there is no component to embed and SwingPanel -- which
+    // needs LocalInteropContainer, and therefore an AWT-backed scene -- must
+    // not be used. See WaylandVideoBridge.
+    if (com.nuvio.app.features.player.desktop.WaylandVideoBridge.isAvailable) {
+        com.nuvio.app.features.player.desktop.WaylandPlayerSurface(
+            sourceUrl = sourceUrl,
+            sourceHeaders = sourceHeaders,
+            modifier = modifier,
+            playWhenReady = playWhenReady,
+            initialPositionMs = initialPositionMs ?: 0L,
+            onControllerReady = onControllerReady,
+            onSnapshot = onSnapshot,
+            onError = onError,
+        )
+        return
+    }
+
     if (DesktopHostOs.current == DesktopHostOs.MACOS ||
         DesktopHostOs.current == DesktopHostOs.WINDOWS ||
         DesktopHostOs.current == DesktopHostOs.LINUX

@@ -88,6 +88,15 @@ class Mpv private constructor(private val handle: MemorySegment, private val are
         private val mpvRenderContextFree by lazy {
             fn("mpv_render_context_free", FunctionDescriptor.ofVoid(ADDRESS))
         }
+        private val mpvSetPropertyString by lazy {
+            fn("mpv_set_property_string", FunctionDescriptor.of(JAVA_INT, ADDRESS, ADDRESS, ADDRESS))
+        }
+        private val mpvGetPropertyString by lazy {
+            fn("mpv_get_property_string", FunctionDescriptor.of(ADDRESS, ADDRESS, ADDRESS))
+        }
+        private val mpvFree by lazy {
+            fn("mpv_free", FunctionDescriptor.ofVoid(ADDRESS))
+        }
 
         /** Load libmpv. Pass an explicit path to use a build other than the system one. */
         fun load(path: String?): Boolean = runCatching {
@@ -224,6 +233,26 @@ class Mpv private constructor(private val handle: MemorySegment, private val are
             mpvRenderContextRender.invokeExact(renderCtx, params) as Int
         }
     }
+
+    fun setProperty(name: String, value: String) {
+        Arena.ofConfined().use { a ->
+            mpvSetPropertyString.invokeExact(
+                handle, a.allocateFrom(name), a.allocateFrom(value),
+            ) as Int
+        }
+    }
+
+    /** Null when the property is unavailable, which mpv reports routinely. */
+    fun getProperty(name: String): String? = Arena.ofConfined().use { a ->
+        val p = mpvGetPropertyString.invokeExact(handle, a.allocateFrom(name)) as MemorySegment
+        if (p.equals(MemorySegment.NULL)) return null
+        val s = p.reinterpret(Long.MAX_VALUE).getString(0)
+        mpvFree.invokeExact(p)
+        s
+    }
+
+    fun getDouble(name: String): Double? = getProperty(name)?.toDoubleOrNull()
+    fun getBoolean(name: String): Boolean? = getProperty(name)?.let { it == "yes" || it == "true" }
 
     fun close() {
         if (!renderCtx.equals(MemorySegment.NULL)) {

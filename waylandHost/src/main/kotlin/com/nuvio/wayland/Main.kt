@@ -12,6 +12,8 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.asComposeCanvas
+import androidx.compose.ui.graphics.drawscope.drawIntoCanvas
+import androidx.compose.ui.graphics.nativeCanvas
 import androidx.compose.ui.unit.Constraints
 import androidx.compose.ui.unit.Density
 import androidx.compose.ui.unit.dp
@@ -95,8 +97,10 @@ fun main() {
     // legacy one.
     val mediaUrl = System.getProperty("nuvio.wayland.media")
     val mpvPath = System.getProperty("nuvio.wayland.libmpv")
+    val runRealAppEarly = System.getProperty("nuvio.wayland.realApp")?.toBoolean() ?: false
     var mpv: Mpv? = null
-    if (mediaUrl != null) {
+    var videoHost: WaylandVideoHost? = null
+    if (mediaUrl != null || runRealAppEarly) {
         if (!Mpv.load(mpvPath)) {
             System.err.println("FAIL: could not load libmpv (nuvio.wayland.libmpv=$mpvPath)")
             exitProcess(1)
@@ -105,7 +109,7 @@ fun main() {
             setOption("config", "no")
             setOption("terminal", "yes")
             setOption("msg-level", "all=info")
-            setOption("audio", "no")
+            if (!runRealAppEarly) setOption("audio", "no")
             setOption("vo", "libmpv")
             System.getProperty("nuvio.wayland.hwdec")?.let { setOption("hwdec", it) }
             initialize()
@@ -114,9 +118,19 @@ fun main() {
                     glfwGetProcAddress(name)
                 }
             }
-            command("loadfile", mediaUrl)
+            if (mediaUrl != null) command("loadfile", mediaUrl)
         }
         println("mpv render context: ${Mpv.MPV_RENDER_API_TYPE_OPENGL_NEXT}")
+        run {
+            // Hand the app a video sink so its player surface stops reaching
+            // for SwingPanel, which needs an AWT-backed scene we do not have.
+            videoHost = WaylandVideoHost(mpv!!, context)
+            if (runRealAppEarly) {
+                com.nuvio.app.features.player.desktop.WaylandVideoBridge.delegate = videoHost
+                println("video bridge: installed")
+            }
+            if (mediaUrl != null) videoHost!!.markLoaded()
+        }
     }
 
     var width = INITIAL_WIDTH
@@ -140,6 +154,7 @@ fun main() {
     java.awt.EventQueue.invokeAndWait { recreateSurface() }
 
     var frames by mutableStateOf(0)
+    val probePixels = System.getProperty("nuvio.wayland.probe")?.toBoolean() ?: false
 
     val scene: ComposeScene = CanvasLayersComposeScene(
         density = Density(1f),
@@ -147,6 +162,10 @@ fun main() {
         coroutineContext = MainUIDispatcher,
     )
     val runRealApp = System.getProperty("nuvio.wayland.realApp")?.toBoolean() ?: false
+    // Drives the app's own player surface directly, so playback can be
+    // exercised without clicking through the UI. Mirrors Main.kt's
+    // smokePlayerUrl harness.
+    val smokePlayerUrl = System.getProperty("nuvio.wayland.smokePlayer")
     java.awt.EventQueue.invokeAndWait {
     if (runRealApp) {
         // Same preamble Main.kt runs before showing its window. initGtkEarly is
@@ -155,11 +174,34 @@ fun main() {
         com.nuvio.app.features.profiles.ProfileRepository.loadCachedProfiles()
         // AppIconRepository is skipped: it only feeds the AWT window icon, and
         // GLFW sets ours.
-        scene.setContent { com.nuvio.app.App() }
-        println("content: real Nuvio app")
+        if (smokePlayerUrl != null) {
+            scene.setContent {
+                com.nuvio.app.core.ui.NuvioTheme {
+                    com.nuvio.app.features.player.PlatformPlayerSurface(
+                        sourceUrl = smokePlayerUrl,
+                        modifier = Modifier.fillMaxSize(),
+                        onControllerReady = {},
+                        onSnapshot = {},
+                        onError = { println("player error: $it") },
+                    )
+                }
+            }
+            println("content: player smoke harness")
+        } else {
+            scene.setContent { com.nuvio.app.App() }
+            println("content: real Nuvio app")
+        }
     } else {
         scene.setContent {
             Box(Modifier.fillMaxSize()) {
+                val vh = videoHost
+                if (vh != null) {
+                    androidx.compose.foundation.Canvas(Modifier.fillMaxSize()) {
+                        drawIntoCanvas { c ->
+                            vh.drawVideo(c.nativeCanvas, size.width, size.height)
+                        }
+                    }
+                }
                 Column(Modifier.padding(32.dp)) {
                     Text("Compose on Wayland, without AWT", color = Color(0xFFE0E0E0))
                     Text("GLFW platform: $platformName", color = Color(0xFF9AD29A))
@@ -196,19 +238,32 @@ fun main() {
 
         val s = surface ?: return
 
-        if (mpv != null) {
-            // Video first, straight into the window framebuffer, then
-            // Compose composites its UI on top of it. Skia must be told
-            // its cached GL state is stale, because mpv has been issuing
-            // its own GL calls against the same context.
-            if (mpv.hasNewFrame()) mpv.render(0, width, height)
-            context.resetGLAll()
-        } else {
-            s.canvas.clear(0xFF101014.toInt())
-        }
+        // Video goes into an offscreen texture, never into the window, so it
+        // composites as ordinary Compose content rather than sitting under the
+        // scene where any opaque background would cover it.
+        videoHost?.renderFrame(width, height)
+
+        s.canvas.clear(0xFF101014.toInt())
 
         scene.render(s.canvas.asComposeCanvas(), System.nanoTime())
         context.flush()
+
+        if (probePixels && frames % 15 == 0) {
+            // Same pixel, now after Compose has drawn. If mpv's value was
+            // non-black and this is black, Compose is painting over the video.
+            val px2 = java.nio.ByteBuffer.allocateDirect(4)
+            GL30.glBindFramebuffer(GL30.GL_FRAMEBUFFER, 0)
+            GL11.glReadPixels(
+                width / 2, height / 2, 1, 1,
+                GL11.GL_RGBA, GL11.GL_UNSIGNED_BYTE, px2,
+            )
+            println(
+                "probe: centre pixel after compose = " +
+                    "${px2.get(0).toInt() and 0xFF}," +
+                    "${px2.get(1).toInt() and 0xFF}," +
+                    "${px2.get(2).toInt() and 0xFF}",
+            )
+        }
         glfwSwapBuffers(window)
 
         frames++
