@@ -180,6 +180,16 @@ fun main() {
             setOption("save-position-on-quit", "no")
             System.getProperty("nuvio.wayland.hwdec")?.let { setOption("hwdec", it) }
             initialize()
+            // Event loop owns the queue; observed properties feed the state
+            // cache. Log forwarding rides the same thread under videoLog.
+            for (prop in WaylandVideoHost.OBSERVED_PROPERTIES) observeProperty(prop)
+            startEventLoop(
+                if (System.getProperty("nuvio.wayland.videoLog")?.toBoolean() == true) {
+                    { line: String -> println(line) }
+                } else {
+                    null
+                },
+            )
             if (System.getProperty("nuvio.wayland.videoLog")?.toBoolean() == true) {
                 requestLogMessages("v")
             }
@@ -501,7 +511,6 @@ fun main() {
         val ui = uiSurface ?: return false
 
         if (videoLog) {
-            mpv?.pumpEvents { println(it) }
             videoHost?.report(System.nanoTime())?.let {
                 println("[wayland-video] $it rss=${rssMb()}MB heap=${Runtime.getRuntime().let { r -> (r.totalMemory() - r.freeMemory()) / 1_048_576 }}MB")
             }

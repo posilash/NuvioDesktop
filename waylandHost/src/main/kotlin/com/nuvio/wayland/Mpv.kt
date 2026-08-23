@@ -127,6 +127,10 @@ class Mpv private constructor(private val handle: MemorySegment, private val are
         private val mpvRequestLogMessages by lazy {
             fn("mpv_request_log_messages", FunctionDescriptor.of(JAVA_INT, ADDRESS, ADDRESS))
         }
+        private val mpvObserveProperty by lazy {
+            fn("mpv_observe_property", FunctionDescriptor.of(JAVA_INT, ADDRESS,
+                JAVA_LONG, ADDRESS, JAVA_INT))
+        }
         private val mpvWaitEvent by lazy {
             fn("mpv_wait_event", FunctionDescriptor.of(ADDRESS, ADDRESS,
                 java.lang.foreign.ValueLayout.JAVA_DOUBLE))
@@ -374,6 +378,82 @@ class Mpv private constructor(private val handle: MemorySegment, private val are
         }
     }
 
+    /** Subscribe to string-format change events for [name]. */
+    fun observeProperty(name: String) {
+        Arena.ofConfined().use { a ->
+            // MPV_FORMAT_STRING = 1: every observed value arrives as text,
+            // parsed at read time -- one code path, no per-type marshalling.
+            mpvObserveProperty.invokeExact(handle, 0L, a.allocateFrom(name), 1) as Int
+        }
+    }
+
+    /**
+     * The event loop, on its own thread -- the only consumer of mpv's event
+     * queue. Observed property changes land in [properties]; playback state
+     * reads become cache hits instead of core-lock round-trips. That is the
+     * design point: property polling -- from any thread -- contends with the
+     * core while the video thread paces inside render(), and the measured
+     * result was 66ms present gaps at the poll rate. The core pushes; nobody
+     * polls.
+     */
+    val properties = java.util.concurrent.ConcurrentHashMap<String, String>()
+
+    private val shutdownLatch = java.util.concurrent.CountDownLatch(1)
+    private var eventThread: Thread? = null
+
+    fun startEventLoop(logSink: ((String) -> Unit)?) {
+        check(eventThread == null)
+        eventThread = Thread({
+            while (true) {
+                val ev = mpvWaitEvent.invokeExact(handle, 0.5) as MemorySegment
+                if (ev.equals(MemorySegment.NULL)) continue
+                val e = ev.reinterpret(64)
+                when (e.get(JAVA_INT, 0)) {
+                    0 -> {} // MPV_EVENT_NONE: timeout tick
+                    1 -> {  // MPV_EVENT_SHUTDOWN: core is gone; stop consuming
+                        shutdownLatch.countDown()
+                        return@Thread
+                    }
+                    2 -> if (logSink != null) { // MPV_EVENT_LOG_MESSAGE
+                        val data = e.get(ADDRESS, 16)
+                        if (!data.equals(MemorySegment.NULL)) {
+                            val d = data.reinterpret(32)
+                            val prefix = d.get(ADDRESS, 0).reinterpret(Long.MAX_VALUE).getString(0)
+                            val text = d.get(ADDRESS, 16).reinterpret(Long.MAX_VALUE).getString(0)
+                            logSink("[mpv/$prefix] " + text.trimEnd())
+                        }
+                    }
+                    22 -> { // MPV_EVENT_PROPERTY_CHANGE
+                        // struct mpv_event_property { name; format:int; data; }
+                        val data = e.get(ADDRESS, 16)
+                        if (!data.equals(MemorySegment.NULL)) {
+                            val d = data.reinterpret(32)
+                            val name = d.get(ADDRESS, 0).reinterpret(Long.MAX_VALUE).getString(0)
+                            val format = d.get(JAVA_INT, 8)
+                            if (format == 1) { // MPV_FORMAT_STRING: char**
+                                val strPtr = d.get(ADDRESS, 16)
+                                if (!strPtr.equals(MemorySegment.NULL)) {
+                                    val cstr = strPtr.reinterpret(8).get(ADDRESS, 0)
+                                    if (!cstr.equals(MemorySegment.NULL)) {
+                                        properties[name] =
+                                            cstr.reinterpret(Long.MAX_VALUE).getString(0)
+                                    }
+                                }
+                            } else {
+                                // MPV_FORMAT_NONE: property became unavailable
+                                properties.remove(name)
+                            }
+                        }
+                    }
+                }
+            }
+        }, "mpv-events").apply { isDaemon = true; start() }
+    }
+
+    fun cachedDouble(name: String): Double? = properties[name]?.toDoubleOrNull()
+    fun cachedBoolean(name: String): Boolean? =
+        properties[name]?.let { it == "yes" || it == "true" }
+
     /**
      * Drain pending events, forwarding mpv's log lines to [sink].
      *
@@ -440,19 +520,18 @@ class Mpv private constructor(private val handle: MemorySegment, private val are
         // reference -- a composable's onDispose, a straggling poll -- gets a
         // no-op instead of an abort or a use of a freed arena.
         shuttingDown = true
+        // The event thread is the queue's only consumer; it trips the latch
+        // on MPV_EVENT_SHUTDOWN and exits. [onWait] keeps the host's event
+        // loop breathing meanwhile: a teardown that stops answering the
+        // compositor's pings gets the window flagged unresponsive and the
+        // process force-killed -- the "crash on close" that was really
+        // Hyprland's ANR killer.
         val deadline = System.nanoTime() + (timeoutSeconds * 1e9).toLong()
         while (System.nanoTime() < deadline) {
-            // [onWait] keeps the host's event loop breathing: a wait that
-            // stops answering the compositor's pings gets the window flagged
-            // unresponsive and the process force-killed -- the "crash on
-            // close" that was really Hyprland's ANR killer (SIGKILL during
-            // teardown, RSS flat, teardown logs present).
             onWait()
-            val ev = mpvWaitEvent.invokeExact(handle, 0.1) as MemorySegment
-            if (ev.equals(MemorySegment.NULL)) continue
-            val id = ev.reinterpret(64).get(JAVA_INT, 0)
-            if (id == 1) return // MPV_EVENT_SHUTDOWN
+            if (shutdownLatch.await(50, java.util.concurrent.TimeUnit.MILLISECONDS)) break
         }
+        eventThread?.join(1000)
     }
 
     fun close() {

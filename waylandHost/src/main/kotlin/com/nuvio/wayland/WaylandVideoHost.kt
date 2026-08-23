@@ -249,8 +249,8 @@ class WaylandVideoHost(
 
     override fun audioLevel(): com.nuvio.app.features.player.PlayerAudioLevel =
         com.nuvio.app.features.player.PlayerAudioLevel(
-            fraction = ((mpv.getDouble("volume") ?: 100.0) / 100.0).toFloat().coerceIn(0f, 1f),
-            isMuted = mpv.getBoolean("mute") ?: false,
+            fraction = ((mpv.cachedDouble("volume") ?: 100.0) / 100.0).toFloat().coerceIn(0f, 1f),
+            isMuted = mpv.cachedBoolean("mute") ?: false,
         )
 
     override fun setVolumeFraction(fraction: Float) {
@@ -368,15 +368,19 @@ class WaylandVideoHost(
 
     override fun snapshot(): WaylandVideoBridge.Delegate.State {
         if (!hasFile) return WaylandVideoBridge.Delegate.State()
-        val position = mpv.getDouble("time-pos") ?: 0.0
-        val duration = mpv.getDouble("duration") ?: 0.0
+        // Cache reads only: observed properties arrive on the event thread;
+        // nothing here touches the mpv core. Polling it -- from any thread --
+        // contends with the core while the video thread paces inside
+        // render(), which measured as 66ms present gaps at the poll rate.
+        val position = mpv.cachedDouble("time-pos") ?: 0.0
+        val duration = mpv.cachedDouble("duration") ?: 0.0
         // demuxer-cache-time is an absolute timestamp, not a length, which is
         // exactly what a buffered *position* wants.
-        val buffered = mpv.getDouble("demuxer-cache-time") ?: position
-        val paused = mpv.getBoolean("pause") ?: false
-        val idle = mpv.getBoolean("idle-active") ?: false
-        val seeking = mpv.getBoolean("seeking") ?: false
-        val bufferingProperty = mpv.getBoolean("paused-for-cache") ?: false
+        val buffered = mpv.cachedDouble("demuxer-cache-time") ?: position
+        val paused = mpv.cachedBoolean("pause") ?: false
+        val idle = mpv.cachedBoolean("idle-active") ?: false
+        val seeking = mpv.cachedBoolean("seeking") ?: false
+        val bufferingProperty = mpv.cachedBoolean("paused-for-cache") ?: false
 
         return WaylandVideoBridge.Delegate.State(
             positionMs = (position * 1000).toLong(),
@@ -384,11 +388,20 @@ class WaylandVideoHost(
             bufferedMs = (buffered * 1000).toLong(),
             isPlaying = !paused && !idle,
             isBuffering = bufferingProperty || seeking || (duration <= 0.0 && !idle),
-            hasEnded = mpv.getBoolean("eof-reached") ?: false,
+            hasEnded = mpv.cachedBoolean("eof-reached") ?: false,
             // The speed cycler and its label both read this back; without it
             // they see 1x forever and cycling sticks at the first step.
-            playbackSpeed = (mpv.getDouble("speed") ?: 1.0).toFloat(),
+            playbackSpeed = (mpv.cachedDouble("speed") ?: 1.0).toFloat(),
             volumeLevel = audioLevel().let { if (it.isMuted) 0f else it.fraction },
+        )
+    }
+
+    companion object {
+        /** Everything snapshot()/audioLevel() read, pushed rather than polled. */
+        val OBSERVED_PROPERTIES = listOf(
+            "time-pos", "duration", "demuxer-cache-time", "pause",
+            "idle-active", "seeking", "paused-for-cache", "eof-reached",
+            "speed", "volume", "mute",
         )
     }
 }
