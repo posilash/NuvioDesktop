@@ -4,6 +4,7 @@ import com.nuvio.app.features.player.desktop.WaylandVideoBridge
 import org.jetbrains.skia.BackendRenderTarget
 import org.jetbrains.skia.BlendMode
 import org.jetbrains.skia.Canvas
+import org.jetbrains.skia.ContentChangeMode
 import org.jetbrains.skia.ColorSpace
 import org.jetbrains.skia.DirectContext
 import org.jetbrains.skia.FramebufferFormat
@@ -145,12 +146,17 @@ class WaylandVideoHost(
             )
         }
         if (frame.fresh) {
-            // GL only guarantees a context sees another context's writes to a
-            // shared texture after *re-binding* it -- which Skia's state cache
-            // elides, since as far as it knows the texture never left the
-            // unit. Dropping the cached texture bindings forces the re-bind;
-            // without it, buffers alternated between live frames and their
-            // initial cleared black.
+            // Two invalidations, both mandatory, both learned the hard way:
+            // notifyContentWillChange drops Skia's cached image of this
+            // surface -- Surface.draw serves that cache, and mpv's writes are
+            // invisible to Skia, so without the notify every present shows
+            // each buffer's first frame forever (a static, flickering image).
+            // Dropping the cache costs nothing: copy-on-write only copies when
+            // a snapshot is *retained* across a write, and this one is not.
+            // The GL reset covers the second cache: a context only sees
+            // another context's writes to a shared texture after re-binding
+            // it, which Skia's state tracker would otherwise elide.
+            wrapper.surface.notifyContentWillChange(ContentChangeMode.DISCARD)
             context.resetGL(org.jetbrains.skia.GLBackendState.TEXTURE_BINDING)
         }
         // Surface.draw, not a snapshot: snapshots are copy-on-write and cost a
