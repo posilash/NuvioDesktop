@@ -20,12 +20,16 @@ import androidx.compose.foundation.layout.only
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.safeContent
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.windowInsetsPadding
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.rounded.OpenInNew
+import androidx.compose.material.icons.automirrored.rounded.VolumeOff
+import androidx.compose.material.icons.automirrored.rounded.VolumeUp
 import androidx.compose.material.icons.rounded.Build
+import androidx.compose.material.icons.rounded.Fullscreen
 import androidx.compose.material.icons.rounded.Flag
 import androidx.compose.material.icons.rounded.Forward10
 import androidx.compose.material.icons.rounded.Lock
@@ -42,6 +46,8 @@ import androidx.compose.material3.SliderDefaults
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.getValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -95,6 +101,11 @@ internal fun PlayerControlsShell(
     onParentalGuideAnimationComplete: () -> Unit = {},
     onScrubChange: (Long) -> Unit,
     onScrubFinished: (Long) -> Unit,
+    // Desktop-only affordances the web chrome had; null keeps them absent
+    // (mobile uses gestures and is always fullscreen).
+    volumeLevel: Float? = null,
+    onVolumeChange: ((Float) -> Unit)? = null,
+    onFullscreenClick: (() -> Unit)? = null,
     horizontalSafePadding: androidx.compose.ui.unit.Dp,
     modifier: Modifier = Modifier,
 ) {
@@ -184,6 +195,9 @@ internal fun PlayerControlsShell(
                     resizeMode = resizeMode,
                     onScrubChange = onScrubChange,
                     onScrubFinished = onScrubFinished,
+            volumeLevel = volumeLevel,
+            onVolumeChange = onVolumeChange,
+            onFullscreenClick = onFullscreenClick,
                     onResizeModeClick = onResizeModeClick,
                     onSpeedClick = onSpeedClick,
                     onSubtitleClick = onSubtitleClick,
@@ -496,6 +510,9 @@ private fun ProgressControls(
     onAudioClick: () -> Unit,
     onSourcesClick: (() -> Unit)? = null,
     onEpisodesClick: (() -> Unit)? = null,
+    volumeLevel: Float? = null,
+    onVolumeChange: ((Float) -> Unit)? = null,
+    onFullscreenClick: (() -> Unit)? = null,
     modifier: Modifier = Modifier,
 ) {
     val durationMs = playbackSnapshot.durationMs.coerceAtLeast(1L)
@@ -504,14 +521,29 @@ private fun ProgressControls(
     val audioPainter = appIconPainter(AppIconResource.PlayerAudioFilled)
 
     Column(modifier = modifier) {
+        // Finish with the value the scrub actually reached, tracked locally.
+        // Reading displayedPositionMs in onValueChangeFinished uses the value
+        // captured at composition: a tap fires change+finish within one frame,
+        // before recomposition delivers the new position, and seeks right back
+        // to where playback already was -- clicks on the bar did nothing while
+        // drags (which span many recompositions) worked.
+        val lastScrubbedMs = remember { mutableStateOf(-1L) }
         Slider(
             modifier = Modifier
                 .fillMaxWidth()
                 .height(metrics.sliderTouchHeight)
                 .graphicsLayer(scaleY = metrics.sliderScaleY),
             value = displayedPositionMs.coerceIn(0L, durationMs).toFloat(),
-            onValueChange = { value -> onScrubChange(value.toLong()) },
-            onValueChangeFinished = { onScrubFinished(displayedPositionMs.coerceIn(0L, durationMs)) },
+            onValueChange = { value ->
+                lastScrubbedMs.value = value.toLong()
+                onScrubChange(value.toLong())
+            },
+            onValueChangeFinished = {
+                val target = lastScrubbedMs.value.takeIf { it >= 0L }
+                    ?: displayedPositionMs
+                lastScrubbedMs.value = -1L
+                onScrubFinished(target.coerceIn(0L, durationMs))
+            },
             valueRange = 0f..durationMs.toFloat(),
         )
         Row(
@@ -575,6 +607,30 @@ private fun ProgressControls(
                             label = stringResource(Res.string.compose_player_episodes),
                             icon = Icons.Rounded.VideoLibrary,
                             onClick = onEpisodesClick,
+                        )
+                    }
+                    if (onFullscreenClick != null) {
+                        PlayerActionPillButton(
+                            label = "Full",
+                            icon = Icons.Rounded.Fullscreen,
+                            onClick = onFullscreenClick,
+                        )
+                    }
+                    if (onVolumeChange != null && volumeLevel != null) {
+                        Icon(
+                            imageVector = if (volumeLevel <= 0.001f) {
+                                Icons.AutoMirrored.Rounded.VolumeOff
+                            } else {
+                                Icons.AutoMirrored.Rounded.VolumeUp
+                            },
+                            contentDescription = null,
+                            tint = Color.White.copy(alpha = 0.85f),
+                            modifier = Modifier.padding(start = 10.dp, end = 4.dp).size(18.dp),
+                        )
+                        Slider(
+                            value = volumeLevel.coerceIn(0f, 1f),
+                            onValueChange = onVolumeChange,
+                            modifier = Modifier.width(110.dp).padding(end = 8.dp),
                         )
                     }
                 }

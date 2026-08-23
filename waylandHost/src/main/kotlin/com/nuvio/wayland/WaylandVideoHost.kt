@@ -267,6 +267,24 @@ class WaylandVideoHost(
         mpv.setProperty("sub-delay", (delayMs / 1000.0).toString())
     }
 
+    override fun setResizeMode(mode: com.nuvio.app.features.player.PlayerResizeMode) {
+        // mpv's own scaling knobs: keepaspect governs stretch, panscan crops
+        // to fill. The render target is the punched rect, so these behave
+        // exactly as in standalone mpv.
+        when (mode) {
+            com.nuvio.app.features.player.PlayerResizeMode.Fit -> {
+                mpv.setProperty("keepaspect", "yes"); mpv.setProperty("panscan", "0")
+            }
+            com.nuvio.app.features.player.PlayerResizeMode.Zoom -> {
+                mpv.setProperty("keepaspect", "yes"); mpv.setProperty("panscan", "1")
+            }
+            com.nuvio.app.features.player.PlayerResizeMode.Fill,
+            com.nuvio.app.features.player.PlayerResizeMode.Stretch -> {
+                mpv.setProperty("keepaspect", "no"); mpv.setProperty("panscan", "0")
+            }
+        }
+    }
+
     /**
      * mpv's track list, read property-by-property (`track-list/N/...`) rather
      * than parsing the JSON blob. Track ids are mpv ids, which is what the
@@ -347,6 +365,9 @@ class WaylandVideoHost(
             isPlaying = !paused && !idle,
             isBuffering = bufferingProperty || seeking || (duration <= 0.0 && !idle),
             hasEnded = mpv.getBoolean("eof-reached") ?: false,
+            // The speed cycler and its label both read this back; without it
+            // they see 1x forever and cycling sticks at the first step.
+            playbackSpeed = (mpv.getDouble("speed") ?: 1.0).toFloat(),
         )
     }
 }

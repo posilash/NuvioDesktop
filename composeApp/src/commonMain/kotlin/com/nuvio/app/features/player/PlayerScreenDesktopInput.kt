@@ -58,11 +58,24 @@ internal fun PlayerScreenRuntime.desktopPlayerInput(modifier: Modifier): Modifie
                 while (true) {
                     val event = awaitPointerEvent(PointerEventPass.Initial)
                     if (event.type == PointerEventType.Scroll) {
-                        // Wheel over the player adjusts volume, matching the
-                        // stock desktop behaviour. Observed on the Initial
-                        // pass without consuming; nothing under the player
-                        // scrolls, so this steals from no one.
-                        val notches = event.changes.firstOrNull()?.scrollDelta?.y ?: 0f
+                        // Wheel over the video adjusts volume, matching the
+                        // stock desktop behaviour -- but only wheel input that
+                        // nothing else wanted. An earlier revision observed
+                        // the Initial pass, which also sees every scroll made
+                        // *inside* the episodes and sources panels: browsing a
+                        // list silently wound the volume to zero, reported as
+                        // "audio disappeared". The Final pass sees the event
+                        // after the hit path has had it; a panel's scrollable
+                        // consumes its own wheel, and consumed deltas are
+                        // zeroed, so this now reacts only to scrolls over
+                        // bare video.
+                        val change = awaitPointerEvent(PointerEventPass.Final)
+                            .changes.firstOrNull()
+                        val notches = if (change != null && !change.isConsumed) {
+                            change.scrollDelta.y
+                        } else {
+                            0f
+                        }
                         if (notches != 0f) adjustVolume(-notches * 0.05f)
                     }
                     if (event.type == PointerEventType.Move) {
@@ -117,6 +130,27 @@ internal fun PlayerScreenRuntime.desktopPlayerInput(modifier: Modifier): Modifie
                 Key.DirectionDown -> {
                     adjustVolume(-0.05f)
                     true
+                }
+                Key.F -> {
+                    if (com.nuvio.app.core.ui.isFullscreenActionSupported) {
+                        com.nuvio.app.core.ui.toggleFullscreenAction()
+                        true
+                    } else {
+                        false
+                    }
+                }
+                Key.M -> {
+                    // Mute toggle, mirroring mpv's own binding. Current state
+                    // comes from the controller, not local bookkeeping.
+                    val level = gestureController?.currentVolume()
+                    if (level != null) {
+                        playerController?.setMuted(!level.isMuted)
+                        showVolumeFeedback(PlayerAudioLevel(level.fraction, !level.isMuted))
+                        controlsActivityTick += 1
+                        true
+                    } else {
+                        false
+                    }
                 }
                 else -> false
             }

@@ -9,6 +9,10 @@ import androidx.compose.foundation.layout.BoxScope
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.ui.graphics.Color
@@ -566,6 +570,19 @@ private fun PlayerScreenRuntime.currentInitialPositionRequestKey(): String? {
 @Composable
 private fun PlayerScreenRuntime.RenderPlayerControls(displayedPositionMs: Long, isEpisode: Boolean) {
     val isInPip = rememberIsInPictureInPicture()
+    // Desktop chrome extras backed by the host: a live volume slider and a
+    // fullscreen toggle. Null on platforms without a gesture controller or
+    // window to toggle, which also keeps mobile exactly as it was.
+    val volumeController = rememberPlayerGestureController()
+    var chromeVolumeLevel by remember { mutableStateOf(volumeController?.currentVolume()?.fraction) }
+    LaunchedEffect(controlsVisible, volumeController) {
+        // Keys and scroll also move the volume; poll while visible so the
+        // slider tracks them instead of freezing at its last drag.
+        while (controlsVisible && volumeController != null) {
+            chromeVolumeLevel = volumeController.currentVolume()?.fraction
+            kotlinx.coroutines.delay(500)
+        }
+    }
     AnimatedVisibility(
         visible = (controlsVisible || showParentalGuide) && !playerControlsLocked && !isInPip,
         enter = fadeIn(),
@@ -661,6 +678,17 @@ private fun PlayerScreenRuntime.RenderPlayerControls(displayedPositionMs: Long, 
                 scrubbingPositionMs = null
                 playerController?.seekTo(positionMs)
                 scheduleProgressSyncAfterSeek()
+            },
+            volumeLevel = chromeVolumeLevel,
+            onVolumeChange = volumeController?.let { controller ->
+                { level: Float ->
+                    chromeVolumeLevel = controller.setVolume(level)?.fraction ?: level
+                }
+            },
+            onFullscreenClick = if (com.nuvio.app.core.ui.isFullscreenActionSupported) {
+                { com.nuvio.app.core.ui.toggleFullscreenAction() }
+            } else {
+                null
             },
             horizontalSafePadding = horizontalSafePadding,
             modifier = Modifier.fillMaxSize(),

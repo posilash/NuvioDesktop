@@ -67,6 +67,7 @@ actual fun PlatformPlayerSurface(
             externalSubtitles = externalSubtitles,
             modifier = modifier,
             playWhenReady = playWhenReady,
+            resizeMode = resizeMode,
             initialPositionMs = initialPositionMs ?: 0L,
             initialPositionRequestKey = initialPositionRequestKey,
             onInitialPositionHandled = onInitialPositionHandled,

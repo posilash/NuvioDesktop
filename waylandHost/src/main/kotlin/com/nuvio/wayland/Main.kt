@@ -161,6 +161,13 @@ fun main() {
             setOption("save-position-on-quit", "no")
             System.getProperty("nuvio.wayland.hwdec")?.let { setOption("hwdec", it) }
                 ?: run { if (getProperty("hwdec") == "no") setOption("hwdec", "auto") }
+            // The user's conf allows a 2GiB demuxer cache -- fine for
+            // standalone mpv, fatal inside the JVM: stacked on the heap and a
+            // 4K decode it filled to the cap and the kernel OOM-killed the
+            // process (exit 137, twice, read as "crashes on close"). Embedded
+            // playback gets a bounded cache.
+            setOption("demuxer-max-bytes", "600MiB")
+            setOption("demuxer-max-back-bytes", "150MiB")
             if (System.getProperty("nuvio.wayland.videoLog")?.toBoolean() == true) {
                 requestLogMessages("v")
             }
@@ -474,18 +481,21 @@ fun main() {
 
         // Present when there is something new: a video frame the pipeline
         // published, a Compose invalidation, or a surface that was just
-        // rebuilt. Video and UI are separate layers with separate cadences;
-        // neither forces work on the other.
+        // rebuilt. Video presents take absolute priority: they reuse the last
+        // UI layer as-is and never wait on a scene rasterization. The cadence
+        // histogram showed why -- fullscreen scenes spike to 50ms, and video
+        // frames that queue behind them clump into 1-2 vsync bursts followed
+        // by 11-vsync gaps, which is exactly the judder the eye catches. The
+        // scene gets rasterized in the gaps between video frames instead; at
+        // 24fps there are 40ms of them, and when the UI is heavier than that
+        // it is the chrome that degrades, never the video.
         val videoChanged = videoFrameReady.getAndSet(false)
         val sceneDirty = forceRepaint || scene.hasInvalidations()
         if (!videoChanged && !sceneDirty) return false
-        forceRepaint = false
 
         var t = System.nanoTime()
-        if (sceneDirty) {
-            // Rasterizing the scene is the expensive step (measured 18-32ms
-            // for the real app), so it happens only when the UI changed --
-            // a video frame reuses the last UI layer as-is.
+        if (sceneDirty && !videoChanged) {
+            forceRepaint = false
             ui.canvas.clear(0x00000000)
             scene.render(ui.canvas.asComposeCanvas(), System.nanoTime())
             timings.add("scene", System.nanoTime() - t)

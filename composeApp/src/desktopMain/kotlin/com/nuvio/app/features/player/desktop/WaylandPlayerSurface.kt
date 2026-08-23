@@ -35,6 +35,7 @@ internal fun WaylandPlayerSurface(
     externalSubtitles: List<com.nuvio.app.features.streams.StreamSubtitle>,
     modifier: Modifier,
     playWhenReady: Boolean,
+    resizeMode: PlayerResizeMode,
     initialPositionMs: Long,
     initialPositionRequestKey: String?,
     onInitialPositionHandled: (key: String, handled: Boolean) -> Unit,
@@ -100,6 +101,7 @@ internal fun WaylandPlayerSurface(
                     durationMs = s.durationMs,
                     positionMs = s.positionMs,
                     bufferedPositionMs = s.bufferedMs,
+                    playbackSpeed = s.playbackSpeed,
                 ),
             )
             if (s.error != null && s.error != lastError) {
@@ -108,6 +110,10 @@ internal fun WaylandPlayerSurface(
             }
             delay(POLL_INTERVAL_MS)
         }
+    }
+
+    LaunchedEffect(resizeMode) {
+        bridge.setResizeMode(resizeMode)
     }
 
     Canvas(

@@ -57,6 +57,9 @@ object WaylandVideoBridge {
         fun selectAudioTrack(id: Int)
         fun selectSubtitleTrack(id: Int)
         fun setSubtitleDelayMs(delayMs: Int)
+
+        /** Map the app's resize mode onto the video's scaling behaviour. */
+        fun setResizeMode(mode: com.nuvio.app.features.player.PlayerResizeMode)
         fun stop()
 
         /** Current track lists, ids matching what the select methods expect. */
@@ -93,6 +96,7 @@ object WaylandVideoBridge {
             val isPlaying: Boolean = false,
             val isBuffering: Boolean = false,
             val hasEnded: Boolean = false,
+            val playbackSpeed: Float = 1f,
             val error: String? = null,
         )
     }
