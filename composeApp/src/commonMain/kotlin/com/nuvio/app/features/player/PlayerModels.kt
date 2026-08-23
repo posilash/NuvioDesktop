@@ -218,6 +218,9 @@ data class PlayerPlaybackSnapshot(
     val positionMs: Long = 0L,
     val bufferedPositionMs: Long = 0L,
     val playbackSpeed: Float = 1f,
+    // 0..1 player volume; null where the platform does not report one
+    // (mobile), which also hides the chrome's volume pill.
+    val volumeLevel: Float? = null,
     val videoWidth: Int = 0,
     val videoHeight: Int = 0,
 )

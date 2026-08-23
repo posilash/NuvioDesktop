@@ -102,6 +102,7 @@ internal fun WaylandPlayerSurface(
                     positionMs = s.positionMs,
                     bufferedPositionMs = s.bufferedMs,
                     playbackSpeed = s.playbackSpeed,
+                    volumeLevel = s.volumeLevel,
                 ),
             )
             if (s.error != null && s.error != lastError) {

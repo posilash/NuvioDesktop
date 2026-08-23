@@ -47,6 +47,24 @@ import kotlin.system.exitProcess
 private const val INITIAL_WIDTH = 1280
 private const val INITIAL_HEIGHT = 800
 
+/** The linux branch's config location: $XDG_CONFIG_HOME/mpv, else ~/.config/mpv. */
+private fun nuvioMpvConfPath(): String? {
+    val dir = System.getenv("NUVIO_MPV_CONFIG_DIR")
+        ?: System.getenv("XDG_CONFIG_HOME")?.takeIf { it.isNotEmpty() }?.plus("/mpv")
+        ?: System.getenv("HOME")?.plus("/.config/mpv")
+        ?: return null
+    val f = java.io.File(dir, "mpv_nuvio.conf")
+    return if (f.isFile) f.absolutePath else null
+}
+
+/** Resident set size in MB, for the SIGKILL investigation: evidence, not theory. */
+private fun rssMb(): Long = runCatching {
+    java.io.File("/proc/self/status").useLines { lines ->
+        lines.firstOrNull { it.startsWith("VmRSS:") }
+            ?.filter { it.isDigit() }?.toLongOrNull()?.div(1024)
+    } ?: -1
+}.getOrDefault(-1)
+
 @OptIn(ExperimentalComposeUiApi::class)
 fun main() {
     GLFWErrorCallback.createPrint(System.err).set()
@@ -128,20 +146,18 @@ fun main() {
             exitProcess(1)
         }
         mpv = Mpv.create().apply {
-            // Load the user's own mpv.conf: their scaler, deband and HDR
-            // profile tuning are exactly what they expect playback to look
-            // like. NOTE the precedence trap: the config file is parsed at
-            // initialize() and overwrites anything set through the API before
-            // it -- API sets do NOT rank like command-line options. The conf's
-            // vo=gpu-next beating our vo=libmpv is how playback ended up in a
-            // real mpv-owned window. Everything the host must own is therefore
-            // (re)asserted AFTER initialize(), below.
-            setOption("config", "yes")
-            // The conf dir also carries their standalone-mpv scripts (modernz,
-            // thumbfast): OSC replacements that would paint a second player UI
-            // into the frames underneath the app's own chrome. Options yes,
-            // scripts no.
+            // The linux branch's convention, kept so one file tunes every
+            // Nuvio build: user options come from <config-dir>/mpv_nuvio.conf
+            // via `include`, not from mpv.conf (whose vo/gpu-context target
+            // standalone mpv and would open mpv's own window here). Scripts
+            // never load: OSC replacements assume mpv owns the window and
+            // fight the app's chrome. NOTE the precedence trap: included
+            // config is parsed at initialize() and overwrites anything set
+            // through the API before it, so everything the host must own is
+            // asserted AFTER initialize(), below.
+            setOption("config", "no")
             setOption("load-scripts", "no")
+            nuvioMpvConfPath()?.let { setOption("include", it) }
             setOption("terminal", "yes")
             setOption("msg-level", "all=info")
             if (!runRealAppEarly) setOption("audio", "no")
@@ -161,13 +177,6 @@ fun main() {
             setOption("save-position-on-quit", "no")
             System.getProperty("nuvio.wayland.hwdec")?.let { setOption("hwdec", it) }
                 ?: run { if (getProperty("hwdec") == "no") setOption("hwdec", "auto") }
-            // The user's conf allows a 2GiB demuxer cache -- fine for
-            // standalone mpv, fatal inside the JVM: stacked on the heap and a
-            // 4K decode it filled to the cap and the kernel OOM-killed the
-            // process (exit 137, twice, read as "crashes on close"). Embedded
-            // playback gets a bounded cache.
-            setOption("demuxer-max-bytes", "600MiB")
-            setOption("demuxer-max-back-bytes", "150MiB")
             if (System.getProperty("nuvio.wayland.videoLog")?.toBoolean() == true) {
                 requestLogMessages("v")
             }
@@ -414,6 +423,11 @@ fun main() {
     var exitCode = 0
     val timings = FrameTimings()
 
+    // Scheduling state for scene-vs-video contention: the scene may only
+    // start a rasterization when it can finish before the next video frame is
+    // due. Costs and cadence are measured, not assumed.
+    var sceneCostEmaMs = 8.0
+    var videoIntervalEmaMs = 41.7
     // Cadence evidence for judder: how far apart video presents actually land.
     // A 24fps source on a 165Hz panel should alternate cleanly between 7- and
     // 6-vsync intervals (42.4/36.4ms); anything outside that pattern is
@@ -426,6 +440,11 @@ fun main() {
             val ms = (now - lastVideoPresentNs) / 1e6
             val bucket = (ms / 6.06).toInt().coerceIn(0, cadenceBuckets.size - 1)
             cadenceBuckets[bucket]++
+            // Learn the source cadence from sane intervals only; pauses and
+            // seeks would poison the average.
+            if (ms in 15.0..100.0) {
+                videoIntervalEmaMs += (ms - videoIntervalEmaMs) * 0.1
+            }
         }
         lastVideoPresentNs = now
         if (videoLog && now - cadenceReportNs > 5_000_000_000L) {
@@ -474,7 +493,9 @@ fun main() {
 
         if (videoLog) {
             mpv?.pumpEvents { println(it) }
-            videoHost?.report(System.nanoTime())?.let { println("[wayland-video] $it") }
+            videoHost?.report(System.nanoTime())?.let {
+                println("[wayland-video] $it rss=${rssMb()}MB heap=${Runtime.getRuntime().let { r -> (r.totalMemory() - r.freeMemory()) / 1_048_576 }}MB")
+            }
             input.report(System.nanoTime())?.let { println("[wayland-video] $it") }
             timings.report(System.nanoTime())?.let { println("[wayland-video] $it") }
         }
@@ -493,11 +514,30 @@ fun main() {
         val sceneDirty = forceRepaint || scene.hasInvalidations()
         if (!videoChanged && !sceneDirty) return false
 
+        // A scene rasterization is uninterruptible once started; at fullscreen
+        // it can take 20-50ms, and a video frame arriving mid-raster queues
+        // behind it -- the measured 11-vsync gaps. So the scene only starts
+        // when it can finish before the next frame is due. When the UI is
+        // heavier than the gap between frames, chrome updates degrade and the
+        // video cadence stays intact, which is the right way round.
         var t = System.nanoTime()
         if (sceneDirty && !videoChanged) {
+            val videoLive = videoHost?.hasFile == true &&
+                lastVideoPresentNs != 0L && (t - lastVideoPresentNs) < 500_000_000L
+            if (videoLive) {
+                val untilNextFrameMs =
+                    (lastVideoPresentNs - t) / 1e6 + videoIntervalEmaMs
+                if (untilNextFrameMs < sceneCostEmaMs * 1.2 + 3.0) {
+                    // Too close: skip this iteration; the loop re-checks in
+                    // ~4ms and the scene runs right after the frame instead.
+                    return false
+                }
+            }
             forceRepaint = false
             ui.canvas.clear(0x00000000)
             scene.render(ui.canvas.asComposeCanvas(), System.nanoTime())
+            val costMs = (System.nanoTime() - t) / 1e6
+            sceneCostEmaMs += (costMs - sceneCostEmaMs) * 0.2
             timings.add("scene", System.nanoTime() - t)
         }
 

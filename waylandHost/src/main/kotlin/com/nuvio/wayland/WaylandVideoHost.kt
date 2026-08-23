@@ -368,6 +368,7 @@ class WaylandVideoHost(
             // The speed cycler and its label both read this back; without it
             // they see 1x forever and cycling sticks at the first step.
             playbackSpeed = (mpv.getDouble("speed") ?: 1.0).toFloat(),
+            volumeLevel = audioLevel().let { if (it.isMuted) 0f else it.fraction },
         )
     }
 }

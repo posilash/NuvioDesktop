@@ -97,6 +97,7 @@ object WaylandVideoBridge {
             val isBuffering: Boolean = false,
             val hasEnded: Boolean = false,
             val playbackSpeed: Float = 1f,
+            val volumeLevel: Float? = null,
             val error: String? = null,
         )
     }
