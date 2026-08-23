@@ -1524,3 +1524,23 @@ configurations.all {
     exclude(group = "androidx.media3", module = "media3-exoplayer")
     exclude(group = "androidx.media3", module = "media3-ui")
 }
+
+// Optional Skiko override, for testing display-server backends.
+//
+// Compose Multiplatform pins the Skiko it was built against, and Skiko is what
+// actually talks to X11/Wayland: it acquires its surface through JAWT, so
+// whether the app can run on AWT's Wayland toolkit is decided there rather than
+// anywhere in this repository.
+//
+//   ./gradlew :composeApp:run -Pnuvio.desktop.skikoVersion=0.150.1
+val skikoOverride = providers.gradleProperty("nuvio.desktop.skikoVersion").orNull
+if (!skikoOverride.isNullOrBlank()) {
+    configurations.all {
+        resolutionStrategy.eachDependency {
+            if (requested.group == "org.jetbrains.skiko") {
+                useVersion(skikoOverride)
+                because("nuvio.desktop.skikoVersion override")
+            }
+        }
+    }
+}
