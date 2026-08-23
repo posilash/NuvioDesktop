@@ -63,9 +63,14 @@ class WaylandVideoHost(
             "lastUpdateFlags=${mpv.lastUpdateFlags} surface=${videoSurface != null}"
     }
 
-    /** Render one frame, if mpv has one that is due. Must run on the GL thread. */
-    fun renderFrame(width: Int, height: Int) {
-        if (!hasFile || width <= 0 || height <= 0) return
+    /**
+     * Render one frame, if mpv has one that is due. Must run on the GL thread.
+     *
+     * Returns true when the video texture changed, which is what tells the host
+     * the window needs repainting even if Compose has nothing new to say.
+     */
+    fun renderFrame(width: Int, height: Int): Boolean {
+        if (!hasFile || width <= 0 || height <= 0) return false
         ensureTarget(width, height)
 
         trackPresentInterval()
@@ -73,7 +78,7 @@ class WaylandVideoHost(
         // Only clear and render when mpv actually has a frame: clearing first
         // and then rendering nothing paints the window black.
         updatePolls++
-        if (!mpv.hasNewFrame()) return
+        if (!mpv.hasNewFrame()) return false
 
         // mpv makes frames available early -- "video-timing-offset" of headroom,
         // 50ms by default -- and would normally sleep off the difference inside
@@ -87,7 +92,7 @@ class WaylandVideoHost(
             val aheadNs = info.targetTimeNs - mpv.timeNs()
             if (aheadNs > presentIntervalNs / 2) {
                 earlyCount++
-                return
+                return false
             }
         }
         renderCount++
@@ -113,6 +118,7 @@ class WaylandVideoHost(
         GL11.glDisable(GL11.GL_SCISSOR_TEST)
         GL11.glViewport(0, 0, width, height)
         context.resetGLAll()
+        return true
     }
 
     /**

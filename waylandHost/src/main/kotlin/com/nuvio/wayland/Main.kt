@@ -268,7 +268,13 @@ fun main() {
     // enough to produce several per-second timing reports.
     val demoFrames = System.getProperty("nuvio.wayland.demoFrames")?.toInt() ?: 120
 
-    fun renderOneFrame() {
+    // Forces a repaint regardless of invalidation state: after a resize the
+    // surface is new and holds nothing, so "nothing changed" would leave the
+    // window blank.
+    var forceRepaint = true
+
+    /** Returns true if this iteration actually presented a frame. */
+    fun renderOneFrame(): Boolean {
 
         val w = IntArray(1); val h = IntArray(1)
         glfwGetFramebufferSize(window, w, h)
@@ -276,6 +282,7 @@ fun main() {
             width = w[0]; height = h[0]
             if (width > 0 && height > 0) {
                 recreateSurface()
+                forceRepaint = true
                 scene.size = androidx.compose.ui.unit.IntSize(width, height)
                 // Pointer positions arrive in window coordinates but the
                 // scene works in framebuffer pixels; on a fractionally
@@ -286,20 +293,29 @@ fun main() {
             }
         }
 
-        val s = surface ?: return
+        val s = surface ?: return false
 
         // Video goes into an offscreen texture, never into the window, so it
         // composites as ordinary Compose content rather than sitting under the
         // scene where any opaque background would cover it.
         var t = System.nanoTime()
-        videoHost?.renderFrame(width, height)
+        val videoChanged = videoHost?.renderFrame(width, height) ?: false
         timings.add("mpv", System.nanoTime() - t)
 
         if (videoLog) {
             mpv?.pumpEvents { println(it) }
             videoHost?.report(System.nanoTime())?.let { println("[wayland-video] $it") }
             input.report(System.nanoTime())?.let { println("[wayland-video] $it") }
+            timings.report(System.nanoTime())?.let { println("[wayland-video] $it") }
         }
+
+        // Repainting a scene that has not changed costs a full rasterization of
+        // the whole tree -- measured at 28ms for the app's own UI, against
+        // 1.4ms for trivial content -- and buys nothing. Present only when
+        // there is something new: a video frame, a Compose invalidation, or a
+        // surface that was just rebuilt.
+        if (!forceRepaint && !videoChanged && !scene.hasInvalidations()) return false
+        forceRepaint = false
 
         t = System.nanoTime()
         s.canvas.clear(0xFF101014.toInt())
@@ -339,9 +355,6 @@ fun main() {
         timings.add("swap", System.nanoTime() - t)
 
         timings.endFrame()
-        if (videoLog) {
-            timings.report(System.nanoTime())?.let { println("[wayland-video] $it") }
-        }
 
         frames++
         if (!runRealApp && frames == demoFrames) {
@@ -352,14 +365,21 @@ fun main() {
         }
         glfwSetWindowShouldClose(window, true)
         }
+        return true
     }
 
+    var presented = true
     try {
         while (!glfwWindowShouldClose(window)) {
             // Input callbacks fire from here, on the main thread, and are
             // forwarded to the EDT by InputRouter.
             val beforePoll = System.nanoTime()
-            glfwPollEvents()
+            // When the last iteration presented, the vsync-blocking swap paces
+            // us. When it did not, there is nothing to block on, so wait for
+            // input with a short timeout instead of spinning -- Compose's own
+            // invalidations do not wake GLFW, hence the timeout rather than an
+            // indefinite wait.
+            if (presented) glfwPollEvents() else glfwWaitEventsTimeout(0.004)
             val afterPoll = System.nanoTime()
             timings.add("poll", afterPoll - beforePoll)
             java.awt.EventQueue.invokeAndWait {
@@ -367,7 +387,7 @@ fun main() {
                 // own work. This is the cost of the main/EDT split, measured
                 // rather than assumed.
                 timings.add("edtWait", System.nanoTime() - afterPoll)
-                renderOneFrame()
+                presented = renderOneFrame()
             }
         }
     } finally {
