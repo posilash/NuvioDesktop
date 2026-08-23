@@ -97,6 +97,13 @@ class Mpv private constructor(private val handle: MemorySegment, private val are
         private val mpvFree by lazy {
             fn("mpv_free", FunctionDescriptor.ofVoid(ADDRESS))
         }
+        private val mpvRequestLogMessages by lazy {
+            fn("mpv_request_log_messages", FunctionDescriptor.of(JAVA_INT, ADDRESS, ADDRESS))
+        }
+        private val mpvWaitEvent by lazy {
+            fn("mpv_wait_event", FunctionDescriptor.of(ADDRESS, ADDRESS,
+                java.lang.foreign.ValueLayout.JAVA_DOUBLE))
+        }
 
         /** Load libmpv. Pass an explicit path to use a build other than the system one. */
         fun load(path: String?): Boolean = runCatching {
@@ -203,9 +210,15 @@ class Mpv private constructor(private val handle: MemorySegment, private val are
         renderCtx = out.get(ADDRESS, 0)
     }
 
+    /** Raw mpv_render_context_update() flags, for diagnostics. */
+    @Volatile
+    var lastUpdateFlags: Long = -1
+        private set
+
     fun hasNewFrame(): Boolean {
         if (renderCtx.equals(MemorySegment.NULL)) return false
         val flags = mpvRenderContextUpdate.invokeExact(renderCtx) as Long
+        lastUpdateFlags = flags
         return (flags and MPV_RENDER_UPDATE_FRAME) != 0L
     }
 
@@ -231,6 +244,38 @@ class Mpv private constructor(private val handle: MemorySegment, private val are
             put(2, MPV_RENDER_PARAM_INVALID, MemorySegment.NULL)
 
             mpvRenderContextRender.invokeExact(renderCtx, params) as Int
+        }
+    }
+
+    /** Ask mpv to deliver its own log at [level] (e.g. "v", "debug"). */
+    fun requestLogMessages(level: String) {
+        Arena.ofConfined().use { a ->
+            mpvRequestLogMessages.invokeExact(handle, a.allocateFrom(level)) as Int
+        }
+    }
+
+    /**
+     * Drain pending events, forwarding mpv's log lines to [sink].
+     *
+     * struct mpv_event { event_id:int, error:int, reply_userdata:uint64, data:ptr }
+     * struct mpv_event_log_message { prefix:ptr, level:ptr, text:ptr, log_level:int }
+     */
+    fun pumpEvents(sink: (String) -> Unit) {
+        while (true) {
+            val ev = mpvWaitEvent.invokeExact(handle, 0.0) as MemorySegment
+            if (ev.equals(MemorySegment.NULL)) return
+            val e = ev.reinterpret(64)
+            val id = e.get(JAVA_INT, 0)
+            if (id == 0) return // MPV_EVENT_NONE
+            if (id == 2) {      // MPV_EVENT_LOG_MESSAGE
+                val data = e.get(ADDRESS, 16)
+                if (!data.equals(MemorySegment.NULL)) {
+                    val d = data.reinterpret(32)
+                    val prefix = d.get(ADDRESS, 0).reinterpret(Long.MAX_VALUE).getString(0)
+                    val text = d.get(ADDRESS, 16).reinterpret(Long.MAX_VALUE).getString(0)
+                    sink("[mpv/$prefix] " + text.trimEnd())
+                }
+            }
         }
     }
 

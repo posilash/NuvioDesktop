@@ -86,7 +86,7 @@ application {
         add("-Dorg.lwjgl.util.Debug=false")
         // libmpv is bound through FFM rather than JNI, so no native build.
         add("--enable-native-access=ALL-UNNAMED")
-        for (k in listOf("media", "libmpv", "hwdec", "realApp", "probe")) {
+        for (k in listOf("media", "libmpv", "hwdec", "realApp", "probe", "videoLog")) {
             providers.gradleProperty("nuvio.wayland.$k").orNull
                 ?.let { add("-Dnuvio.wayland.$k=$it") }
         }

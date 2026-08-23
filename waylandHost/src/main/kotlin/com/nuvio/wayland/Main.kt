@@ -111,12 +111,18 @@ fun main() {
             setOption("msg-level", "all=info")
             if (!runRealAppEarly) setOption("audio", "no")
             setOption("vo", "libmpv")
+            if (System.getProperty("nuvio.wayland.videoLog")?.toBoolean() == true) {
+                setOption("msg-level", "all=v")
+            }
             System.getProperty("nuvio.wayland.hwdec")?.let { setOption("hwdec", it) }
             initialize()
             java.awt.EventQueue.invokeAndWait {
                 createRenderContext(Mpv.MPV_RENDER_API_TYPE_OPENGL_NEXT) { name ->
                     glfwGetProcAddress(name)
                 }
+            }
+            if (System.getProperty("nuvio.wayland.videoLog")?.toBoolean() == true) {
+                requestLogMessages("v")
             }
             if (mediaUrl != null) command("loadfile", mediaUrl)
         }
@@ -155,6 +161,7 @@ fun main() {
 
     var frames by mutableStateOf(0)
     val probePixels = System.getProperty("nuvio.wayland.probe")?.toBoolean() ?: false
+    val videoLog = System.getProperty("nuvio.wayland.videoLog")?.toBoolean() ?: false
 
     val scene: ComposeScene = CanvasLayersComposeScene(
         density = Density(1f),
@@ -242,6 +249,11 @@ fun main() {
         // composites as ordinary Compose content rather than sitting under the
         // scene where any opaque background would cover it.
         videoHost?.renderFrame(width, height)
+
+        if (videoLog) {
+            mpv?.pumpEvents { println(it) }
+            videoHost?.report(System.nanoTime())?.let { println("[wayland-video] $it") }
+        }
 
         s.canvas.clear(0xFF101014.toInt())
 

@@ -7,6 +7,11 @@ import androidx.compose.ui.graphics.nativeCanvas
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableIntStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
+import androidx.compose.runtime.withFrameNanos
 import androidx.compose.ui.Modifier
 import com.nuvio.app.features.player.AudioTrack
 import com.nuvio.app.features.player.PlayerEngineController
@@ -46,6 +51,7 @@ internal fun WaylandPlayerSurface(
     }
 
     DisposableEffect(sourceUrl) {
+        WaylandVideoLog.log("surface: open url=$sourceUrl playWhenReady=$playWhenReady pos=$initialPositionMs")
         bridge.open(
             url = sourceUrl,
             headers = sourceHeaders.map { (k, v) -> "$k: $v" },
@@ -53,7 +59,10 @@ internal fun WaylandPlayerSurface(
             playWhenReady = playWhenReady,
         )
         onControllerReady(WaylandPlayerController(bridge))
-        onDispose { bridge.stop() }
+        onDispose {
+            WaylandVideoLog.log("surface: disposed")
+            bridge.stop()
+        }
     }
 
     LaunchedEffect(sourceUrl) {
@@ -80,7 +89,21 @@ internal fun WaylandPlayerSurface(
 
     // The frame is drawn here, inside the scene, so it is ordered and clipped
     // like any other Compose content.
+    // Compose only redraws what has been invalidated. The video texture
+    // changes outside the composition entirely, so without a per-frame tick
+    // the Canvas below is drawn once and then never again -- a still image
+    // over a playing stream.
+    var tick by remember { mutableIntStateOf(0) }
+    LaunchedEffect(Unit) {
+        while (true) {
+            withFrameNanos { }
+            tick++
+        }
+    }
+
     Canvas(modifier.fillMaxSize()) {
+        @Suppress("UNUSED_EXPRESSION") tick // read it: this is what forces the redraw
+        if (WaylandVideoLog.enabled) WaylandVideoLog.noteDraw(size.width, size.height)
         drawIntoCanvas { canvas ->
             bridge.drawVideo(canvas.nativeCanvas, size.width, size.height)
         }

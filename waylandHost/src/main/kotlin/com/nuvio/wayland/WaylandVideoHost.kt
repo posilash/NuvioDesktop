@@ -38,11 +38,32 @@ class WaylandVideoHost(
     private var renderTarget: BackendRenderTarget? = null
     private var videoSurface: Surface? = null
 
+    private var renderCount = 0L
+    private var drawCount = 0L
+    private var updatePolls = 0L
+    private var lastReport = 0L
+
+    /** Per-second summary of what the video path is actually doing. */
+    fun report(now: Long): String? {
+        if (now - lastReport < 1_000_000_000L) return null
+        lastReport = now
+        val r = renderCount; val d = drawCount; val u = updatePolls
+        renderCount = 0; drawCount = 0; updatePolls = 0
+        return "video: hasFile=$hasFile target=${texWidth}x$texHeight " +
+            "mpvRenders/s=$r composeDraws/s=$d updatePolls/s=$u " +
+            "lastUpdateFlags=${mpv.lastUpdateFlags} surface=${videoSurface != null}"
+    }
+
     /** Render one frame, if mpv has a new one. Must run on the GL thread. */
     fun renderFrame(width: Int, height: Int) {
         if (!hasFile || width <= 0 || height <= 0) return
         ensureTarget(width, height)
+
+        // Only clear and render when mpv actually has a frame: clearing first
+        // and then rendering nothing paints the window black.
+        updatePolls++
         if (!mpv.hasNewFrame()) return
+        renderCount++
 
         // Skia's snapshots are copy-on-write, invalidated by Skia's own draw
         // calls. mpv writes into this FBO through raw GL, which Skia never
@@ -118,6 +139,7 @@ class WaylandVideoHost(
     }
 
     override fun drawVideo(canvas: org.jetbrains.skia.Canvas, width: Float, height: Float) {
+        drawCount++
         val snapshot = videoSurface?.makeImageSnapshot() ?: return
         canvas.drawImageRect(
             snapshot,
