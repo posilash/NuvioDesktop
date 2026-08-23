@@ -127,6 +127,9 @@ class Mpv private constructor(private val handle: MemorySegment, private val are
         private val mpvRequestLogMessages by lazy {
             fn("mpv_request_log_messages", FunctionDescriptor.of(JAVA_INT, ADDRESS, ADDRESS))
         }
+        private val mpvRenderContextReportSwap by lazy {
+            fn("mpv_render_context_report_swap", FunctionDescriptor.ofVoid(ADDRESS))
+        }
         private val mpvObserveProperty by lazy {
             fn("mpv_observe_property", FunctionDescriptor.of(JAVA_INT, ADDRESS,
                 JAVA_LONG, ADDRESS, JAVA_INT))
@@ -376,6 +379,17 @@ class Mpv private constructor(private val handle: MemorySegment, private val are
         Arena.ofConfined().use { a ->
             mpvRequestLogMessages.invokeExact(handle, a.allocateFrom(level)) as Int
         }
+    }
+
+    /**
+     * Tell mpv a swap just happened. With ADVANCED_CONTROL this is the vsync
+     * feedback a real VO gets: mpv aligns frame target times to the display's
+     * actual cadence instead of freewheeling on its own clock. Callable from
+     * any thread per render.h.
+     */
+    fun reportSwap() {
+        if (renderCtx.equals(MemorySegment.NULL) || shuttingDown) return
+        mpvRenderContextReportSwap.invokeExact(renderCtx)
     }
 
     /** Subscribe to string-format change events for [name]. */

@@ -649,7 +649,31 @@ fun main() {
         t = System.nanoTime()
         glfwSwapBuffers(window)
         timings.add("swap", System.nanoTime() - t)
-        if (videoChanged) noteVideoPresent(System.nanoTime())
+        if (videoChanged) {
+            noteVideoPresent(System.nanoTime())
+            // Vsync feedback: with ADVANCED_CONTROL, reported swaps let mpv
+            // align frame target times to the display's actual cadence --
+            // what a real VO gets from its swapchain.
+            mpv?.reportSwap()
+            // The safest moment to rasterize the scene is right here, just
+            // after a frame was presented: the full frame interval lies
+            // ahead. Deferring it to the next loop iteration burned 4-12ms
+            // of that margin and let 20ms scenes collide with the next
+            // frame -- the residual 11-vsync gaps.
+            if (scene.hasInvalidations() &&
+                sceneCostEmaMs < (pipeline?.publishIntervalMs ?: 41.7) - 8.0
+            ) {
+                val ts = System.nanoTime()
+                forceRepaint = false
+                ui.canvas.clear(0x00000000)
+                scene.render(ui.canvas.asComposeCanvas(), System.nanoTime())
+                context.flush()
+                val costMs = (System.nanoTime() - ts) / 1e6
+                sceneCostEmaMs += (costMs - sceneCostEmaMs) * 0.2
+                lastSceneRenderNs = ts
+                timings.add("scene", System.nanoTime() - ts)
+            }
+        }
 
         timings.endFrame()
 
@@ -689,26 +713,36 @@ fun main() {
             }
         }
     } finally {
-        // Teardown order matters twice over. The scene goes first: disposing
-        // the composition runs the player surface's onDispose, which stops
-        // playback through the bridge -- that must reach a live mpv, not a
-        // destroyed handle whose arena is gone. Then the render API's own
-        // contract: quit the core and wait for its shutdown event (so the VO
-        // and its dispatch queues are gone), then free the render context on
-        // the thread that owns it, then destroy the handle. Freeing the
-        // render context first raced VO teardown and aborted the process.
-        // Unmap the window before the slow parts: an unmapped surface gets no
-        // compositor pings, so a lengthy mpv quit cannot be flagged as "not
-        // responding" and force-killed mid-teardown.
+        // Teardown runs on a worker so the MAIN thread can keep answering the
+        // compositor for its whole duration -- scene.close() alone can take
+        // seconds for the full app tree, and a client that goes quiet after a
+        // close request gets flagged unresponsive and SIGKILLed ("crash on
+        // close", exit 137). Ordering within the worker still matters: scene
+        // first (its disposals stop playback through a live mpv), then quit
+        // and await the core's shutdown event, then the render context on its
+        // owning thread, then the handle. GL cleanup happens on the EDT,
+        // which owns that context; the windows die last, on this thread,
+        // which owns GLFW.
         glfwHideWindow(window)
-        scene.close()
-        mpv?.quitAndAwaitShutdown(onWait = { glfwPollEvents() })
-        pipeline?.stop()
-        mpv?.close()
-        surface?.close()
-        renderTarget?.close()
-        uiSurface?.close()
-        context.close()
+        val teardownDone = java.util.concurrent.CountDownLatch(1)
+        Thread({
+            runCatching {
+                java.awt.EventQueue.invokeAndWait { scene.close() }
+                mpv?.quitAndAwaitShutdown()
+                pipeline?.stop()
+                mpv?.close()
+                java.awt.EventQueue.invokeAndWait {
+                    surface?.close()
+                    renderTarget?.close()
+                    uiSurface?.close()
+                    context.close()
+                }
+            }.onFailure { it.printStackTrace() }
+            teardownDone.countDown()
+        }, "nuvio-teardown").start()
+        while (!teardownDone.await(10, java.util.concurrent.TimeUnit.MILLISECONDS)) {
+            glfwPollEvents()
+        }
         glfwDestroyWindow(videoWindow)
         glfwDestroyWindow(window)
         glfwTerminate()
