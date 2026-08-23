@@ -1,6 +1,7 @@
 package com.nuvio.wayland
 
 import com.nuvio.app.features.player.desktop.WaylandVideoBridge
+import com.nuvio.app.features.player.desktop.WaylandVideoLog
 import org.jetbrains.skia.BackendRenderTarget
 import org.jetbrains.skia.BlendMode
 import org.jetbrains.skia.Canvas
@@ -215,16 +216,22 @@ class WaylandVideoHost(
             mpv.setProperty("http-header-fields", headers.joinToString("\n"))
         }
         // Sources that split their audio into a separate stream are silent
-        // without this. Cleared explicitly: the property persists across
-        // loads, and the previous file's audio bleeding into the next is
-        // exactly the kind of bug nobody traces quickly.
-        mpv.setProperty("audio-files", audioUrl ?: "")
+        // without this. Cleared with change-list, never with an empty string:
+        // audio-files="" is a list holding one empty filename, which mpv then
+        // tries to open ("Can not open external file .") and lets the phantom
+        // external track shadow the real audio -- observed as a whole session
+        // with no sound.
+        if (audioUrl != null) {
+            mpv.setProperty("audio-files", audioUrl)
+        } else {
+            mpv.command("change-list", "audio-files", "clr", "")
+        }
         mpv.setProperty("pause", if (playWhenReady) "no" else "yes")
         if (startPositionMs > 0) {
             mpv.setProperty("start", (startPositionMs / 1000.0).toString())
         }
         mpv.command("loadfile", url)
-        for (sub in subtitles) {
+        for (sub in subtitles.filter { it.url.isNotBlank() }) {
             // "auto" attaches without selecting; the app's own subtitle
             // policy decides what to enable.
             mpv.command(
@@ -259,6 +266,8 @@ class WaylandVideoHost(
     }
 
     override fun setSubtitleUrl(url: String) {
+        if (url.isBlank()) return
+        WaylandVideoLog.log("sub-add select url=$url")
         mpv.command("sub-add", url, "select")
     }
 

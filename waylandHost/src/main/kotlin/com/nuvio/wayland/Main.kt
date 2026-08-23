@@ -192,6 +192,11 @@ fun main() {
         // The render context is created on the pipeline's thread; loading a
         // file before it exists makes video-output init fail.
         pipeline!!.awaitReady()
+        System.getProperty("nuvio.wayland.mpvExtra")?.split(';')?.forEach { kv ->
+            val (k, v) = kv.split('=', limit = 2)
+            mpv!!.setProperty(k, v)
+            println("mpvExtra: $k=$v")
+        }
         if (mediaUrl != null) mpv!!.command("loadfile", mediaUrl)
         println("mpv render context: ${Mpv.MPV_RENDER_API_TYPE_OPENGL_NEXT} (video thread)")
         // Hand the app a video sink so its player surface stops reaching
@@ -566,6 +571,32 @@ fun main() {
         context.flush()
         timings.add("flush", System.nanoTime() - t)
 
+        // Throwaway subtitle harness: white text in the bottom third means
+        // subs render; zero bright pixels means they are lost in the pipeline.
+        if (System.getProperty("nuvio.wayland.subTest")?.toBoolean() == true && frames % 60 == 30) {
+            // Whole-frame scan: distinguishes "not rendered" from "rendered in
+            // the wrong place". Reports the y-range of near-white pixels.
+            val buf = java.nio.ByteBuffer.allocateDirect(width * height * 4)
+            GL30.glBindFramebuffer(GL30.GL_FRAMEBUFFER, 0)
+            GL11.glReadPixels(0, 0, width, height, GL11.GL_RGBA, GL11.GL_UNSIGNED_BYTE, buf)
+            var bright = 0; var minY = -1; var maxY = -1; var minX = -1; var maxX = -1
+            for (y in 0 until height step 2) {
+                for (x in 0 until width step 2) {
+                    val i = (y * width + x) * 4
+                    val r = buf.get(i).toInt() and 0xFF
+                    val g = buf.get(i + 1).toInt() and 0xFF
+                    val b = buf.get(i + 2).toInt() and 0xFF
+                    if (r > 230 && g > 230 && b > 230) {
+                        bright++
+                        if (minY < 0) minY = y
+                        maxY = y
+                        if (minX < 0 || x < minX) minX = x
+                        if (x > maxX) maxX = x
+                    }
+                }
+            }
+            println("[sub-test] frame=$frames bright=$bright x=[$minX..$maxX] yGL=[$minY..$maxY] (win ${width}x$height)")
+        }
         // Throwaway resize-mode harness: cycle Fit/Stretch/Zoom and read the
         // pillarbox edge; the bar is black under Fit, content under Stretch.
         if (System.getProperty("nuvio.wayland.resizeTest")?.toBoolean() == true) {
