@@ -92,7 +92,13 @@ internal fun WaylandPlayerSurface(
         onControllerReady(WaylandPlayerController(bridge))
         var lastError: String? = null
         while (true) {
-            val s = bridge.snapshot()
+            // Off the UI thread: each property read takes the mpv core lock,
+            // which is contended during playback. Polled on the EDT, the ~8
+            // reads stalled it up to ~66ms at 10Hz -- measured as constant
+            // 11-vsync gaps in the present cadence, i.e. the visible judder.
+            val s = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+                bridge.snapshot()
+            }
             onSnapshot(
                 PlayerPlaybackSnapshot(
                     isLoading = s.isBuffering,

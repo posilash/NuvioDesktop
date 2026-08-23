@@ -26,9 +26,6 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.rounded.OpenInNew
-import androidx.compose.material.icons.automirrored.rounded.VolumeDown
-import androidx.compose.material.icons.automirrored.rounded.VolumeOff
-import androidx.compose.material.icons.automirrored.rounded.VolumeUp
 import androidx.compose.material.icons.rounded.Build
 import androidx.compose.material.icons.rounded.Flag
 import androidx.compose.material.icons.rounded.Forward10
@@ -47,10 +44,8 @@ import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.remember
-import com.nuvio.app.core.ui.FullscreenActionButton
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.setValue
-import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.getValue
 import androidx.compose.ui.Alignment
@@ -105,11 +100,6 @@ internal fun PlayerControlsShell(
     onParentalGuideAnimationComplete: () -> Unit = {},
     onScrubChange: (Long) -> Unit,
     onScrubFinished: (Long) -> Unit,
-    // Ported from the NuvioLinux fork's chrome: volume pill in the bottom
-    // row, driven by the snapshot's volumeLevel. Null callbacks keep it
-    // absent (mobile uses gestures).
-    onVolumeChange: ((Float) -> Unit)? = null,
-    onMuteToggle: (() -> Unit)? = null,
     horizontalSafePadding: androidx.compose.ui.unit.Dp,
     modifier: Modifier = Modifier,
 ) {
@@ -199,8 +189,6 @@ internal fun PlayerControlsShell(
                     resizeMode = resizeMode,
                     onScrubChange = onScrubChange,
                     onScrubFinished = onScrubFinished,
-            onVolumeChange = onVolumeChange,
-            onMuteToggle = onMuteToggle,
                     onResizeModeClick = onResizeModeClick,
                     onSpeedClick = onSpeedClick,
                     onSubtitleClick = onSubtitleClick,
@@ -364,12 +352,6 @@ private fun PlayerHeader(
                             onClick = onVideoSettingsClick,
                         )
                     }
-                    FullscreenActionButton(
-                        buttonSize = metrics.headerIconSize + 16.dp,
-                        iconSize = metrics.headerIconSize,
-                        containerColor = Color.Black.copy(alpha = 0.35f),
-                        contentColor = Color.White,
-                    )
                     NuvioBackButton(
                         onClick = onBack,
                         containerColor = Color.Black.copy(alpha = 0.35f),
@@ -519,8 +501,6 @@ private fun ProgressControls(
     onAudioClick: () -> Unit,
     onSourcesClick: (() -> Unit)? = null,
     onEpisodesClick: (() -> Unit)? = null,
-    onVolumeChange: ((Float) -> Unit)? = null,
-    onMuteToggle: (() -> Unit)? = null,
     modifier: Modifier = Modifier,
 ) {
     val durationMs = playbackSnapshot.durationMs.coerceAtLeast(1L)
@@ -563,19 +543,7 @@ private fun ProgressControls(
             verticalAlignment = Alignment.CenterVertically,
         ) {
             TimePill(text = formatPlaybackTime(displayedPositionMs), fontSize = metrics.timeSize)
-            Row(
-                horizontalArrangement = Arrangement.spacedBy(10.dp),
-                verticalAlignment = Alignment.CenterVertically,
-            ) {
-                if (playbackSnapshot.volumeLevel != null && onVolumeChange != null && onMuteToggle != null) {
-                    VolumeControl(
-                        volumeLevel = playbackSnapshot.volumeLevel,
-                        onVolumeChange = onVolumeChange,
-                        onMuteToggle = onMuteToggle,
-                    )
-                }
-                TimePill(text = formatPlaybackTime(durationMs), fontSize = metrics.timeSize)
-            }
+            TimePill(text = formatPlaybackTime(durationMs), fontSize = metrics.timeSize)
         }
         Row(
             modifier = Modifier.fillMaxWidth(),
@@ -731,65 +699,6 @@ internal fun LockedPlayerOverlay(
                 TimePill(text = formatPlaybackTime(durationMs), fontSize = metrics.timeSize)
             }
         }
-    }
-}
-
-// The web chrome's volume control (player-ui/controls.html: volume-button +
-// volume-slider in the playback-status row), expressed in Compose: icon
-// toggles mute, slider drives the level, and a local value keeps the thumb
-// stable mid-drag while snapshots lag behind.
-@Composable
-private fun VolumeControl(
-    volumeLevel: Float?,
-    onVolumeChange: (Float) -> Unit,
-    onMuteToggle: () -> Unit,
-) {
-    val level = (volumeLevel ?: 1f).coerceIn(0f, 1f)
-    var isDragging by remember { mutableStateOf(false) }
-    var localVolume by remember { mutableFloatStateOf(level) }
-    LaunchedEffect(volumeLevel) {
-        if (!isDragging) {
-            localVolume = (volumeLevel ?: 1f).coerceIn(0f, 1f)
-        }
-    }
-    val volumeIcon = when {
-        localVolume <= 0f -> Icons.AutoMirrored.Rounded.VolumeOff
-        localVolume < 0.5f -> Icons.AutoMirrored.Rounded.VolumeDown
-        else -> Icons.AutoMirrored.Rounded.VolumeUp
-    }
-    Row(
-        modifier = Modifier
-            .clip(RoundedCornerShape(22.dp))
-            .clickable(onClick = onMuteToggle)
-            .padding(horizontal = 8.dp, vertical = 4.dp),
-        horizontalArrangement = Arrangement.spacedBy(6.dp),
-        verticalAlignment = Alignment.CenterVertically,
-    ) {
-        Icon(
-            imageVector = volumeIcon,
-            contentDescription = null,
-            tint = Color.White,
-            modifier = Modifier.size(18.dp),
-        )
-        Slider(
-            modifier = Modifier.width(88.dp),
-            value = localVolume,
-            onValueChange = {
-                isDragging = true
-                localVolume = it.coerceIn(0f, 1f)
-                onVolumeChange(it.coerceIn(0f, 1f))
-            },
-            onValueChangeFinished = {
-                isDragging = false
-                onVolumeChange(localVolume.coerceIn(0f, 1f))
-            },
-            valueRange = 0f..1f,
-            colors = SliderDefaults.colors(
-                thumbColor = Color.White,
-                activeTrackColor = Color.White,
-                inactiveTrackColor = Color.White.copy(alpha = 0.28f),
-            ),
-        )
     }
 }
 

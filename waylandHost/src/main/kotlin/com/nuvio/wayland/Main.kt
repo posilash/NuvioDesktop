@@ -566,6 +566,22 @@ fun main() {
         context.flush()
         timings.add("flush", System.nanoTime() - t)
 
+        // Throwaway resize-mode harness: cycle Fit/Stretch/Zoom and read the
+        // pillarbox edge; the bar is black under Fit, content under Stretch.
+        if (System.getProperty("nuvio.wayland.resizeTest")?.toBoolean() == true) {
+            when (frames) {
+                150 -> { println("[resize-test] -> Stretch"); videoHost?.setResizeMode(com.nuvio.app.features.player.PlayerResizeMode.Stretch) }
+                300 -> { println("[resize-test] -> Zoom"); videoHost?.setResizeMode(com.nuvio.app.features.player.PlayerResizeMode.Zoom) }
+                450 -> { println("[resize-test] -> Fit"); videoHost?.setResizeMode(com.nuvio.app.features.player.PlayerResizeMode.Fit) }
+            }
+            if (frames % 30 == 0) {
+                val px = java.nio.ByteBuffer.allocateDirect(4)
+                GL30.glBindFramebuffer(GL30.GL_FRAMEBUFFER, 0)
+                GL11.glReadPixels(8, height / 2, 1, 1, GL11.GL_RGBA, GL11.GL_UNSIGNED_BYTE, px)
+                val v = (px.get(0).toInt() and 0xFF) + (px.get(1).toInt() and 0xFF) + (px.get(2).toInt() and 0xFF)
+                println("[resize-test] frame=$frames edgeSum=$v (${if (v > 30) "CONTENT" else "bar"})")
+            }
+        }
         if (probePixels && frames % 15 == 0) {
             // Same pixel, now after Compose has drawn. If mpv's value was
             // non-black and this is black, Compose is painting over the video.

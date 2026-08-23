@@ -570,9 +570,6 @@ private fun PlayerScreenRuntime.currentInitialPositionRequestKey(): String? {
 @Composable
 private fun PlayerScreenRuntime.RenderPlayerControls(displayedPositionMs: Long, isEpisode: Boolean) {
     val isInPip = rememberIsInPictureInPicture()
-    // Volume flows through the snapshot (NuvioLinux's design); the chrome's
-    // pill only needs the change and mute callbacks, backed by the host.
-    val volumeController = rememberPlayerGestureController()
     AnimatedVisibility(
         visible = (controlsVisible || showParentalGuide) && !playerControlsLocked && !isInPip,
         enter = fadeIn(),
@@ -668,15 +665,6 @@ private fun PlayerScreenRuntime.RenderPlayerControls(displayedPositionMs: Long, 
                 scrubbingPositionMs = null
                 playerController?.seekTo(positionMs)
                 scheduleProgressSyncAfterSeek()
-            },
-            onVolumeChange = volumeController?.let { controller ->
-                { level: Float -> controller.setVolume(level) }
-            },
-            onMuteToggle = volumeController?.let { controller ->
-                {
-                    val level = controller.currentVolume()
-                    if (level != null) playerController?.setMuted(!level.isMuted)
-                }
             },
             horizontalSafePadding = horizontalSafePadding,
             modifier = Modifier.fillMaxSize(),
