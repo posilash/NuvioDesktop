@@ -279,7 +279,12 @@ class WaylandVideoHost(
     }
 
     override fun selectAudioTrack(id: Int) {
-        mpv.setProperty("aid", if (id < 0) "no" else id.toString())
+        // id < 0 means "default/auto" -- the runtime sends -1 at startup to
+        // assert its no-preference state. Mapping it to aid=no muted every
+        // session at start (the log's video-only "V:" status lines) until the
+        // user picked a track by hand. Subtitles differ: there -1 really is
+        // "off".
+        mpv.setProperty("aid", if (id < 0) "auto" else id.toString())
     }
 
     override fun selectSubtitleTrack(id: Int) {
