@@ -120,20 +120,38 @@ class InputRouter(
 
         // Text input arrives separately from key events: GLFW's key callback
         // reports physical keys, while this reports the composed character,
-        // which is what text fields need.
+        // which is what text fields need. The codepoint alone is not enough:
+        // Compose's desktop isTypedEvent demands an AWT KEY_TYPED (id 400)
+        // nativeEvent -- decompiled from TextFieldKeyInput.desktop.kt -- and
+        // silently inserts nothing without one. So the character is dressed up
+        // as exactly the event AWT would have delivered.
         glfwSetCharCallback(window) { _, codepoint ->
             val mods = modifiers
             onUiThread {
-                scene.sendKeyEvent(
-                    KeyEvent(
-                        InternalKeyEvent(
-                            Key.Unknown, KeyEventType.KeyDown, codepoint, mods, null,
+                for (ch in Character.toChars(codepoint)) {
+                    val awtTyped = java.awt.event.KeyEvent(
+                        awtEventSource,
+                        java.awt.event.KeyEvent.KEY_TYPED,
+                        System.currentTimeMillis(),
+                        0,
+                        java.awt.event.KeyEvent.VK_UNDEFINED,
+                        ch,
+                    )
+                    scene.sendKeyEvent(
+                        KeyEvent(
+                            InternalKeyEvent(
+                                Key.Unknown, KeyEventType.KeyDown, ch.code, mods, awtTyped,
+                            ),
                         ),
-                    ),
-                )
+                    )
+                }
             }
         }
     }
+
+    // AWT events want a Component source; this one never has a peer and never
+    // shows -- it exists only to satisfy the constructor.
+    private val awtEventSource = java.awt.Container()
 
     /** Compose state must only be touched from the thread that renders it. */
     private fun onUiThread(block: () -> Unit) = java.awt.EventQueue.invokeLater(block)
