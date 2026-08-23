@@ -130,13 +130,13 @@ fun main() {
         mpv = Mpv.create().apply {
             // Load the user's own mpv.conf: their scaler, deband and HDR
             // profile tuning are exactly what they expect playback to look
-            // like. Options set through the API before initialize() rank like
-            // command-line options and override the file, which is how the
-            // host keeps the ones it must own (vo, and position restoring --
-            // the app manages resume itself, so mpv's watch-later would fight
-            // it).
+            // like. NOTE the precedence trap: the config file is parsed at
+            // initialize() and overwrites anything set through the API before
+            // it -- API sets do NOT rank like command-line options. The conf's
+            // vo=gpu-next beating our vo=libmpv is how playback ended up in a
+            // real mpv-owned window. Everything the host must own is therefore
+            // (re)asserted AFTER initialize(), below.
             setOption("config", "yes")
-            setOption("save-position-on-quit", "no")
             // The conf dir also carries their standalone-mpv scripts (modernz,
             // thumbfast): OSC replacements that would paint a second player UI
             // into the frames underneath the app's own chrome. Options yes,
@@ -145,16 +145,22 @@ fun main() {
             setOption("terminal", "yes")
             setOption("msg-level", "all=info")
             if (!runRealAppEarly) setOption("audio", "no")
-            setOption("vo", "libmpv")
             if (System.getProperty("nuvio.wayland.videoLog")?.toBoolean() == true) {
                 setOption("msg-level", "all=v")
             }
-            // config=no above means the user's mpv.conf never loads, and mpv's
-            // own default is hwdec=no -- so without this every stream is
-            // software-decoded. "auto" picks nvdec with cuda-interop here,
-            // which is the zero-copy path the render API was built for.
-            setOption("hwdec", System.getProperty("nuvio.wayland.hwdec") ?: "auto")
             initialize()
+            // Host-owned options, asserted after the config file has been
+            // parsed so it cannot overwrite them (see the note above):
+            // - vo=libmpv: the render API is the only output; the conf's
+            //   vo=gpu-next would open mpv's own window.
+            // - no position saving: the app manages resume itself; mpv's
+            //   watch-later would fight it.
+            // - hwdec: explicit override wins, else the conf decides, else
+            //   auto -- mpv's own default is 'no', i.e. software decode.
+            setOption("vo", "libmpv")
+            setOption("save-position-on-quit", "no")
+            System.getProperty("nuvio.wayland.hwdec")?.let { setOption("hwdec", it) }
+                ?: run { if (getProperty("hwdec") == "no") setOption("hwdec", "auto") }
             if (System.getProperty("nuvio.wayland.videoLog")?.toBoolean() == true) {
                 requestLogMessages("v")
             }
@@ -226,11 +232,17 @@ fun main() {
         glfwGetFramebufferSize(window, fw, fh)
         glfwGetWindowContentScale(window, cx, cy)
         val scale = if (ww[0] > 0) fw[0].toFloat() / ww[0] else 1f
+        // Optional override for comparing UI sizing: the stock build runs
+        // XWayland at density 1 regardless of the output's real scale, so its
+        // UI is smaller than any native-scale app. -Pnuvio.wayland.uiScale=1.0
+        // reproduces that look; unset means the display's true scale.
+        val override = System.getProperty("nuvio.wayland.uiScale")?.toFloatOrNull()
         println(
             "[wayland-scale] window=${ww[0]}x${wh[0]} fb=${fw[0]}x${fh[0]} " +
-                "contentScale=${cx[0]} -> density=$scale",
+                "contentScale=${cx[0]} -> density=${override ?: scale}" +
+                if (override != null) " (override)" else "",
         )
-        return scale
+        return override ?: scale
     }
 
     val scene: ComposeScene = CanvasLayersComposeScene(
@@ -323,6 +335,53 @@ fun main() {
         }
         println("content: demo")
     }
+    }
+
+    // The app's fullscreen button resolves through DesktopAppFullscreen, whose
+    // stock handler drives an AWT window that does not exist here. GLFW's
+    // window-monitor calls belong to the main thread, and the app invokes the
+    // toggle from the EDT, so the handler blocks briefly on a main-thread
+    // hop -- the main loop wakes on the posted event and applies it.
+    val fullscreenApplied = java.util.concurrent.atomic.AtomicBoolean(false)
+    val fullscreenRequests = java.util.concurrent.ConcurrentLinkedQueue<java.util.concurrent.CountDownLatch>()
+    var windowedX = 0; var windowedY = 0
+    var windowedW = INITIAL_WIDTH; var windowedH = INITIAL_HEIGHT
+    if (runRealAppEarly) {
+        com.nuvio.app.features.player.desktop.WaylandVideoBridge.registerFullscreenToggle(
+            handler = {
+                val latch = java.util.concurrent.CountDownLatch(1)
+                fullscreenRequests.add(latch)
+                glfwPostEmptyEvent()
+                latch.await(2, java.util.concurrent.TimeUnit.SECONDS)
+            },
+            isFullscreen = { fullscreenApplied.get() },
+        )
+    }
+    fun applyFullscreenRequests() {
+        while (true) {
+            val latch = fullscreenRequests.poll() ?: return
+            if (!fullscreenApplied.get()) {
+                val x = IntArray(1); val y = IntArray(1)
+                val w = IntArray(1); val h = IntArray(1)
+                glfwGetWindowPos(window, x, y)
+                glfwGetWindowSize(window, w, h)
+                windowedX = x[0]; windowedY = y[0]; windowedW = w[0]; windowedH = h[0]
+                val monitor = glfwGetPrimaryMonitor()
+                val mode = glfwGetVideoMode(monitor)
+                if (mode != null) {
+                    glfwSetWindowMonitor(
+                        window, monitor, 0, 0, mode.width(), mode.height(), mode.refreshRate(),
+                    )
+                    fullscreenApplied.set(true)
+                }
+            } else {
+                glfwSetWindowMonitor(
+                    window, NULL, windowedX, windowedY, windowedW, windowedH, 0,
+                )
+                fullscreenApplied.set(false)
+            }
+            latch.countDown()
+        }
     }
 
     val input = InputRouter(window, scene)
@@ -499,6 +558,7 @@ fun main() {
             // invalidations do not wake GLFW, hence the timeout rather than an
             // indefinite wait.
             if (presented) glfwPollEvents() else glfwWaitEventsTimeout(0.004)
+            applyFullscreenRequests()
             val afterPoll = System.nanoTime()
             timings.add("poll", afterPoll - beforePoll)
             java.awt.EventQueue.invokeAndWait {

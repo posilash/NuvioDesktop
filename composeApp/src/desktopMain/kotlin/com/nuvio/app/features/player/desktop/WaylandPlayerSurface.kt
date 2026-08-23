@@ -30,10 +30,14 @@ import kotlinx.coroutines.delay
 @Composable
 internal fun WaylandPlayerSurface(
     sourceUrl: String,
+    sourceAudioUrl: String?,
     sourceHeaders: Map<String, String>,
+    externalSubtitles: List<com.nuvio.app.features.streams.StreamSubtitle>,
     modifier: Modifier,
     playWhenReady: Boolean,
     initialPositionMs: Long,
+    initialPositionRequestKey: String?,
+    onInitialPositionHandled: (key: String, handled: Boolean) -> Unit,
     onControllerReady: (PlayerEngineController) -> Unit,
     onSnapshot: (PlayerPlaybackSnapshot) -> Unit,
     onError: (String?) -> Unit,
@@ -54,7 +58,20 @@ internal fun WaylandPlayerSurface(
             headers = sourceHeaders.map { (k, v) -> "$k: $v" },
             startPositionMs = initialPositionMs,
             playWhenReady = playWhenReady,
+            audioUrl = sourceAudioUrl,
+            subtitles = externalSubtitles.map {
+                WaylandVideoBridge.ExternalSubtitle(
+                    url = it.url,
+                    language = it.language,
+                    title = it.name,
+                )
+            },
         )
+        // The runtime tracks whether the resume position was actually applied
+        // and re-requests it until told. open() passed it to mpv above.
+        if (initialPositionRequestKey != null) {
+            onInitialPositionHandled(initialPositionRequestKey, initialPositionMs > 0)
+        }
         onDispose {
             WaylandVideoLog.log("surface: disposed")
             bridge.stop()
@@ -132,10 +149,8 @@ private class WaylandPlayerController(
         bridge.seekBy(0)
     }
 
-    // Track enumeration is not wired yet; the UI treats an empty list as
-    // "nothing to choose from" rather than erroring.
-    override fun getAudioTracks(): List<AudioTrack> = emptyList()
-    override fun getSubtitleTracks(): List<SubtitleTrack> = emptyList()
+    override fun getAudioTracks(): List<AudioTrack> = bridge.audioTracks()
+    override fun getSubtitleTracks(): List<SubtitleTrack> = bridge.subtitleTracks()
     override fun selectAudioTrack(index: Int) = bridge.selectAudioTrack(index)
     override fun selectSubtitleTrack(index: Int) = bridge.selectSubtitleTrack(index)
 
@@ -146,6 +161,8 @@ private class WaylandPlayerController(
         bridge.selectSubtitleTrack(trackIndex)
     }
 
+    // Subtitle styling comes from the user's own mpv.conf, which the host
+    // loads; the app's style panel is not mapped onto it.
     override fun applySubtitleStyle(style: SubtitleStyleState, useLibass: Boolean) {}
-    override fun setSubtitleDelayMs(delayMs: Int) {}
+    override fun setSubtitleDelayMs(delayMs: Int) = bridge.setSubtitleDelayMs(delayMs)
 }

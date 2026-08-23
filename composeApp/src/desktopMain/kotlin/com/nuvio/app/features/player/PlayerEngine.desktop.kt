@@ -62,10 +62,14 @@ actual fun PlatformPlayerSurface(
     if (com.nuvio.app.features.player.desktop.WaylandVideoBridge.isAvailable) {
         com.nuvio.app.features.player.desktop.WaylandPlayerSurface(
             sourceUrl = sourceUrl,
+            sourceAudioUrl = sourceAudioUrl,
             sourceHeaders = sourceHeaders,
+            externalSubtitles = externalSubtitles,
             modifier = modifier,
             playWhenReady = playWhenReady,
             initialPositionMs = initialPositionMs ?: 0L,
+            initialPositionRequestKey = initialPositionRequestKey,
+            onInitialPositionHandled = onInitialPositionHandled,
             onControllerReady = onControllerReady,
             onSnapshot = onSnapshot,
             onError = onError,

@@ -17,9 +17,28 @@ package com.nuvio.app.features.player.desktop
  */
 object WaylandVideoBridge {
 
+    /** An addon-provided subtitle to attach at open time. */
+    data class ExternalSubtitle(
+        val url: String,
+        val language: String,
+        val title: String?,
+    )
+
     interface Delegate {
-        /** Start playing [url]. [headers] are HTTP header lines, as mpv wants them. */
-        fun open(url: String, headers: List<String>, startPositionMs: Long, playWhenReady: Boolean)
+        /**
+         * Start playing [url]. [headers] are HTTP header lines, as mpv wants
+         * them. [audioUrl] is a separate audio stream for sources that split
+         * tracks; without it such streams play silent. [subtitles] are
+         * attached (not selected) so the track menus can offer them.
+         */
+        fun open(
+            url: String,
+            headers: List<String>,
+            startPositionMs: Long,
+            playWhenReady: Boolean,
+            audioUrl: String? = null,
+            subtitles: List<ExternalSubtitle> = emptyList(),
+        )
 
         fun play()
         fun pause()
@@ -37,7 +56,12 @@ object WaylandVideoBridge {
         fun clearExternalSubtitles()
         fun selectAudioTrack(id: Int)
         fun selectSubtitleTrack(id: Int)
+        fun setSubtitleDelayMs(delayMs: Int)
         fun stop()
+
+        /** Current track lists, ids matching what the select methods expect. */
+        fun audioTracks(): List<com.nuvio.app.features.player.AudioTrack>
+        fun subtitleTracks(): List<com.nuvio.app.features.player.SubtitleTrack>
 
         /** Current playback state, polled by the surface once per frame. */
         fun snapshot(): State
@@ -77,4 +101,17 @@ object WaylandVideoBridge {
     var delegate: Delegate? = null
 
     val isAvailable: Boolean get() = delegate != null
+
+    /**
+     * Route the app's fullscreen action to the host's window. The stock
+     * handler drives an AWT window; an AWT-free host registers its own here.
+     * Returns the unregister function.
+     */
+    fun registerFullscreenToggle(
+        handler: () -> Unit,
+        isFullscreen: () -> Boolean,
+    ): () -> Unit = registerDesktopAppFullscreenToggle(
+        handler = { handler() },
+        isFullscreen = { isFullscreen() },
+    )
 }

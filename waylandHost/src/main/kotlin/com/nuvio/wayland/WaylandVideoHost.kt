@@ -195,17 +195,32 @@ class WaylandVideoHost(
         headers: List<String>,
         startPositionMs: Long,
         playWhenReady: Boolean,
+        audioUrl: String?,
+        subtitles: List<WaylandVideoBridge.ExternalSubtitle>,
     ) {
         if (headers.isNotEmpty()) {
             // mpv wants header lines joined by newlines, same as the existing
             // desktop bridge passes them.
             mpv.setProperty("http-header-fields", headers.joinToString("\n"))
         }
+        // Sources that split their audio into a separate stream are silent
+        // without this. Cleared explicitly: the property persists across
+        // loads, and the previous file's audio bleeding into the next is
+        // exactly the kind of bug nobody traces quickly.
+        mpv.setProperty("audio-files", audioUrl ?: "")
         mpv.setProperty("pause", if (playWhenReady) "no" else "yes")
         if (startPositionMs > 0) {
             mpv.setProperty("start", (startPositionMs / 1000.0).toString())
         }
         mpv.command("loadfile", url)
+        for (sub in subtitles) {
+            // "auto" attaches without selecting; the app's own subtitle
+            // policy decides what to enable.
+            mpv.command(
+                "sub-add", sub.url, "auto",
+                sub.title ?: sub.language, sub.language,
+            )
+        }
         hasFile = true
     }
 
@@ -247,6 +262,66 @@ class WaylandVideoHost(
     override fun selectSubtitleTrack(id: Int) {
         mpv.setProperty("sid", if (id < 0) "no" else id.toString())
     }
+
+    override fun setSubtitleDelayMs(delayMs: Int) {
+        mpv.setProperty("sub-delay", (delayMs / 1000.0).toString())
+    }
+
+    /**
+     * mpv's track list, read property-by-property (`track-list/N/...`) rather
+     * than parsing the JSON blob. Track ids are mpv ids, which is what the
+     * aid/sid selectors above expect back.
+     */
+    private data class MpvTrack(
+        val id: Int,
+        val title: String?,
+        val language: String?,
+        val selected: Boolean,
+        val forced: Boolean,
+    )
+
+    private fun tracks(type: String): List<MpvTrack> {
+        val count = mpv.getProperty("track-list/count")?.toIntOrNull() ?: 0
+        val out = ArrayList<MpvTrack>()
+        for (i in 0 until count) {
+            if (mpv.getProperty("track-list/$i/type") != type) continue
+            val id = mpv.getProperty("track-list/$i/id")?.toIntOrNull() ?: continue
+            out += MpvTrack(
+                id = id,
+                title = mpv.getProperty("track-list/$i/title"),
+                language = mpv.getProperty("track-list/$i/lang"),
+                selected = mpv.getProperty("track-list/$i/selected") == "yes",
+                forced = mpv.getProperty("track-list/$i/forced") == "yes",
+            )
+        }
+        return out
+    }
+
+    private fun MpvTrack.label(fallback: String): String =
+        title ?: language ?: "$fallback $id"
+
+    override fun audioTracks(): List<com.nuvio.app.features.player.AudioTrack> =
+        tracks("audio").map { t ->
+            com.nuvio.app.features.player.AudioTrack(
+                index = t.id,
+                id = t.id.toString(),
+                label = t.label("Audio"),
+                language = t.language,
+                isSelected = t.selected,
+            )
+        }
+
+    override fun subtitleTracks(): List<com.nuvio.app.features.player.SubtitleTrack> =
+        tracks("sub").map { t ->
+            com.nuvio.app.features.player.SubtitleTrack(
+                index = t.id,
+                id = t.id.toString(),
+                label = t.label("Subtitle"),
+                language = t.language,
+                isSelected = t.selected,
+                isForced = t.forced,
+            )
+        }
 
     override fun stop() {
         hasFile = false

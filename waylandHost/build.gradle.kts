@@ -88,7 +88,7 @@ application {
         add("--enable-native-access=ALL-UNNAMED")
         for (k in listOf(
             "media", "libmpv", "hwdec", "realApp", "probe", "videoLog",
-            "smokePlayer", "demoFrames",
+            "smokePlayer", "demoFrames", "uiScale",
         )) {
             providers.gradleProperty("nuvio.wayland.$k").orNull
                 ?.let { add("-Dnuvio.wayland.$k=$it") }
