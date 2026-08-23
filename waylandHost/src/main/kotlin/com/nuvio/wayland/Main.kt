@@ -463,8 +463,12 @@ fun main() {
             }
         }
     } finally {
-        // The pipeline frees the mpv render context on its own thread (where
-        // its GL context lives); only then may the core handle be destroyed.
+        // Teardown order matters, per the render API's contract: quit the core
+        // and wait for its shutdown event (so the VO and its dispatch queues
+        // are gone), then free the render context on the thread that owns it,
+        // then destroy the handle. Freeing the render context first raced VO
+        // teardown and aborted the process on exit-after-playback.
+        mpv?.quitAndAwaitShutdown()
         pipeline?.stop()
         mpv?.close()
         scene.close()

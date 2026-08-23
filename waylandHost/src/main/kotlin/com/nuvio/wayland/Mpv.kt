@@ -399,6 +399,27 @@ class Mpv private constructor(private val handle: MemorySegment, private val are
     fun getDouble(name: String): Double? = getProperty(name)?.toDoubleOrNull()
     fun getBoolean(name: String): Boolean? = getProperty(name)?.let { it == "yes" || it == "true" }
 
+    /**
+     * Ask the core to quit and wait until it reports MPV_EVENT_SHUTDOWN.
+     *
+     * This is the render API's documented teardown order: freeing the render
+     * context while the core's VO still exists races its dispatch queues --
+     * observed as `queue_dtor: Assertion !queue->lock_requests` aborting the
+     * whole process when the window was closed after playback. After the
+     * shutdown event, the core guarantees the VO is gone and
+     * mpv_render_context_free is safe.
+     */
+    fun quitAndAwaitShutdown(timeoutSeconds: Double = 5.0) {
+        command("quit")
+        val deadline = System.nanoTime() + (timeoutSeconds * 1e9).toLong()
+        while (System.nanoTime() < deadline) {
+            val ev = mpvWaitEvent.invokeExact(handle, 0.25) as MemorySegment
+            if (ev.equals(MemorySegment.NULL)) continue
+            val id = ev.reinterpret(64).get(JAVA_INT, 0)
+            if (id == 1) return // MPV_EVENT_SHUTDOWN
+        }
+    }
+
     fun close() {
         // The render context belongs to the video thread's GL context; freeing
         // it from here would touch GL from the wrong thread. freeRenderContext()
