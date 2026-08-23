@@ -816,6 +816,15 @@ fun main() {
         return true
     }
 
+    // The chrome view must match the framebuffer from the first frame, not
+    // only after a resize -- a stale 1280x800 view under a differently-sized
+    // window skews every click through the stretch factor.
+    run {
+        val fw = IntArray(1); val fh = IntArray(1)
+        glfwGetFramebufferSize(window, fw, fh)
+        if (fw[0] > 0) wpeChrome?.dispatchSize(fw[0], fh[0])
+    }
+
     var presented = true
     try {
         while (!glfwWindowShouldClose(window)) {
