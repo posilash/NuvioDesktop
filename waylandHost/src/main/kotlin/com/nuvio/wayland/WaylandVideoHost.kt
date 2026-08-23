@@ -214,6 +214,16 @@ class WaylandVideoHost(
     override fun setSpeed(speed: Float) = mpv.setProperty("speed", speed.toString())
     override fun setMuted(muted: Boolean) = mpv.setProperty("mute", if (muted) "yes" else "no")
 
+    override fun audioLevel(): com.nuvio.app.features.player.PlayerAudioLevel =
+        com.nuvio.app.features.player.PlayerAudioLevel(
+            fraction = ((mpv.getDouble("volume") ?: 100.0) / 100.0).toFloat().coerceIn(0f, 1f),
+            isMuted = mpv.getBoolean("mute") ?: false,
+        )
+
+    override fun setVolumeFraction(fraction: Float) {
+        mpv.setProperty("volume", (fraction.coerceIn(0f, 1f) * 100.0).toString())
+    }
+
     override fun seekTo(positionMs: Long) {
         mpv.command("seek", (positionMs / 1000.0).toString(), "absolute")
     }

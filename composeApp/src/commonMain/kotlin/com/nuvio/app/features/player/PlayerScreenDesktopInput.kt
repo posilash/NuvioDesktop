@@ -41,6 +41,15 @@ internal fun PlayerScreenRuntime.desktopPlayerInput(modifier: Modifier): Modifie
         runCatching { focusRequester.requestFocus() }
     }
 
+    val gestureController = rememberPlayerGestureController()
+    fun adjustVolume(delta: Float) {
+        val controller = gestureController ?: return
+        val current = controller.currentVolume()?.fraction ?: return
+        val level = controller.setVolume((current + delta).coerceIn(0f, 1f)) ?: return
+        showVolumeFeedback(level)
+        controlsActivityTick += 1
+    }
+
     return modifier
         .pointerInput(Unit) {
             // kotlin.time, not System.nanoTime(): this file is common code.
@@ -48,6 +57,14 @@ internal fun PlayerScreenRuntime.desktopPlayerInput(modifier: Modifier): Modifie
             awaitPointerEventScope {
                 while (true) {
                     val event = awaitPointerEvent(PointerEventPass.Initial)
+                    if (event.type == PointerEventType.Scroll) {
+                        // Wheel over the player adjusts volume, matching the
+                        // stock desktop behaviour. Observed on the Initial
+                        // pass without consuming; nothing under the player
+                        // scrolls, so this steals from no one.
+                        val notches = event.changes.firstOrNull()?.scrollDelta?.y ?: 0f
+                        if (notches != 0f) adjustVolume(-notches * 0.05f)
+                    }
                     if (event.type == PointerEventType.Move) {
                         val stale = lastActivity
                             ?.let { it.elapsedNow().inWholeMilliseconds > 200 }
@@ -91,6 +108,14 @@ internal fun PlayerScreenRuntime.desktopPlayerInput(modifier: Modifier): Modifie
                     seekBy(10_000L)
                     controlsVisible = true
                     controlsActivityTick += 1
+                    true
+                }
+                Key.DirectionUp -> {
+                    adjustVolume(0.05f)
+                    true
+                }
+                Key.DirectionDown -> {
+                    adjustVolume(-0.05f)
                     true
                 }
                 else -> false

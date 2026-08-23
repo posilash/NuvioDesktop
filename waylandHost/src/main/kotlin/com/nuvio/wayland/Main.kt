@@ -128,7 +128,20 @@ fun main() {
             exitProcess(1)
         }
         mpv = Mpv.create().apply {
-            setOption("config", "no")
+            // Load the user's own mpv.conf: their scaler, deband and HDR
+            // profile tuning are exactly what they expect playback to look
+            // like. Options set through the API before initialize() rank like
+            // command-line options and override the file, which is how the
+            // host keeps the ones it must own (vo, and position restoring --
+            // the app manages resume itself, so mpv's watch-later would fight
+            // it).
+            setOption("config", "yes")
+            setOption("save-position-on-quit", "no")
+            // The conf dir also carries their standalone-mpv scripts (modernz,
+            // thumbfast): OSC replacements that would paint a second player UI
+            // into the frames underneath the app's own chrome. Options yes,
+            // scripts no.
+            setOption("load-scripts", "no")
             setOption("terminal", "yes")
             setOption("msg-level", "all=info")
             if (!runRealAppEarly) setOption("audio", "no")
@@ -208,9 +221,16 @@ fun main() {
     fun currentScale(): Float {
         val ww = IntArray(1); val wh = IntArray(1)
         val fw = IntArray(1); val fh = IntArray(1)
+        val cx = FloatArray(1); val cy = FloatArray(1)
         glfwGetWindowSize(window, ww, wh)
         glfwGetFramebufferSize(window, fw, fh)
-        return if (ww[0] > 0) fw[0].toFloat() / ww[0] else 1f
+        glfwGetWindowContentScale(window, cx, cy)
+        val scale = if (ww[0] > 0) fw[0].toFloat() / ww[0] else 1f
+        println(
+            "[wayland-scale] window=${ww[0]}x${wh[0]} fb=${fw[0]}x${fh[0]} " +
+                "contentScale=${cx[0]} -> density=$scale",
+        )
+        return scale
     }
 
     val scene: ComposeScene = CanvasLayersComposeScene(
@@ -327,6 +347,32 @@ fun main() {
 
     var exitCode = 0
     val timings = FrameTimings()
+
+    // Cadence evidence for judder: how far apart video presents actually land.
+    // A 24fps source on a 165Hz panel should alternate cleanly between 7- and
+    // 6-vsync intervals (42.4/36.4ms); anything outside that pattern is
+    // latency of ours, not arithmetic.
+    var lastVideoPresentNs = 0L
+    val cadenceBuckets = IntArray(12)
+    var cadenceReportNs = 0L
+    fun noteVideoPresent(now: Long) {
+        if (lastVideoPresentNs != 0L) {
+            val ms = (now - lastVideoPresentNs) / 1e6
+            val bucket = (ms / 6.06).toInt().coerceIn(0, cadenceBuckets.size - 1)
+            cadenceBuckets[bucket]++
+        }
+        lastVideoPresentNs = now
+        if (videoLog && now - cadenceReportNs > 5_000_000_000L) {
+            if (cadenceReportNs != 0L) {
+                val body = cadenceBuckets.withIndex()
+                    .filter { it.value > 0 }
+                    .joinToString(" ") { "${it.index}v=${it.value}" }
+                println("[wayland-video] cadence(vsyncs): $body")
+                cadenceBuckets.fill(0)
+            }
+            cadenceReportNs = now
+        }
+    }
     // The demo path is self-terminating so it can be run unattended; long
     // enough to produce several per-second timing reports.
     val demoFrames = System.getProperty("nuvio.wayland.demoFrames")?.toInt() ?: 120
@@ -425,6 +471,7 @@ fun main() {
         t = System.nanoTime()
         glfwSwapBuffers(window)
         timings.add("swap", System.nanoTime() - t)
+        if (videoChanged) noteVideoPresent(System.nanoTime())
 
         timings.endFrame()
 

@@ -27,6 +27,12 @@ object WaylandVideoBridge {
         fun seekBy(offsetMs: Long)
         fun setSpeed(speed: Float)
         fun setMuted(muted: Boolean)
+
+        /** Player volume as a 0..1 fraction, plus mute state. */
+        fun audioLevel(): com.nuvio.app.features.player.PlayerAudioLevel
+
+        /** Set player volume as a 0..1 fraction. Does not touch mute. */
+        fun setVolumeFraction(fraction: Float)
         fun setSubtitleUrl(url: String)
         fun clearExternalSubtitles()
         fun selectAudioTrack(id: Int)
