@@ -41,28 +41,55 @@ class WaylandVideoHost(
     private var renderCount = 0L
     private var drawCount = 0L
     private var updatePolls = 0L
+    private var earlyCount = 0L
     private var lastReport = 0L
+
+    // Rolling estimate of the host's present interval, used to decide whether a
+    // frame is close enough to its deadline to draw now. Measured rather than
+    // assumed: the display's refresh rate is not ours to know from here, and
+    // vsync is what actually sets the loop's cadence.
+    private var lastFrameNanos = 0L
+    private var presentIntervalNs = 16_667_000.0
 
     /** Per-second summary of what the video path is actually doing. */
     fun report(now: Long): String? {
         if (now - lastReport < 1_000_000_000L) return null
         lastReport = now
-        val r = renderCount; val d = drawCount; val u = updatePolls
-        renderCount = 0; drawCount = 0; updatePolls = 0
+        val r = renderCount; val d = drawCount; val u = updatePolls; val e = earlyCount
+        renderCount = 0; drawCount = 0; updatePolls = 0; earlyCount = 0
         return "video: hasFile=$hasFile target=${texWidth}x$texHeight " +
-            "mpvRenders/s=$r composeDraws/s=$d updatePolls/s=$u " +
+            "mpvRenders/s=$r composeDraws/s=$d updatePolls/s=$u tooEarly/s=$e " +
+            "present=%.1fms ".format(presentIntervalNs / 1e6) +
             "lastUpdateFlags=${mpv.lastUpdateFlags} surface=${videoSurface != null}"
     }
 
-    /** Render one frame, if mpv has a new one. Must run on the GL thread. */
+    /** Render one frame, if mpv has one that is due. Must run on the GL thread. */
     fun renderFrame(width: Int, height: Int) {
         if (!hasFile || width <= 0 || height <= 0) return
         ensureTarget(width, height)
+
+        trackPresentInterval()
 
         // Only clear and render when mpv actually has a frame: clearing first
         // and then rendering nothing paints the window black.
         updatePolls++
         if (!mpv.hasNewFrame()) return
+
+        // mpv makes frames available early -- "video-timing-offset" of headroom,
+        // 50ms by default -- and would normally sleep off the difference inside
+        // render(). Rendering it the moment it appears would run the video fast
+        // and judder; blocking would pin the UI to the video's frame rate. So
+        // hold the frame until it is within half a present interval of its
+        // deadline, and leave the previous one on screen until then. The update
+        // flag stays set meanwhile, so the frame is not lost.
+        val info = mpv.nextFrameInfo()
+        if (info != null && info.isPresent && info.targetTimeNs != 0L) {
+            val aheadNs = info.targetTimeNs - mpv.timeNs()
+            if (aheadNs > presentIntervalNs / 2) {
+                earlyCount++
+                return
+            }
+        }
         renderCount++
 
         // Skia's snapshots are copy-on-write, invalidated by Skia's own draw
@@ -86,6 +113,23 @@ class WaylandVideoHost(
         GL11.glDisable(GL11.GL_SCISSOR_TEST)
         GL11.glViewport(0, 0, width, height)
         context.resetGLAll()
+    }
+
+    /**
+     * Keep a smoothed estimate of how often this loop presents.
+     *
+     * Long gaps (a stall, a resize, the first frame) would otherwise poison the
+     * average and make everything look "due", so they are ignored rather than
+     * averaged in.
+     */
+    private fun trackPresentInterval() {
+        val now = System.nanoTime()
+        val previous = lastFrameNanos
+        lastFrameNanos = now
+        if (previous == 0L) return
+        val deltaNs = (now - previous).toDouble()
+        if (deltaNs <= 0 || deltaNs > 100_000_000) return
+        presentIntervalNs += (deltaNs - presentIntervalNs) * 0.1
     }
 
     private fun ensureTarget(width: Int, height: Int) {

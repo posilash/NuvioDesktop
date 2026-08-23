@@ -114,7 +114,11 @@ fun main() {
             if (System.getProperty("nuvio.wayland.videoLog")?.toBoolean() == true) {
                 setOption("msg-level", "all=v")
             }
-            System.getProperty("nuvio.wayland.hwdec")?.let { setOption("hwdec", it) }
+            // config=no above means the user's mpv.conf never loads, and mpv's
+            // own default is hwdec=no -- so without this every stream is
+            // software-decoded. "auto" picks nvdec with cuda-interop here,
+            // which is the zero-copy path the render API was built for.
+            setOption("hwdec", System.getProperty("nuvio.wayland.hwdec") ?: "auto")
             initialize()
             java.awt.EventQueue.invokeAndWait {
                 createRenderContext(Mpv.MPV_RENDER_API_TYPE_OPENGL_NEXT) { name ->
@@ -224,6 +228,10 @@ fun main() {
     input.install()
 
     var exitCode = 0
+    val timings = FrameTimings()
+    // The demo path is self-terminating so it can be run unattended; long
+    // enough to produce several per-second timing reports.
+    val demoFrames = System.getProperty("nuvio.wayland.demoFrames")?.toInt() ?: 120
 
     fun renderOneFrame() {
 
@@ -248,17 +256,24 @@ fun main() {
         // Video goes into an offscreen texture, never into the window, so it
         // composites as ordinary Compose content rather than sitting under the
         // scene where any opaque background would cover it.
+        var t = System.nanoTime()
         videoHost?.renderFrame(width, height)
+        timings.add("mpv", System.nanoTime() - t)
 
         if (videoLog) {
             mpv?.pumpEvents { println(it) }
             videoHost?.report(System.nanoTime())?.let { println("[wayland-video] $it") }
+            input.report(System.nanoTime())?.let { println("[wayland-video] $it") }
         }
 
+        t = System.nanoTime()
         s.canvas.clear(0xFF101014.toInt())
-
         scene.render(s.canvas.asComposeCanvas(), System.nanoTime())
+        timings.add("scene", System.nanoTime() - t)
+
+        t = System.nanoTime()
         context.flush()
+        timings.add("flush", System.nanoTime() - t)
 
         if (probePixels && frames % 15 == 0) {
             // Same pixel, now after Compose has drawn. If mpv's value was
@@ -284,11 +299,18 @@ fun main() {
             }
             println("probe: frame=$frames hash=$hash nonBlackPixels=$nonBlack/${n * n}")
         }
+        t = System.nanoTime()
         glfwSwapBuffers(window)
+        timings.add("swap", System.nanoTime() - t)
+
+        timings.endFrame()
+        if (videoLog) {
+            timings.report(System.nanoTime())?.let { println("[wayland-video] $it") }
+        }
 
         frames++
-        if (!runRealApp && frames == 120) {
-        println("RESULT: rendered 120 frames on $platformName")
+        if (!runRealApp && frames == demoFrames) {
+        println("RESULT: rendered $demoFrames frames on $platformName")
         if (platformName != "Wayland") {
             System.err.println("FAIL: not running on Wayland")
             exitCode = 1
@@ -301,8 +323,17 @@ fun main() {
         while (!glfwWindowShouldClose(window)) {
             // Input callbacks fire from here, on the main thread, and are
             // forwarded to the EDT by InputRouter.
+            val beforePoll = System.nanoTime()
             glfwPollEvents()
-            java.awt.EventQueue.invokeAndWait { renderOneFrame() }
+            val afterPoll = System.nanoTime()
+            timings.add("poll", afterPoll - beforePoll)
+            java.awt.EventQueue.invokeAndWait {
+                // How long the render task sat in the AWT queue behind Compose's
+                // own work. This is the cost of the main/EDT split, measured
+                // rather than assumed.
+                timings.add("edtWait", System.nanoTime() - afterPoll)
+                renderOneFrame()
+            }
         }
     } finally {
         mpv?.close()

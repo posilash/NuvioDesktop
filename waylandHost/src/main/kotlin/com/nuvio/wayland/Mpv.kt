@@ -8,6 +8,7 @@ import java.lang.foreign.MemorySegment
 import java.lang.foreign.SymbolLookup
 import java.lang.foreign.ValueLayout.ADDRESS
 import java.lang.foreign.ValueLayout.JAVA_INT
+import java.lang.foreign.ValueLayout.JAVA_LONG
 import java.lang.invoke.MethodHandles
 import java.lang.invoke.MethodType
 
@@ -33,8 +34,12 @@ class Mpv private constructor(private val handle: MemorySegment, private val are
         const val MPV_RENDER_PARAM_OPENGL_FBO = 3
         const val MPV_RENDER_PARAM_FLIP_Y = 4
         const val MPV_RENDER_PARAM_ADVANCED_CONTROL = 10
+        const val MPV_RENDER_PARAM_NEXT_FRAME_INFO = 11
+        const val MPV_RENDER_PARAM_BLOCK_FOR_TARGET_TIME = 12
 
         const val MPV_RENDER_UPDATE_FRAME = 1L
+
+        const val MPV_RENDER_FRAME_INFO_PRESENT = 1L shl 0
 
         const val MPV_RENDER_API_TYPE_OPENGL = "opengl"
         const val MPV_RENDER_API_TYPE_OPENGL_NEXT = "opengl-next"
@@ -44,6 +49,12 @@ class Mpv private constructor(private val handle: MemorySegment, private val are
             JAVA_INT.withName("type"),
             MemoryLayout.paddingLayout(4),
             ADDRESS.withName("data"),
+        )
+
+        // struct mpv_render_frame_info { uint64_t flags; int64_t target_time; }
+        private val RENDER_FRAME_INFO: MemoryLayout = MemoryLayout.structLayout(
+            java.lang.foreign.ValueLayout.JAVA_LONG.withName("flags"),
+            java.lang.foreign.ValueLayout.JAVA_LONG.withName("target_time"),
         )
 
         // struct mpv_opengl_fbo { int fbo, w, h, internal_format; }
@@ -84,6 +95,15 @@ class Mpv private constructor(private val handle: MemorySegment, private val are
         }
         private val mpvRenderContextUpdate by lazy {
             fn("mpv_render_context_update", FunctionDescriptor.of(java.lang.foreign.ValueLayout.JAVA_LONG, ADDRESS))
+        }
+        // mpv_render_context_get_info takes its param struct by value.
+        private val mpvRenderContextGetInfo by lazy {
+            fn("mpv_render_context_get_info",
+                FunctionDescriptor.of(JAVA_INT, ADDRESS, RENDER_PARAM))
+        }
+        private val mpvGetTimeNs by lazy {
+            fn("mpv_get_time_ns",
+                FunctionDescriptor.of(java.lang.foreign.ValueLayout.JAVA_LONG, ADDRESS))
         }
         private val mpvRenderContextFree by lazy {
             fn("mpv_render_context_free", FunctionDescriptor.ofVoid(ADDRESS))
@@ -222,7 +242,46 @@ class Mpv private constructor(private val handle: MemorySegment, private val are
         return (flags and MPV_RENDER_UPDATE_FRAME) != 0L
     }
 
-    /** Render one frame into [fbo] at [w] x [h]. */
+    /** mpv's internal clock, in the same base as [FrameInfo.targetTimeNs]. */
+    fun timeNs(): Long = mpvGetTimeNs.invokeExact(handle) as Long
+
+    /**
+     * When the next frame is due, so the caller can do the pacing itself.
+     *
+     * [targetTimeNs] is nanoseconds on mpv's own clock, matching [timeNs].
+     * render.h still documents it as `mpv_get_time_us()` units, but
+     * `vo_libmpv.c` assigns it straight from `vo_frame.pts`, which `vo.h`
+     * defines in `mp_time_ns()` units -- the doc predates mpv's move to
+     * nanoseconds. Reading it as microseconds puts every frame a thousandfold
+     * into the future, so nothing ever looks due and the video never draws.
+     */
+    data class FrameInfo(val flags: Long, val targetTimeNs: Long) {
+        val isPresent: Boolean get() = (flags and MPV_RENDER_FRAME_INFO_PRESENT) != 0L
+    }
+
+    /**
+     * Ask mpv about the frame it would draw next.
+     *
+     * This is what makes it safe to turn off `BLOCK_FOR_TARGET_TIME`: mpv
+     * normally does the frame pacing by *sleeping inside* render(), which is
+     * fine on a dedicated render thread and ruinous on one that also draws the
+     * UI. Reading the deadline instead lets the caller keep the display's
+     * cadence and present each frame when it is actually due.
+     */
+    fun nextFrameInfo(): FrameInfo? {
+        if (renderCtx.equals(MemorySegment.NULL)) return null
+        Arena.ofConfined().use { a ->
+            val info = a.allocate(RENDER_FRAME_INFO)
+            val param = a.allocate(RENDER_PARAM)
+            param.set(JAVA_INT, 0, MPV_RENDER_PARAM_NEXT_FRAME_INFO)
+            param.set(ADDRESS, 8, info)
+            val r = mpvRenderContextGetInfo.invokeExact(renderCtx, param) as Int
+            if (r < 0) return null
+            return FrameInfo(info.get(JAVA_LONG, 0), info.get(JAVA_LONG, 8))
+        }
+    }
+
+    /** Render one frame into [fbo] at [w] x [h]. Never blocks on frame timing. */
     fun render(fbo: Int, w: Int, h: Int) {
         if (renderCtx.equals(MemorySegment.NULL)) return
         Arena.ofConfined().use { frame ->
@@ -232,8 +291,12 @@ class Mpv private constructor(private val handle: MemorySegment, private val are
             target.set(JAVA_INT, 8, h)
             target.set(JAVA_INT, 12, 0) // internal_format: 0 = let mpv choose
             val flip = frame.allocateFrom(JAVA_INT, 0)
+            // Without this mpv sleeps until the frame's target time inside
+            // render(), pinning this thread -- and so the whole UI -- to the
+            // video's frame rate. The caller paces instead, via nextFrameInfo().
+            val noBlock = frame.allocateFrom(JAVA_INT, 0)
 
-            val params = frame.allocate(RENDER_PARAM, 3)
+            val params = frame.allocate(RENDER_PARAM, 4)
             fun put(i: Int, type: Int, data: MemorySegment) {
                 val off = i.toLong() * RENDER_PARAM.byteSize()
                 params.set(JAVA_INT, off, type)
@@ -241,7 +304,8 @@ class Mpv private constructor(private val handle: MemorySegment, private val are
             }
             put(0, MPV_RENDER_PARAM_OPENGL_FBO, target)
             put(1, MPV_RENDER_PARAM_FLIP_Y, flip)
-            put(2, MPV_RENDER_PARAM_INVALID, MemorySegment.NULL)
+            put(2, MPV_RENDER_PARAM_BLOCK_FOR_TARGET_TIME, noBlock)
+            put(3, MPV_RENDER_PARAM_INVALID, MemorySegment.NULL)
 
             mpvRenderContextRender.invokeExact(renderCtx, params) as Int
         }

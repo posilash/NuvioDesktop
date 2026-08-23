@@ -38,6 +38,28 @@ class InputRouter(
     /** Scale from window coordinates to framebuffer pixels (fractional scaling). */
     var scale: Float = 1f
 
+    // Counted at both ends: what GLFW handed us, and what actually reached the
+    // scene. If those diverge the events are being dropped between the two,
+    // which is a different fault from never receiving any.
+    private var received = 0L
+    private var delivered = 0L
+    private var keys = 0L
+    private var lastReport = 0L
+
+    /** Per-second summary of input, or null until a second has passed. */
+    fun report(now: Long): String? {
+        if (lastReport == 0L) {
+            lastReport = now
+            return null
+        }
+        if (now - lastReport < 1_000_000_000L) return null
+        lastReport = now
+        val r = received; val d = delivered; val k = keys
+        received = 0; delivered = 0; keys = 0
+        return "input: glfwEvents/s=$r deliveredToScene/s=$d keys/s=$k " +
+            "cursor=${cursorX.toInt()},${cursorY.toInt()} scale=$scale"
+    }
+
     fun install() {
         glfwSetCursorPosCallback(window) { _, x, y ->
             cursorX = (x * scale).toFloat()
@@ -86,7 +108,10 @@ class InputRouter(
             }
             val vk = key.toAwtVirtualKey() ?: return@glfwSetKeyCallback
             val mods = modifiers
+            received++
+            keys++
             onUiThread {
+                delivered++
                 scene.sendKeyEvent(
                     KeyEvent(InternalKeyEvent(Key(vk), type, 0, mods, null)),
                 )
@@ -117,7 +142,10 @@ class InputRouter(
         type: PointerEventType,
         scroll: Offset = Offset.Zero,
         button: PointerButton? = null,
-    ) = onUiThread {
+    ) = run {
+        received++
+        onUiThread {
+        delivered++
         scene.sendPointerEvent(
             eventType = type,
             position = Offset(cursorX, cursorY),
@@ -128,6 +156,7 @@ class InputRouter(
             keyboardModifiers = modifiers,
             button = button,
         )
+        }
     }
 
     private fun Int.toComposeModifiers(): PointerKeyboardModifiers {
