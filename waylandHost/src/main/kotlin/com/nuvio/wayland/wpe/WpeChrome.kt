@@ -92,10 +92,17 @@ class WpeChrome(
             ),
             FunctionDescriptor.ofVoid(ADDRESS, ADDRESS), arena,
         )
+        val shmStub = linker.upcallStub(
+            MethodHandles.lookup().findStatic(
+                WpeCallbacks::class.java, "exportShmBuffer",
+                MethodType.methodType(Void.TYPE, MemorySegment::class.java, MemorySegment::class.java),
+            ),
+            FunctionDescriptor.ofVoid(ADDRESS, ADDRESS), arena,
+        )
         WpeCallbacks.owner = this
         client.setAtIndex(ADDRESS, 0, MemorySegment.NULL)
         client.setAtIndex(ADDRESS, 1, exportStub)
-        client.setAtIndex(ADDRESS, 2, MemorySegment.NULL)
+        client.setAtIndex(ADDRESS, 2, shmStub)
         client.setAtIndex(ADDRESS, 3, MemorySegment.NULL)
         client.setAtIndex(ADDRESS, 4, MemorySegment.NULL)
 
@@ -144,12 +151,78 @@ class WpeChrome(
             FunctionDescriptor.of(JAVA_BOOLEAN, ADDRESS, ADDRESS, ADDRESS))
             .invokeExact(ucm, arena.allocateFrom("player"), MemorySegment.NULL) as Boolean
 
+        // Transparent background, or the view is an opaque wall: at launch it
+        // blacked out the whole app, and in playback it sat as solid black
+        // between the video below and the chrome the page draws on top --
+        // "player UI works, no video, only sound". Stock builds its overlay
+        // window transparent for the same reason. WebKitColor = 4 gdoubles.
+        Arena.ofConfined().use { a ->
+            val color = a.allocate(java.lang.foreign.ValueLayout.JAVA_DOUBLE, 4)
+            if (System.getProperty("nuvio.wayland.chromeBgRed")?.toBoolean() == true) {
+                color.setAtIndex(java.lang.foreign.ValueLayout.JAVA_DOUBLE, 0, 1.0)
+                color.setAtIndex(java.lang.foreign.ValueLayout.JAVA_DOUBLE, 3, 1.0)
+            }
+            // Statement position on purpose: a void invokeExact in a lambda's
+            // tail is compiled expecting Object and throws
+            // WrongMethodTypeException at runtime.
+            fn(webkit, "webkit_web_view_set_background_color",
+                FunctionDescriptor.ofVoid(ADDRESS, ADDRESS))
+                .invokeExact(webView, color)
+            Unit
+        }
+
         fn(webkit, "webkit_web_view_load_uri", FunctionDescriptor.ofVoid(ADDRESS, ADDRESS))
             .invokeExact(webView, arena.allocateFrom(pageUri))
         println("[wpe] view up, loading $pageUri")
     }
 
     // ---- GLib-thread callbacks ----
+
+    /** A copied SHM frame: BGRA8888 pixels, ready for glTexImage2D. */
+    class ShmFrame(val width: Int, val height: Int, val pixels: java.nio.ByteBuffer)
+
+    private val pendingShm = AtomicReference<ShmFrame?>(null)
+    private val wlServer by lazy { SymbolLookup.libraryLookup("libwayland-server.so.0", arena) }
+
+    internal fun handleShmExport(buffer: MemorySegment) {
+        framesExported++
+        runCatching {
+            val shm = fn(fdo, "wpe_fdo_shm_exported_buffer_get_shm_buffer",
+                FunctionDescriptor.of(ADDRESS, ADDRESS)).invokeExact(buffer) as MemorySegment
+            if (!shm.equals(MemorySegment.NULL)) {
+                fn(wlServer, "wl_shm_buffer_begin_access", FunctionDescriptor.ofVoid(ADDRESS))
+                    .invokeExact(shm)
+                val data = fn(wlServer, "wl_shm_buffer_get_data",
+                    FunctionDescriptor.of(ADDRESS, ADDRESS)).invokeExact(shm) as MemorySegment
+                val stride = fn(wlServer, "wl_shm_buffer_get_stride",
+                    FunctionDescriptor.of(JAVA_INT, ADDRESS)).invokeExact(shm) as Int
+                val w = fn(wlServer, "wl_shm_buffer_get_width",
+                    FunctionDescriptor.of(JAVA_INT, ADDRESS)).invokeExact(shm) as Int
+                val h = fn(wlServer, "wl_shm_buffer_get_height",
+                    FunctionDescriptor.of(JAVA_INT, ADDRESS)).invokeExact(shm) as Int
+                if (!data.equals(MemorySegment.NULL) && w > 0 && h > 0) {
+                    // Copy out (tightly, dropping any stride padding) so the
+                    // wl buffer can go straight back to the web process.
+                    val out = java.nio.ByteBuffer.allocateDirect(w * h * 4)
+                    val src = data.reinterpret(stride.toLong() * h)
+                    for (row in 0 until h) {
+                        val rowSeg = src.asSlice(row.toLong() * stride, (w * 4).toLong())
+                        out.put(rowSeg.toArray(java.lang.foreign.ValueLayout.JAVA_BYTE))
+                    }
+                    out.flip()
+                    pendingShm.set(ShmFrame(w, h, out))
+                }
+                fn(wlServer, "wl_shm_buffer_end_access", FunctionDescriptor.ofVoid(ADDRESS))
+                    .invokeExact(shm)
+            }
+        }.onFailure { lastError = it.toString() }
+        fn(fdo, "wpe_view_backend_exportable_fdo_dispatch_release_shm_exported_buffer",
+            FunctionDescriptor.ofVoid(ADDRESS, ADDRESS))
+            .invokeExact(exportable, buffer)
+    }
+
+    /** Newest SHM frame, or null. Ack with [ackFrame] after upload. */
+    fun takeShmFrame(): ShmFrame? = pendingShm.getAndSet(null)
 
     internal fun handleExport(image: MemorySegment) {
         framesExported++
@@ -226,6 +299,7 @@ class WpeChrome(
                 fn(wpe, "wpe_view_backend_dispatch_pointer_event",
                     FunctionDescriptor.ofVoid(ADDRESS, ADDRESS))
                     .invokeExact(backend, ev)
+                Unit // see set_background_color note
             }
         }
     }
@@ -245,6 +319,7 @@ class WpeChrome(
                 fn(wpe, "wpe_view_backend_dispatch_axis_event",
                     FunctionDescriptor.ofVoid(ADDRESS, ADDRESS))
                     .invokeExact(backend, ev)
+                Unit // see set_background_color note
             }
         }
     }
@@ -267,6 +342,7 @@ class WpeChrome(
                 fn(wpe, "wpe_view_backend_dispatch_keyboard_event",
                     FunctionDescriptor.ofVoid(ADDRESS, ADDRESS))
                     .invokeExact(backend, ev)
+                Unit // see set_background_color note
             }
         }
     }
@@ -297,6 +373,7 @@ class WpeChrome(
                         MemorySegment.NULL, MemorySegment.NULL,
                         MemorySegment.NULL, MemorySegment.NULL, MemorySegment.NULL,
                     )
+                Unit // see set_background_color note
             }
         }
     }
@@ -357,14 +434,44 @@ class WpeChromeLayer(private val chrome: WpeChrome) {
      * displayed image is only released once its successor is bound.
      */
     fun importLatest(): Boolean {
+        chrome.takeShmFrame()?.let { frame ->
+            if (texture == 0) texture = org.lwjgl.opengl.GL11.glGenTextures()
+            org.lwjgl.opengl.GL11.glBindTexture(org.lwjgl.opengl.GL11.GL_TEXTURE_2D, texture)
+            // wl_shm ARGB8888 little-endian == GL_BGRA bytes.
+            org.lwjgl.opengl.GL11.glTexImage2D(
+                org.lwjgl.opengl.GL11.GL_TEXTURE_2D, 0,
+                org.lwjgl.opengl.GL11.GL_RGBA8, frame.width, frame.height, 0,
+                org.lwjgl.opengl.GL12.GL_BGRA,
+                org.lwjgl.opengl.GL11.GL_UNSIGNED_BYTE, frame.pixels,
+            )
+            org.lwjgl.opengl.GL11.glTexParameteri(
+                org.lwjgl.opengl.GL11.GL_TEXTURE_2D,
+                org.lwjgl.opengl.GL11.GL_TEXTURE_MIN_FILTER, org.lwjgl.opengl.GL11.GL_LINEAR,
+            )
+            org.lwjgl.opengl.GL11.glTexParameteri(
+                org.lwjgl.opengl.GL11.GL_TEXTURE_2D,
+                org.lwjgl.opengl.GL11.GL_TEXTURE_MAG_FILTER, org.lwjgl.opengl.GL11.GL_LINEAR,
+            )
+            org.lwjgl.opengl.GL11.glBindTexture(org.lwjgl.opengl.GL11.GL_TEXTURE_2D, 0)
+            imageWidth = frame.width
+            imageHeight = frame.height
+            framesImported++
+            chrome.ackFrame()
+            return true
+        }
         val image = chrome.takeImage() ?: return false
         if (texture == 0) {
             texture = org.lwjgl.opengl.GL11.glGenTextures()
         }
         org.lwjgl.opengl.GL11.glBindTexture(org.lwjgl.opengl.GL11.GL_TEXTURE_2D, texture)
+        val eglImage = chrome.eglImageOf(image)
         imageTargetTexture.invokeExact(
-            org.lwjgl.opengl.GL11.GL_TEXTURE_2D, chrome.eglImageOf(image),
+            org.lwjgl.opengl.GL11.GL_TEXTURE_2D, eglImage,
         )
+        val err = org.lwjgl.opengl.GL11.glGetError()
+        if (err != 0 || eglImage.equals(MemorySegment.NULL)) {
+            println("[wpe] EGLImage bind: image=$eglImage glError=0x${err.toString(16)}")
+        }
         org.lwjgl.opengl.GL11.glTexParameteri(
             org.lwjgl.opengl.GL11.GL_TEXTURE_2D,
             org.lwjgl.opengl.GL11.GL_TEXTURE_MIN_FILTER, org.lwjgl.opengl.GL11.GL_LINEAR,
@@ -397,5 +504,10 @@ internal object WpeCallbacks {
     @JvmStatic
     fun playerMessage(ucm: MemorySegment, jscValue: MemorySegment, data: MemorySegment) {
         owner?.handleMessage(jscValue)
+    }
+
+    @JvmStatic
+    fun exportShmBuffer(data: MemorySegment, buffer: MemorySegment) {
+        owner?.handleShmExport(buffer)
     }
 }

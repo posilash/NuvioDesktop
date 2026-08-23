@@ -88,10 +88,17 @@ application {
         add("--enable-native-access=ALL-UNNAMED")
         for (k in listOf(
             "media", "libmpv", "hwdec", "realApp", "probe", "videoLog",
-            "smokePlayer", "demoFrames", "uiScale", "resizeTest", "subTest", "mpvExtra", "webChrome",
+            "smokePlayer", "demoFrames", "uiScale", "resizeTest", "subTest", "mpvExtra", "webChrome", "chromePage", "chromeProbe", "chromeBgRed",
         )) {
             providers.gradleProperty("nuvio.wayland.$k").orNull
                 ?.let { add("-Dnuvio.wayland.$k=$it") }
         }
     }
+}
+
+// NVIDIA's DMABUF path exports the web chrome with destroyed alpha (the same
+// degradation the stock bridge documents); disabling it makes the WPE web
+// process hand over SHM buffers whose alpha is correct.
+tasks.named<JavaExec>("run") {
+    environment("WEBKIT_DISABLE_DMABUF_RENDERER", "1")
 }

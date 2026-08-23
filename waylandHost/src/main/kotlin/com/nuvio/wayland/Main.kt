@@ -87,6 +87,21 @@ private fun drawChromeTexture(
         ) ?: error("could not wrap chrome texture")
         w = Triple(fbo, rt, surface)
     }
+    if (System.getProperty("nuvio.wayland.chromeProbe")?.toBoolean() == true) {
+        val px = java.nio.ByteBuffer.allocateDirect(4)
+        org.lwjgl.opengl.GL30.glBindFramebuffer(org.lwjgl.opengl.GL30.GL_READ_FRAMEBUFFER, w.first)
+        org.lwjgl.opengl.GL11.glReadPixels(
+            chromeWrapperW / 2, chromeWrapperH / 2, 1, 1,
+            org.lwjgl.opengl.GL11.GL_RGBA, org.lwjgl.opengl.GL11.GL_UNSIGNED_BYTE, px,
+        )
+        org.lwjgl.opengl.GL30.glBindFramebuffer(org.lwjgl.opengl.GL30.GL_READ_FRAMEBUFFER, 0)
+        println(
+            "[wpe] texel rgba=(%d,%d,%d,%d)".format(
+                px.get(0).toInt() and 0xFF, px.get(1).toInt() and 0xFF,
+                px.get(2).toInt() and 0xFF, px.get(3).toInt() and 0xFF,
+            ),
+        )
+    }
     w.third.notifyContentWillChange(org.jetbrains.skia.ContentChangeMode.DISCARD)
     context.resetGL(org.jetbrains.skia.GLBackendState.TEXTURE_BINDING)
     val snapshot = w.third.makeImageSnapshot()
@@ -486,6 +501,7 @@ fun main() {
             java.io.File("../composeApp/src/desktopMain/resources/player-ui/controls.html"),
         ).map { it.absoluteFile.normalize() }.firstOrNull { it.isFile }
             ?: error("controls.html not found from ${java.io.File(".").absolutePath}")
+        val pageOverride = System.getProperty("nuvio.wayland.chromePage")
         wpeChrome = com.nuvio.wayland.wpe.WpeChrome(
             eglDisplay = org.lwjgl.glfw.GLFWNativeEGL.glfwGetEGLDisplay(),
             width = INITIAL_WIDTH,
@@ -507,7 +523,7 @@ fun main() {
                     }
                 }
             },
-        ).also { it.start("file://" + page.path) }
+        ).also { it.start(pageOverride ?: ("file://" + page.path)) }
         wpeLayer = com.nuvio.wayland.wpe.WpeChromeLayer(wpeChrome!!)
         videoHost?.chrome = wpeChrome
         if (runRealAppEarly) {
