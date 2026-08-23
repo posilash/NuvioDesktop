@@ -55,7 +55,6 @@ internal fun WaylandPlayerSurface(
             startPositionMs = initialPositionMs,
             playWhenReady = playWhenReady,
         )
-        onControllerReady(WaylandPlayerController(bridge))
         onDispose {
             WaylandVideoLog.log("surface: disposed")
             bridge.stop()
@@ -63,6 +62,16 @@ internal fun WaylandPlayerSurface(
     }
 
     LaunchedEffect(sourceUrl) {
+        // Deliberately asynchronous, not in the DisposableEffect above: the
+        // player runtime resets its controller from a source-keyed
+        // LaunchedEffect, written for the stock surface whose controller
+        // arrives only after native init. A controller handed over
+        // synchronously in the commit phase lands *before* that reset and is
+        // silently wiped -- keys and controls then no-op against a null
+        // controller while playback runs fine. Runtime effects launch first
+        // (they compose first), so delivering from a coroutine here orders
+        // this after the reset.
+        onControllerReady(WaylandPlayerController(bridge))
         var lastError: String? = null
         while (true) {
             val s = bridge.snapshot()
