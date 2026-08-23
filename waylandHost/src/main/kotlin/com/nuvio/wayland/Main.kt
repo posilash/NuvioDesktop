@@ -173,8 +173,20 @@ fun main() {
     val probePixels = System.getProperty("nuvio.wayland.probe")?.toBoolean() ?: false
     val videoLog = System.getProperty("nuvio.wayland.videoLog")?.toBoolean() ?: false
 
+    // Density must be the output's real scale, not 1: Compose sizes everything
+    // in dp, so density 1 on a fractionally scaled display lays the whole UI
+    // out visibly smaller than the stock (AWT) build, which gets the system
+    // scale from the toolkit. Framebuffer/window ratio is exactly that scale.
+    fun currentScale(): Float {
+        val ww = IntArray(1); val wh = IntArray(1)
+        val fw = IntArray(1); val fh = IntArray(1)
+        glfwGetWindowSize(window, ww, wh)
+        glfwGetFramebufferSize(window, fw, fh)
+        return if (ww[0] > 0) fw[0].toFloat() / ww[0] else 1f
+    }
+
     val scene: ComposeScene = CanvasLayersComposeScene(
-        density = Density(1f),
+        density = Density(currentScale()),
         size = androidx.compose.ui.unit.IntSize(width, height),
         coroutineContext = MainUIDispatcher,
     )
@@ -262,6 +274,23 @@ fun main() {
     val input = InputRouter(window, scene)
     input.install()
 
+    // Keyboard needs an owner. On the AWT path the window grants Compose focus
+    // when it gains it; with a bare scene nothing does, so every key event is
+    // delivered and then dropped by the focus system. Mirror what a window
+    // does: take focus now, and follow the compositor's focus from then on.
+    java.awt.EventQueue.invokeLater {
+        scene.focusManager.takeFocus(androidx.compose.ui.focus.FocusDirection.Next)
+    }
+    glfwSetWindowFocusCallback(window) { _, focused ->
+        java.awt.EventQueue.invokeLater {
+            if (focused) {
+                scene.focusManager.takeFocus(androidx.compose.ui.focus.FocusDirection.Next)
+            } else {
+                scene.focusManager.releaseFocus()
+            }
+        }
+    }
+
     var exitCode = 0
     val timings = FrameTimings()
     // The demo path is self-terminating so it can be run unattended; long
@@ -286,10 +315,11 @@ fun main() {
                 scene.size = androidx.compose.ui.unit.IntSize(width, height)
                 // Pointer positions arrive in window coordinates but the
                 // scene works in framebuffer pixels; on a fractionally
-                // scaled output those differ.
-                val ww = IntArray(1); val wh = IntArray(1)
-                glfwGetWindowSize(window, ww, wh)
-                input.scale = if (ww[0] > 0) width.toFloat() / ww[0] else 1f
+                // scaled output those differ. The same ratio is the UI
+                // density, which can change when the window moves outputs.
+                val scale = currentScale()
+                input.scale = scale
+                if (scene.density.density != scale) scene.density = Density(scale)
             }
         }
 

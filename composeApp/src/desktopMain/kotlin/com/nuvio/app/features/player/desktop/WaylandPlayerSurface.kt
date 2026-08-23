@@ -1,7 +1,19 @@
 package com.nuvio.app.features.player.desktop
 
 import androidx.compose.foundation.Canvas
+import androidx.compose.foundation.focusable
 import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.ui.focus.FocusRequester
+import androidx.compose.ui.focus.focusRequester
+import androidx.compose.ui.input.key.Key
+import androidx.compose.ui.input.key.KeyEvent
+import androidx.compose.ui.input.key.KeyEventType
+import androidx.compose.ui.input.key.key
+import androidx.compose.ui.input.key.onKeyEvent
+import androidx.compose.ui.input.key.type
+import androidx.compose.ui.input.pointer.PointerEventPass
+import androidx.compose.ui.input.pointer.PointerEventType
+import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.graphics.drawscope.drawIntoCanvas
 import androidx.compose.ui.graphics.nativeCanvas
 import androidx.compose.runtime.Composable
@@ -37,6 +49,7 @@ internal fun WaylandPlayerSurface(
     modifier: Modifier,
     playWhenReady: Boolean,
     initialPositionMs: Long,
+    onPlayerControlsEvent: (String, Double) -> Boolean,
     onControllerReady: (PlayerEngineController) -> Unit,
     onSnapshot: (PlayerPlaybackSnapshot) -> Unit,
     onError: (String?) -> Unit,
@@ -101,12 +114,74 @@ internal fun WaylandPlayerSurface(
         }
     }
 
-    Canvas(modifier.fillMaxSize()) {
+    // Desktop affordances the stock build gets from its web overlay: moving
+    // the mouse reveals the controls, and the keyboard drives playback. The
+    // runtime's cursorActivity event both shows the chrome and resets its
+    // auto-hide timer, so throttling to well under that timeout loses nothing.
+    val focusRequester = remember { FocusRequester() }
+    LaunchedEffect(sourceUrl) {
+        // Keys route to the focused node; nothing else on this screen wants
+        // focus, so the surface takes it when playback starts.
+        runCatching { focusRequester.requestFocus() }
+    }
+
+    Canvas(
+        modifier
+            .fillMaxSize()
+            .focusRequester(focusRequester)
+            .focusable()
+            .onKeyEvent { event -> handlePlayerKey(event, bridge, onPlayerControlsEvent) }
+            .pointerInput(Unit) {
+                var lastActivityNs = 0L
+                awaitPointerEventScope {
+                    while (true) {
+                        val event = awaitPointerEvent(PointerEventPass.Initial)
+                        if (event.type == PointerEventType.Move) {
+                            val now = System.nanoTime()
+                            if (now - lastActivityNs > 200_000_000L) {
+                                lastActivityNs = now
+                                onPlayerControlsEvent("cursorActivity", 0.0)
+                            }
+                        }
+                    }
+                }
+            },
+    ) {
         @Suppress("UNUSED_EXPRESSION") tick // read it: this is what forces the redraw
         if (WaylandVideoLog.enabled) WaylandVideoLog.noteDraw(size.width, size.height)
         drawIntoCanvas { canvas ->
             bridge.drawVideo(canvas.nativeCanvas, size.width, size.height)
         }
+    }
+}
+
+/**
+ * The keyboard bindings the stock desktop build implements in its web
+ * overlay's JS, expressed against the bridge directly.
+ */
+private fun handlePlayerKey(
+    event: KeyEvent,
+    bridge: WaylandVideoBridge.Delegate,
+    onPlayerControlsEvent: (String, Double) -> Boolean,
+): Boolean {
+    if (event.type != KeyEventType.KeyDown) return false
+    return when (event.key) {
+        Key.Spacebar, Key.K -> {
+            if (bridge.snapshot().isPlaying) bridge.pause() else bridge.play()
+            onPlayerControlsEvent("cursorActivity", 0.0)
+            true
+        }
+        Key.DirectionLeft, Key.J -> {
+            bridge.seekBy(-10_000L)
+            onPlayerControlsEvent("cursorActivity", 0.0)
+            true
+        }
+        Key.DirectionRight, Key.L -> {
+            bridge.seekBy(10_000L)
+            onPlayerControlsEvent("cursorActivity", 0.0)
+            true
+        }
+        else -> false
     }
 }
 
