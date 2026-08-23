@@ -278,13 +278,12 @@ class WaylandVideoHost(
         mpv.command("sub-remove")
     }
 
+    // Same semantics as the stock JNI bridge: the id here is the MPV id
+    // (already resolved from a list position by the controller); negative
+    // means off. Position->id resolution lives in the controller, exactly
+    // where stock puts it.
     override fun selectAudioTrack(id: Int) {
-        // id < 0 means "default/auto" -- the runtime sends -1 at startup to
-        // assert its no-preference state. Mapping it to aid=no muted every
-        // session at start (the log's video-only "V:" status lines) until the
-        // user picked a track by hand. Subtitles differ: there -1 really is
-        // "off".
-        mpv.setProperty("aid", if (id < 0) "auto" else id.toString())
+        mpv.setProperty("aid", if (id < 0) "no" else id.toString())
     }
 
     override fun selectSubtitleTrack(id: Int) {
@@ -346,21 +345,27 @@ class WaylandVideoHost(
     private fun MpvTrack.label(fallback: String): String =
         title ?: language ?: "$fallback $id"
 
+    // Stock's track contract (buildTracksJson): `index` is the 0-based
+    // position in the filtered list -- the currency the whole UI layer
+    // trades in -- and `id` is the mpv id, which only the controller's
+    // position->id resolution ever hands to mpv. Publishing mpv ids as
+    // indices sent raw positions into aid: position 0 became aid=0, a track
+    // that does not exist, and every session started mute.
     override fun audioTracks(): List<com.nuvio.app.features.player.AudioTrack> =
-        tracks("audio").map { t ->
+        tracks("audio").mapIndexed { position, t ->
             com.nuvio.app.features.player.AudioTrack(
-                index = t.id,
+                index = position,
                 id = t.id.toString(),
-                label = t.label("Audio"),
+                label = t.label("Track"),
                 language = t.language,
                 isSelected = t.selected,
             )
         }
 
     override fun subtitleTracks(): List<com.nuvio.app.features.player.SubtitleTrack> =
-        tracks("sub").map { t ->
+        tracks("sub").mapIndexed { position, t ->
             com.nuvio.app.features.player.SubtitleTrack(
-                index = t.id,
+                index = position,
                 id = t.id.toString(),
                 label = t.label("Subtitle"),
                 language = t.language,

@@ -195,14 +195,28 @@ private class WaylandPlayerController(
 
     override fun getAudioTracks(): List<AudioTrack> = bridge.audioTracks()
     override fun getSubtitleTracks(): List<SubtitleTrack> = bridge.subtitleTracks()
-    override fun selectAudioTrack(index: Int) = bridge.selectAudioTrack(index)
-    override fun selectSubtitleTrack(index: Int) = bridge.selectSubtitleTrack(index)
+
+    // Position -> mpv id resolution, exactly as the stock controller does it
+    // (resolveTrackId): the UI's index is a list position; only a resolved id
+    // reaches mpv, and a stale or unknown position is a no-op rather than a
+    // deselection. Negative still means "off", passed straight through.
+    override fun selectAudioTrack(index: Int) {
+        if (index < 0) return bridge.selectAudioTrack(-1)
+        val id = bridge.audioTracks().getOrNull(index)?.id?.toIntOrNull() ?: return
+        bridge.selectAudioTrack(id)
+    }
+
+    override fun selectSubtitleTrack(index: Int) {
+        if (index < 0) return bridge.selectSubtitleTrack(-1)
+        val id = bridge.subtitleTracks().getOrNull(index)?.id?.toIntOrNull() ?: return
+        bridge.selectSubtitleTrack(id)
+    }
 
     override fun setSubtitleUri(url: String) = bridge.setSubtitleUrl(url)
     override fun clearExternalSubtitle() = bridge.clearExternalSubtitles()
     override fun clearExternalSubtitleAndSelect(trackIndex: Int) {
         bridge.clearExternalSubtitles()
-        bridge.selectSubtitleTrack(trackIndex)
+        selectSubtitleTrack(trackIndex)
     }
 
     // Subtitle styling comes from the user's own mpv.conf, which the host
