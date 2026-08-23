@@ -20,6 +20,8 @@ import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.graphics.asComposeCanvas
 import androidx.compose.ui.graphics.drawscope.drawIntoCanvas
 import androidx.compose.ui.graphics.nativeCanvas
+import androidx.compose.ui.layout.boundsInWindow
+import androidx.compose.ui.layout.onGloballyPositioned
 import androidx.compose.ui.unit.Constraints
 import androidx.compose.ui.unit.Density
 import androidx.compose.ui.unit.dp
@@ -74,6 +76,18 @@ fun main() {
         error("glfwCreateWindow failed")
     }
 
+    // Second, invisible window whose context shares objects with the first:
+    // the video thread's home. Created here, before any context goes current
+    // on another thread -- GLFW requires the share context not be current
+    // elsewhere during creation. Textures made in one are usable in the other;
+    // that sharing is what makes the video path zero-copy end to end.
+    glfwWindowHint(GLFW_VISIBLE, GLFW_FALSE)
+    val videoWindow = glfwCreateWindow(64, 64, "nuvio-video", NULL, window)
+    if (videoWindow == NULL) {
+        glfwTerminate()
+        error("glfwCreateWindow (video context) failed")
+    }
+
     // Compose's lifecycle insists on the AWT event queue being "the main
     // thread" (LifecycleRegistry enforces it), while GLFW insists on owning the
     // real main thread for event polling. Both can be satisfied: GLFW allows a
@@ -96,16 +110,18 @@ fun main() {
         context = DirectContext.makeGL()
     }
 
-    // Optional video layer. mpv renders into the same GL context, underneath
-    // Compose, via the render API -- no embedded window, no "wid", no
-    // XComposite capture of an overlay. The api-type asks for the libplacebo
-    // renderer, so this keeps vo=gpu-next quality rather than dropping to the
-    // legacy one.
+    // Optional video layer. mpv renders on its own thread, into textures the
+    // window context shares, via the render API -- no embedded window, no
+    // "wid", no XComposite capture of an overlay. The api-type asks for the
+    // libplacebo renderer, so this keeps vo=gpu-next quality rather than
+    // dropping to the legacy one.
     val mediaUrl = System.getProperty("nuvio.wayland.media")
     val mpvPath = System.getProperty("nuvio.wayland.libmpv")
     val runRealAppEarly = System.getProperty("nuvio.wayland.realApp")?.toBoolean() ?: false
     var mpv: Mpv? = null
+    var pipeline: VideoPipeline? = null
     var videoHost: WaylandVideoHost? = null
+    val videoFrameReady = java.util.concurrent.atomic.AtomicBoolean(false)
     if (mediaUrl != null || runRealAppEarly) {
         if (!Mpv.load(mpvPath)) {
             System.err.println("FAIL: could not load libmpv (nuvio.wayland.libmpv=$mpvPath)")
@@ -126,37 +142,45 @@ fun main() {
             // which is the zero-copy path the render API was built for.
             setOption("hwdec", System.getProperty("nuvio.wayland.hwdec") ?: "auto")
             initialize()
-            java.awt.EventQueue.invokeAndWait {
-                createRenderContext(Mpv.MPV_RENDER_API_TYPE_OPENGL_NEXT) { name ->
-                    glfwGetProcAddress(name)
-                }
-            }
             if (System.getProperty("nuvio.wayland.videoLog")?.toBoolean() == true) {
                 requestLogMessages("v")
             }
-            if (mediaUrl != null) command("loadfile", mediaUrl)
         }
-        println("mpv render context: ${Mpv.MPV_RENDER_API_TYPE_OPENGL_NEXT}")
-        run {
-            // Hand the app a video sink so its player surface stops reaching
-            // for SwingPanel, which needs an AWT-backed scene we do not have.
-            videoHost = WaylandVideoHost(mpv!!, context)
-            if (runRealAppEarly) {
-                com.nuvio.app.features.player.desktop.WaylandVideoBridge.delegate = videoHost
-                println("video bridge: installed")
-            }
-            if (mediaUrl != null) videoHost!!.markLoaded()
+        pipeline = VideoPipeline(mpv!!, videoWindow).apply {
+            onFrame = { videoFrameReady.set(true) }
+            probe = System.getProperty("nuvio.wayland.probe")?.toBoolean() ?: false
+            start()
         }
+        // The render context is created on the pipeline's thread; loading a
+        // file before it exists makes video-output init fail.
+        pipeline!!.awaitReady()
+        if (mediaUrl != null) mpv!!.command("loadfile", mediaUrl)
+        println("mpv render context: ${Mpv.MPV_RENDER_API_TYPE_OPENGL_NEXT} (video thread)")
+        // Hand the app a video sink so its player surface stops reaching
+        // for SwingPanel, which needs an AWT-backed scene we do not have.
+        videoHost = WaylandVideoHost(mpv!!, pipeline!!, context)
+        if (runRealAppEarly) {
+            com.nuvio.app.features.player.desktop.WaylandVideoBridge.delegate = videoHost
+            println("video bridge: installed")
+        }
+        if (mediaUrl != null) videoHost!!.markLoaded()
     }
 
     var width = INITIAL_WIDTH
     var height = INITIAL_HEIGHT
     var renderTarget: BackendRenderTarget? = null
     var surface: Surface? = null
+    // The UI's own layer. The scene rasterizes here, only when it has
+    // something new -- never on account of a video frame. Presenting is then
+    // two cheap draws (video texture, UI texture) regardless of how expensive
+    // the scene is, which is what keeps a 24fps stream smooth under an 18ms
+    // UI. Transparent where the player surface punched its hole.
+    var uiSurface: Surface? = null
 
     fun recreateSurface() {
         surface?.close()
         renderTarget?.close()
+        uiSurface?.close()
         renderTarget = BackendRenderTarget.makeGL(
             width, height, 0, 8,
             GL30.glGetInteger(GL30.GL_FRAMEBUFFER_BINDING),
@@ -166,6 +190,10 @@ fun main() {
             context, renderTarget!!, SurfaceOrigin.BOTTOM_LEFT,
             SurfaceColorFormat.RGBA_8888, ColorSpace.sRGB,
         ) ?: error("Surface.makeFromBackendRenderTarget returned null")
+        uiSurface = Surface.makeRenderTarget(
+            context, false,
+            org.jetbrains.skia.ImageInfo.makeN32Premul(width, height),
+        ) ?: error("Surface.makeRenderTarget (UI layer) returned null")
     }
     java.awt.EventQueue.invokeAndWait { recreateSurface() }
 
@@ -254,7 +282,13 @@ fun main() {
             ) {
                 val vh = videoHost
                 if (vh != null) {
-                    androidx.compose.foundation.Canvas(Modifier.fillMaxSize()) {
+                    androidx.compose.foundation.Canvas(
+                        Modifier.fillMaxSize()
+                            .onGloballyPositioned { coords ->
+                                val b = coords.boundsInWindow()
+                                vh.setVideoRect(b.left, b.top, b.width, b.height)
+                            },
+                    ) {
                         drawIntoCanvas { c ->
                             vh.drawVideo(c.nativeCanvas, size.width, size.height)
                         }
@@ -324,13 +358,7 @@ fun main() {
         }
 
         val s = surface ?: return false
-
-        // Video goes into an offscreen texture, never into the window, so it
-        // composites as ordinary Compose content rather than sitting under the
-        // scene where any opaque background would cover it.
-        var t = System.nanoTime()
-        val videoChanged = videoHost?.renderFrame(width, height) ?: false
-        timings.add("mpv", System.nanoTime() - t)
+        val ui = uiSurface ?: return false
 
         if (videoLog) {
             mpv?.pumpEvents { println(it) }
@@ -339,18 +367,32 @@ fun main() {
             timings.report(System.nanoTime())?.let { println("[wayland-video] $it") }
         }
 
-        // Repainting a scene that has not changed costs a full rasterization of
-        // the whole tree -- measured at 28ms for the app's own UI, against
-        // 1.4ms for trivial content -- and buys nothing. Present only when
-        // there is something new: a video frame, a Compose invalidation, or a
-        // surface that was just rebuilt.
-        if (!forceRepaint && !videoChanged && !scene.hasInvalidations()) return false
+        // Present when there is something new: a video frame the pipeline
+        // published, a Compose invalidation, or a surface that was just
+        // rebuilt. Video and UI are separate layers with separate cadences;
+        // neither forces work on the other.
+        val videoChanged = videoFrameReady.getAndSet(false)
+        val sceneDirty = forceRepaint || scene.hasInvalidations()
+        if (!videoChanged && !sceneDirty) return false
         forceRepaint = false
+
+        var t = System.nanoTime()
+        if (sceneDirty) {
+            // Rasterizing the scene is the expensive step (measured 18-32ms
+            // for the real app), so it happens only when the UI changed --
+            // a video frame reuses the last UI layer as-is.
+            ui.canvas.clear(0x00000000)
+            scene.render(ui.canvas.asComposeCanvas(), System.nanoTime())
+            timings.add("scene", System.nanoTime() - t)
+        }
 
         t = System.nanoTime()
         s.canvas.clear(0xFF101014.toInt())
-        scene.render(s.canvas.asComposeCanvas(), System.nanoTime())
-        timings.add("scene", System.nanoTime() - t)
+        videoHost?.compositeVideo(s.canvas)
+        val uiSnapshot = ui.makeImageSnapshot()
+        s.canvas.drawImage(uiSnapshot, 0f, 0f)
+        uiSnapshot.close()
+        timings.add("composite", System.nanoTime() - t)
 
         t = System.nanoTime()
         context.flush()
@@ -421,11 +463,16 @@ fun main() {
             }
         }
     } finally {
+        // The pipeline frees the mpv render context on its own thread (where
+        // its GL context lives); only then may the core handle be destroyed.
+        pipeline?.stop()
         mpv?.close()
         scene.close()
         surface?.close()
         renderTarget?.close()
+        uiSurface?.close()
         context.close()
+        glfwDestroyWindow(videoWindow)
         glfwDestroyWindow(window)
         glfwTerminate()
     }

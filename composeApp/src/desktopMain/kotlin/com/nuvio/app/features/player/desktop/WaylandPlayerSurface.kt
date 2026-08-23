@@ -14,16 +14,14 @@ import androidx.compose.ui.input.key.type
 import androidx.compose.ui.input.pointer.PointerEventPass
 import androidx.compose.ui.input.pointer.PointerEventType
 import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.layout.boundsInWindow
+import androidx.compose.ui.layout.onGloballyPositioned
 import androidx.compose.ui.graphics.drawscope.drawIntoCanvas
 import androidx.compose.ui.graphics.nativeCanvas
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
-import androidx.compose.runtime.getValue
-import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.remember
-import androidx.compose.runtime.setValue
-import androidx.compose.runtime.withFrameNanos
 import androidx.compose.ui.Modifier
 import com.nuvio.app.features.player.AudioTrack
 import com.nuvio.app.features.player.PlayerEngineController
@@ -36,11 +34,11 @@ import kotlinx.coroutines.delay
 /**
  * Player surface for hosts that render video themselves, underneath Compose.
  *
- * Draws nothing. The host has already painted the current video frame into the
- * framebuffer before Compose runs, so this composable's only jobs are to drive
- * playback through [WaylandVideoBridge] and to report state back to the player
- * UI. That is the whole point: with no component to embed there is no
- * `SwingPanel`, and therefore no AWT.
+ * Draws no video. The host composites the actual frames beneath the scene at
+ * its own cadence; this composable reports where the video belongs, punches
+ * the transparent hole it shows through, drives playback through
+ * [WaylandVideoBridge], and reports state back to the player UI. With no
+ * component to embed there is no `SwingPanel`, and therefore no AWT.
  */
 @Composable
 internal fun WaylandPlayerSurface(
@@ -100,20 +98,6 @@ internal fun WaylandPlayerSurface(
         }
     }
 
-    // The frame is drawn here, inside the scene, so it is ordered and clipped
-    // like any other Compose content.
-    // Compose only redraws what has been invalidated. The video texture
-    // changes outside the composition entirely, so without a per-frame tick
-    // the Canvas below is drawn once and then never again -- a still image
-    // over a playing stream.
-    var tick by remember { mutableIntStateOf(0) }
-    LaunchedEffect(Unit) {
-        while (true) {
-            withFrameNanos { }
-            tick++
-        }
-    }
-
     // Desktop affordances the stock build gets from its web overlay: moving
     // the mouse reveals the controls, and the keyboard drives playback. The
     // runtime's cursorActivity event both shows the chrome and resets its
@@ -128,6 +112,13 @@ internal fun WaylandPlayerSurface(
     Canvas(
         modifier
             .fillMaxSize()
+            // The video is composited by the host, underneath the scene; the
+            // draw below only punches the transparent hole it shows through.
+            // Layout is what knows where that hole is.
+            .onGloballyPositioned { coordinates ->
+                val bounds = coordinates.boundsInWindow()
+                bridge.setVideoRect(bounds.left, bounds.top, bounds.width, bounds.height)
+            }
             .focusRequester(focusRequester)
             .focusable()
             .onKeyEvent { event -> handlePlayerKey(event, bridge, onPlayerControlsEvent) }
@@ -147,7 +138,6 @@ internal fun WaylandPlayerSurface(
                 }
             },
     ) {
-        @Suppress("UNUSED_EXPRESSION") tick // read it: this is what forces the redraw
         if (WaylandVideoLog.enabled) WaylandVideoLog.noteDraw(size.width, size.height)
         drawIntoCanvas { canvas ->
             bridge.drawVideo(canvas.nativeCanvas, size.width, size.height)

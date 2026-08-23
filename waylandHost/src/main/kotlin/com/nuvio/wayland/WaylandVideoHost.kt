@@ -2,11 +2,13 @@ package com.nuvio.wayland
 
 import com.nuvio.app.features.player.desktop.WaylandVideoBridge
 import org.jetbrains.skia.BackendRenderTarget
+import org.jetbrains.skia.BlendMode
+import org.jetbrains.skia.Canvas
 import org.jetbrains.skia.ColorSpace
-import org.jetbrains.skia.ColorType
 import org.jetbrains.skia.ContentChangeMode
 import org.jetbrains.skia.DirectContext
 import org.jetbrains.skia.FramebufferFormat
+import org.jetbrains.skia.Paint
 import org.jetbrains.skia.Rect
 import org.jetbrains.skia.SamplingMode
 import org.jetbrains.skia.Surface
@@ -18,188 +20,167 @@ import org.lwjgl.opengl.GL30
 /**
  * Backs [WaylandVideoBridge] with the host's mpv instance.
  *
- * Everything is expressed as mpv properties and commands, so this stays thin.
- * The one piece of state worth keeping is [hasFile]: the render loop must not
- * paint mpv's output when nothing is loaded, or an idle mpv would blank the
- * framebuffer under the UI every frame.
+ * Playback control is mpv properties and commands. The video itself flows
+ * through [VideoPipeline] on its own thread; this class is the consumer side:
+ * the scene punches a transparent hole where the surface sits ([drawVideo]),
+ * and [compositeVideo] paints the latest published frame into that hole,
+ * underneath the UI layer. The scene is never rasterized on account of a video
+ * frame -- that separation is the point of the design.
  */
 class WaylandVideoHost(
     private val mpv: Mpv,
+    private val pipeline: VideoPipeline,
     private val context: DirectContext,
 ) : WaylandVideoBridge.Delegate {
 
-    // Offscreen target. mpv renders here rather than into the window, so the
-    // frame can be drawn as ordinary Compose content instead of sitting
-    // underneath the scene where any opaque background would cover it.
-    private var fbo = 0
-    private var texture = 0
-    private var texWidth = 0
-    private var texHeight = 0
-    private var renderTarget: BackendRenderTarget? = null
-    private var videoSurface: Surface? = null
+    // Where the video belongs, in framebuffer pixels. Reported by the surface
+    // composable from layout; the demo path sets it directly.
+    @Volatile private var rectLeft = 0f
+    @Volatile private var rectTop = 0f
+    @Volatile private var rectWidth = 0f
+    @Volatile private var rectHeight = 0f
 
-    private var renderCount = 0L
-    private var drawCount = 0L
-    private var updatePolls = 0L
-    private var earlyCount = 0L
+    private var composites = 0L
+    private var holePunches = 0L
     private var lastReport = 0L
 
-    // Rolling estimate of the host's present interval, used to decide whether a
-    // frame is close enough to its deadline to draw now. Measured rather than
-    // assumed: the display's refresh rate is not ours to know from here, and
-    // vsync is what actually sets the loop's cadence.
-    private var lastFrameNanos = 0L
-    private var presentIntervalNs = 16_667_000.0
+    override fun setVideoRect(left: Float, top: Float, width: Float, height: Float) {
+        rectLeft = left; rectTop = top; rectWidth = width; rectHeight = height
+        pipeline.setTargetSize(width.toInt(), height.toInt())
+    }
 
     /** Per-second summary of what the video path is actually doing. */
     fun report(now: Long): String? {
+        if (lastReport == 0L) { lastReport = now; return null }
         if (now - lastReport < 1_000_000_000L) return null
+        val elapsed = (now - lastReport) / 1e9
         lastReport = now
-        val r = renderCount; val d = drawCount; val u = updatePolls; val e = earlyCount
-        renderCount = 0; drawCount = 0; updatePolls = 0; earlyCount = 0
-        return "video: hasFile=$hasFile target=${texWidth}x$texHeight " +
-            "mpvRenders/s=$r composeDraws/s=$d updatePolls/s=$u tooEarly/s=$e " +
-            "present=%.1fms ".format(presentIntervalNs / 1e6) +
-            "lastUpdateFlags=${mpv.lastUpdateFlags} surface=${videoSurface != null}"
+        val c = composites; composites = 0
+        val p = holePunches; holePunches = 0
+        return "video: hasFile=$hasFile rect=${rectWidth.toInt()}x${rectHeight.toInt()}" +
+            "+${rectLeft.toInt()}+${rectTop.toInt()} composites/s=%.0f punches/s=%.0f | "
+                .format(c / elapsed, p / elapsed) +
+            pipeline.report(elapsed)
     }
 
     /**
-     * Render one frame, if mpv has one that is due. Must run on the GL thread.
-     *
-     * Returns true when the video texture changed, which is what tells the host
-     * the window needs repainting even if Compose has nothing new to say.
+     * Called during scene rasterization where the video surface sits: clears
+     * that rectangle to transparent so [compositeVideo]'s output shows through
+     * from the layer below, while everything the scene draws after (controls,
+     * overlays, dialogs) stacks above.
      */
-    fun renderFrame(width: Int, height: Int): Boolean {
-        if (!hasFile || width <= 0 || height <= 0) return false
-        ensureTarget(width, height)
+    override fun drawVideo(canvas: Canvas, width: Float, height: Float) {
+        holePunches++
+        canvas.drawRect(
+            Rect.makeWH(width, height),
+            Paint().apply { blendMode = BlendMode.CLEAR },
+        )
+    }
 
-        trackPresentInterval()
+    // ---- Composite side (UI thread, window GL context) ----
 
-        // Only clear and render when mpv actually has a frame: clearing first
-        // and then rendering nothing paints the window black.
-        updatePolls++
-        if (!mpv.hasNewFrame()) return false
+    // Skia wrappers over the pipeline's shared textures. Framebuffers do not
+    // cross contexts, so this side binds each texture into its own FBO and
+    // wraps that for Skia. Keyed by buffer generation: a reallocation on the
+    // video thread invalidates the wrapper.
+    private class Wrapper(
+        val fbo: Int,
+        val renderTarget: BackendRenderTarget,
+        val surface: Surface,
+        val generation: Int,
+    )
 
-        // mpv makes frames available early -- "video-timing-offset" of headroom,
-        // 50ms by default -- and would normally sleep off the difference inside
-        // render(). Rendering it the moment it appears would run the video fast
-        // and judder; blocking would pin the UI to the video's frame rate. So
-        // hold the frame until it is within half a present interval of its
-        // deadline, and leave the previous one on screen until then. The update
-        // flag stays set meanwhile, so the frame is not lost.
-        val info = mpv.nextFrameInfo()
-        if (info != null && info.isPresent && info.targetTimeNs != 0L) {
-            val aheadNs = info.targetTimeNs - mpv.timeNs()
-            if (aheadNs > presentIntervalNs / 2) {
-                earlyCount++
-                return false
-            }
+    private val wrappers = HashMap<Int, Wrapper>()
+
+    /**
+     * Draw the newest published video frame into the window at the reported
+     * rect. Runs on the UI thread with the window context current, after the
+     * background clear and before the UI layer.
+     */
+    fun compositeVideo(canvas: Canvas) {
+        if (!hasFile) return
+        if (rectWidth <= 0f || rectHeight <= 0f) return
+        val frame = pipeline.acquireDisplayFrame() ?: return
+        val buf = frame.buffer
+
+        val wrapper = wrappers.getOrPut(buf.generation) {
+            val fbo = GL30.glGenFramebuffers()
+            GL30.glBindFramebuffer(GL30.GL_FRAMEBUFFER, fbo)
+            GL30.glFramebufferTexture2D(
+                GL30.GL_FRAMEBUFFER, GL30.GL_COLOR_ATTACHMENT0,
+                GL11.GL_TEXTURE_2D, buf.texture, 0,
+            )
+            GL30.glBindFramebuffer(GL30.GL_FRAMEBUFFER, 0)
+            val rt = BackendRenderTarget.makeGL(
+                buf.width, buf.height, 0, 8, fbo, FramebufferFormat.GR_GL_RGBA8,
+            )
+            // TOP_LEFT: mpv renders with flip_y=0 into an FBO, leaving the
+            // image top-row-first.
+            val surface = Surface.makeFromBackendRenderTarget(
+                context, rt, SurfaceOrigin.TOP_LEFT,
+                SurfaceColorFormat.RGBA_8888, ColorSpace.sRGB,
+            ) ?: error("could not wrap video texture for Skia")
+            evictStaleWrappers(keep = buf.generation)
+            // The FBO creation above went through raw GL behind Skia's back;
+            // its cached bindings are stale until told. Rare: once per
+            // texture generation, i.e. per resize.
+            context.resetGLAll()
+            Wrapper(fbo, rt, surface, buf.generation)
         }
-        renderCount++
 
-        // Skia's snapshots are copy-on-write, invalidated by Skia's own draw
-        // calls. mpv writes into this FBO through raw GL, which Skia never
-        // sees, so without this it keeps handing back the first snapshot it
-        // took and the picture freezes -- refreshing only when a resize
-        // rebuilds the surface. This is the API for exactly that case.
-        videoSurface?.notifyContentWillChange(ContentChangeMode.DISCARD)
-
-        // Start from opaque black: mpv letterboxes rather than filling, and a
-        // stale frame would otherwise show through the bars.
-        GL30.glBindFramebuffer(GL30.GL_FRAMEBUFFER, fbo)
-        GL11.glClearColor(0f, 0f, 0f, 1f)
-        GL11.glClear(GL11.GL_COLOR_BUFFER_BIT)
-
-        mpv.render(fbo, width, height)
-
-        // mpv restores the framebuffer binding to 0 itself, but not the scissor
-        // or viewport, and Skia's cached GL state is stale either way.
-        GL30.glBindFramebuffer(GL30.GL_FRAMEBUFFER, 0)
-        GL11.glDisable(GL11.GL_SCISSOR_TEST)
-        GL11.glViewport(0, 0, width, height)
-        context.resetGLAll()
-        return true
-    }
-
-    /**
-     * Keep a smoothed estimate of how often this loop presents.
-     *
-     * Long gaps (a stall, a resize, the first frame) would otherwise poison the
-     * average and make everything look "due", so they are ignored rather than
-     * averaged in.
-     */
-    private fun trackPresentInterval() {
-        val now = System.nanoTime()
-        val previous = lastFrameNanos
-        lastFrameNanos = now
-        if (previous == 0L) return
-        val deltaNs = (now - previous).toDouble()
-        if (deltaNs <= 0 || deltaNs > 100_000_000) return
-        presentIntervalNs += (deltaNs - presentIntervalNs) * 0.1
-    }
-
-    private fun ensureTarget(width: Int, height: Int) {
-        if (fbo != 0 && width == texWidth && height == texHeight) return
-        releaseTarget()
-
-        texture = GL11.glGenTextures()
-        GL11.glBindTexture(GL11.GL_TEXTURE_2D, texture)
-        GL11.glTexImage2D(
-            GL11.GL_TEXTURE_2D, 0, GL11.GL_RGBA8, width, height, 0,
-            GL11.GL_RGBA, GL11.GL_UNSIGNED_BYTE, null as java.nio.ByteBuffer?,
-        )
-        GL11.glTexParameteri(GL11.GL_TEXTURE_2D, GL11.GL_TEXTURE_MIN_FILTER, GL11.GL_LINEAR)
-        GL11.glTexParameteri(GL11.GL_TEXTURE_2D, GL11.GL_TEXTURE_MAG_FILTER, GL11.GL_LINEAR)
-
-        fbo = GL30.glGenFramebuffers()
-        GL30.glBindFramebuffer(GL30.GL_FRAMEBUFFER, fbo)
-        GL30.glFramebufferTexture2D(
-            GL30.GL_FRAMEBUFFER, GL30.GL_COLOR_ATTACHMENT0,
-            GL11.GL_TEXTURE_2D, texture, 0,
-        )
-        GL30.glBindFramebuffer(GL30.GL_FRAMEBUFFER, 0)
-
-        texWidth = width
-        texHeight = height
-
-        // A Skia surface over the same FBO, rather than an adopted texture.
-        // Image.adoptTextureFrom() hands Skia ownership of an image it treats
-        // as immutable, so it never re-read what mpv wrote: the picture only
-        // refreshed when a resize rebuilt it. Snapshotting a surface each frame
-        // is copy-on-write and always current.
-        //
-        // TOP_LEFT, not BOTTOM_LEFT: rendering into an FBO with flip_y=0 leaves
-        // mpv's output top-row-first. Declaring it bottom-first is what turned
-        // the picture upside down.
-        renderTarget = BackendRenderTarget.makeGL(
-            width, height, 0, 8, fbo, FramebufferFormat.GR_GL_RGBA8,
-        )
-        videoSurface = Surface.makeFromBackendRenderTarget(
-            context, renderTarget!!, SurfaceOrigin.TOP_LEFT,
-            SurfaceColorFormat.RGBA_8888, ColorSpace.sRGB,
-        )
-    }
-
-    private fun releaseTarget() {
-        videoSurface?.close(); videoSurface = null
-        renderTarget?.close(); renderTarget = null
-        if (fbo != 0) { GL30.glDeleteFramebuffers(fbo); fbo = 0 }
-        if (texture != 0) { GL11.glDeleteTextures(texture); texture = 0 }
-        texWidth = 0; texHeight = 0
-    }
-
-    override fun drawVideo(canvas: org.jetbrains.skia.Canvas, width: Float, height: Float) {
-        drawCount++
-        val snapshot = videoSurface?.makeImageSnapshot() ?: return
+        if (pipeline.probe && frame.fresh) {
+            // Consumer-side truth: what this context reads from the same
+            // texture, after the fence wait. Compare with the publish line.
+            GL30.glBindFramebuffer(GL30.GL_READ_FRAMEBUFFER, wrapper.fbo)
+            val px = java.nio.ByteBuffer.allocateDirect(4)
+            GL11.glReadPixels(
+                buf.width / 2, buf.height / 2, 1, 1,
+                GL11.GL_RGBA, GL11.GL_UNSIGNED_BYTE, px,
+            )
+            GL30.glBindFramebuffer(GL30.GL_READ_FRAMEBUFFER, 0)
+            val v = (px.get(0).toInt() and 0xFF shl 16) or
+                (px.get(1).toInt() and 0xFF shl 8) or (px.get(2).toInt() and 0xFF)
+            println(
+                "[wayland-video] consume: gen=${buf.generation} tex=${buf.texture} " +
+                    "center=%06x".format(v),
+            )
+        }
+        if (frame.fresh) {
+            // Two caches must be told the texture changed behind their backs.
+            // Skia's copy-on-write snapshot would be the first frame forever
+            // without notifyContentWillChange. And GL itself only guarantees a
+            // context sees another context's writes to a shared texture after
+            // *re-binding* it -- which Skia's state cache elides, since as far
+            // as it knows the texture never left the unit. Dropping the cached
+            // texture bindings forces the re-bind; without it, buffers
+            // alternated between live frames and their initial cleared black.
+            wrapper.surface.notifyContentWillChange(ContentChangeMode.DISCARD)
+            context.resetGL(org.jetbrains.skia.GLBackendState.TEXTURE_BINDING)
+        }
+        val snapshot = wrapper.surface.makeImageSnapshot()
         canvas.drawImageRect(
             snapshot,
-            Rect.makeWH(texWidth.toFloat(), texHeight.toFloat()),
-            Rect.makeWH(width, height),
+            Rect.makeWH(buf.width.toFloat(), buf.height.toFloat()),
+            Rect.makeXYWH(rectLeft, rectTop, rectWidth, rectHeight),
             SamplingMode.LINEAR,
             null,
             true,
         )
         snapshot.close()
+        composites++
+    }
+
+    private fun evictStaleWrappers(keep: Int) {
+        // Generations only grow; anything older than (keep - 3) can no longer
+        // be republished by the triple-buffered pipeline.
+        val stale = wrappers.keys.filter { it < keep - 3 }
+        for (g in stale) {
+            wrappers.remove(g)?.let {
+                it.surface.close()
+                it.renderTarget.close()
+                GL30.glDeleteFramebuffers(it.fbo)
+            }
+        }
     }
 
     @Volatile

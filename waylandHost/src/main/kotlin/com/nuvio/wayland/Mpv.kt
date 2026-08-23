@@ -96,6 +96,10 @@ class Mpv private constructor(private val handle: MemorySegment, private val are
         private val mpvRenderContextUpdate by lazy {
             fn("mpv_render_context_update", FunctionDescriptor.of(java.lang.foreign.ValueLayout.JAVA_LONG, ADDRESS))
         }
+        private val mpvRenderContextSetUpdateCallback by lazy {
+            fn("mpv_render_context_set_update_callback",
+                FunctionDescriptor.ofVoid(ADDRESS, ADDRESS, ADDRESS))
+        }
         // mpv_render_context_get_info takes its param struct by value.
         private val mpvRenderContextGetInfo by lazy {
             fn("mpv_render_context_get_info",
@@ -281,9 +285,18 @@ class Mpv private constructor(private val handle: MemorySegment, private val are
         }
     }
 
-    /** Render one frame into [fbo] at [w] x [h]. Never blocks on frame timing. */
-    fun render(fbo: Int, w: Int, h: Int) {
-        if (renderCtx.equals(MemorySegment.NULL)) return
+    /**
+     * Render one frame into [fbo] at [w] x [h].
+     *
+     * Blocks until the frame's presentation time -- mpv's own display sync.
+     * That is precisely what a dedicated video thread wants, and precisely
+     * what must never run on a thread that also draws UI: an earlier revision
+     * called this on the Compose thread and pinned the entire application to
+     * the video's frame rate. The pacing belongs to mpv; the threading
+     * belongs to the caller.
+     */
+    fun render(fbo: Int, w: Int, h: Int): Int {
+        if (renderCtx.equals(MemorySegment.NULL)) return -1
         Arena.ofConfined().use { frame ->
             val target = frame.allocate(OPENGL_FBO)
             target.set(JAVA_INT, 0, fbo)
@@ -291,12 +304,8 @@ class Mpv private constructor(private val handle: MemorySegment, private val are
             target.set(JAVA_INT, 8, h)
             target.set(JAVA_INT, 12, 0) // internal_format: 0 = let mpv choose
             val flip = frame.allocateFrom(JAVA_INT, 0)
-            // Without this mpv sleeps until the frame's target time inside
-            // render(), pinning this thread -- and so the whole UI -- to the
-            // video's frame rate. The caller paces instead, via nextFrameInfo().
-            val noBlock = frame.allocateFrom(JAVA_INT, 0)
 
-            val params = frame.allocate(RENDER_PARAM, 4)
+            val params = frame.allocate(RENDER_PARAM, 3)
             fun put(i: Int, type: Int, data: MemorySegment) {
                 val off = i.toLong() * RENDER_PARAM.byteSize()
                 params.set(JAVA_INT, off, type)
@@ -304,11 +313,38 @@ class Mpv private constructor(private val handle: MemorySegment, private val are
             }
             put(0, MPV_RENDER_PARAM_OPENGL_FBO, target)
             put(1, MPV_RENDER_PARAM_FLIP_Y, flip)
-            put(2, MPV_RENDER_PARAM_BLOCK_FOR_TARGET_TIME, noBlock)
-            put(3, MPV_RENDER_PARAM_INVALID, MemorySegment.NULL)
+            put(2, MPV_RENDER_PARAM_INVALID, MemorySegment.NULL)
 
-            mpvRenderContextRender.invokeExact(renderCtx, params) as Int
+            return mpvRenderContextRender.invokeExact(renderCtx, params) as Int
         }
+    }
+
+    /**
+     * Install the render-context update callback.
+     *
+     * mpv invokes it from an internal thread whenever a new frame (or other
+     * update) is available; [callback] must only signal -- never call back
+     * into mpv, and never touch GL.
+     */
+    fun setUpdateCallback(callback: Runnable) {
+        check(!renderCtx.equals(MemorySegment.NULL)) { "render context not created" }
+        UpdateCallbackBridge.callback = callback
+        val target = MethodHandles.lookup().findStatic(
+            UpdateCallbackBridge::class.java, "invoke",
+            MethodType.methodType(Void.TYPE, MemorySegment::class.java),
+        )
+        val stub = linker.upcallStub(target, FunctionDescriptor.ofVoid(ADDRESS), arena)
+        mpvRenderContextSetUpdateCallback.invokeExact(renderCtx, stub, MemorySegment.NULL)
+    }
+
+    /**
+     * Free the render context. Must be called from the thread that owns the
+     * GL context it was created against, before [close].
+     */
+    fun freeRenderContext() {
+        if (renderCtx.equals(MemorySegment.NULL)) return
+        mpvRenderContextFree.invokeExact(renderCtx)
+        renderCtx = MemorySegment.NULL
     }
 
     /** Ask mpv to deliver its own log at [level] (e.g. "v", "debug"). */
@@ -364,12 +400,26 @@ class Mpv private constructor(private val handle: MemorySegment, private val are
     fun getBoolean(name: String): Boolean? = getProperty(name)?.let { it == "yes" || it == "true" }
 
     fun close() {
-        if (!renderCtx.equals(MemorySegment.NULL)) {
-            mpvRenderContextFree.invokeExact(renderCtx)
-            renderCtx = MemorySegment.NULL
+        // The render context belongs to the video thread's GL context; freeing
+        // it from here would touch GL from the wrong thread. freeRenderContext()
+        // runs on that thread during its shutdown, before this is called.
+        check(renderCtx.equals(MemorySegment.NULL)) {
+            "freeRenderContext() must run (on the video thread) before close()"
         }
         mpvTerminateDestroy.invokeExact(handle)
         arena.close()
+    }
+}
+
+/** Upcall target for the render-context update callback. */
+internal object UpdateCallbackBridge {
+    @JvmStatic
+    @Volatile
+    var callback: Runnable? = null
+
+    @JvmStatic
+    fun invoke(ctx: MemorySegment) {
+        callback?.run()
     }
 }
 

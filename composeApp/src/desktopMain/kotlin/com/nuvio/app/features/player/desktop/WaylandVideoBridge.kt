@@ -37,14 +37,22 @@ object WaylandVideoBridge {
         fun snapshot(): State
 
         /**
-         * Draw the latest video frame into [canvas] at the given rectangle.
+         * Report where the video surface sits, in scene (framebuffer) pixels.
+         * Called from layout whenever the surface's bounds change; the host
+         * renders and composites the video into exactly this rectangle.
+         */
+        fun setVideoRect(left: Float, top: Float, width: Float, height: Float)
+
+        /**
+         * Called during scene rasterization where the video surface sits.
          *
-         * The host renders video into an offscreen texture, so the frame is
-         * drawn *inside* the Compose scene rather than underneath it. That is
-         * what makes ordering, clipping and position behave: painted beneath
-         * the scene, any opaque background above it would simply cover it.
-         *
-         * Called on the render thread, during composition.
+         * The host composites the actual video *under* the scene; this call's
+         * job is to clear the surface's rectangle to transparent so the video
+         * layer shows through, while everything composed above the surface --
+         * controls, overlays, dialogs -- still stacks on top. Keeping video
+         * out of the scene means a new video frame never costs a scene
+         * rasterization, which is what decouples video smoothness from UI
+         * complexity.
          */
         fun drawVideo(canvas: org.jetbrains.skia.Canvas, width: Float, height: Float)
 
