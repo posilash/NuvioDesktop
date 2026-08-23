@@ -71,6 +71,22 @@ class VideoPipeline(
     /** Called (from any thread) after each publish; wired to wake the host loop. */
     @Volatile var onFrame: (() -> Unit)? = null
 
+    // Source cadence measured at the publish point, where mpv's own pacing
+    // sets it -- present times are downstream and get contaminated by the
+    // very stalls a scheduler needs this number to avoid.
+    @Volatile var publishIntervalMs: Double = 41.7
+        private set
+    private var lastPublishNs = 0L
+
+    private fun notePublish() {
+        val now = System.nanoTime()
+        if (lastPublishNs != 0L) {
+            val ms = (now - lastPublishNs) / 1e6
+            if (ms in 8.0..120.0) publishIntervalMs += (ms - publishIntervalMs) * 0.1
+        }
+        lastPublishNs = now
+    }
+
     fun setTargetSize(width: Int, height: Int) {
         if (width == targetWidth && height == targetHeight) return
         targetWidth = width
@@ -201,6 +217,7 @@ class VideoPipeline(
                 rendering = null
             }
             lastGeneration = buf.generation
+            notePublish()
             onFrame?.invoke()
             // Wake the host loop even if it is idle in glfwWaitEventsTimeout.
             glfwPostEmptyEvent()

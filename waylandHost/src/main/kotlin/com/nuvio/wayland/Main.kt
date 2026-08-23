@@ -550,7 +550,7 @@ fun main() {
             val starvedMs = (t - lastSceneRenderNs) / 1e6
             if (videoLive && starvedMs < 120.0) {
                 val untilNextFrameMs =
-                    (lastVideoPresentNs - t) / 1e6 + videoIntervalEmaMs
+                    (lastVideoPresentNs - t) / 1e6 + (pipeline?.publishIntervalMs ?: videoIntervalEmaMs)
                 if (untilNextFrameMs < sceneCostEmaMs * 1.2 + 3.0) {
                     // Too close: skip this iteration; the loop re-checks in
                     // ~4ms and the scene runs right after the frame instead.

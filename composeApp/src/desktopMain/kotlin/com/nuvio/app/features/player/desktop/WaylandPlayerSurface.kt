@@ -9,6 +9,7 @@ import androidx.compose.ui.graphics.nativeCanvas
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.remember
 import androidx.compose.ui.Modifier
 import com.nuvio.app.features.player.AudioTrack
 import com.nuvio.app.features.player.PlayerEngineController
@@ -79,6 +80,7 @@ internal fun WaylandPlayerSurface(
         }
     }
 
+    val controller = remember(bridge) { WaylandPlayerController(bridge) }
     LaunchedEffect(sourceUrl) {
         // Deliberately asynchronous, not in the DisposableEffect above: the
         // player runtime resets its controller from a source-keyed
@@ -89,28 +91,45 @@ internal fun WaylandPlayerSurface(
         // controller while playback runs fine. Runtime effects launch first
         // (they compose first), so delivering from a coroutine here orders
         // this after the reset.
-        onControllerReady(WaylandPlayerController(bridge))
+        onControllerReady(controller)
         var lastError: String? = null
+        var lastPushed: PlayerPlaybackSnapshot? = null
         while (true) {
-            // Off the UI thread: each property read takes the mpv core lock,
-            // which is contended during playback. Polled on the EDT, the ~8
-            // reads stalled it up to ~66ms at 10Hz -- measured as constant
-            // 11-vsync gaps in the present cadence, i.e. the visible judder.
-            val s = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
-                bridge.snapshot()
+            val s = bridge.snapshot() // pure cache reads; never touches the core
+            // Seek-hold: right after a seek, mpv still reports the old
+            // position for a few hundred ms, which made the seek bar bounce
+            // back before jumping to the target. Report the target until
+            // playback catches up (or the hold times out).
+            val seekTarget = controller.pendingSeekTargetMs
+            val position = if (
+                seekTarget >= 0 &&
+                System.nanoTime() - controller.pendingSeekAtNs < 1_500_000_000L &&
+                kotlin.math.abs(s.positionMs - seekTarget) > 800
+            ) {
+                seekTarget
+            } else {
+                if (seekTarget >= 0) controller.clearPendingSeek()
+                s.positionMs
             }
-            onSnapshot(
-                PlayerPlaybackSnapshot(
-                    isLoading = s.isBuffering,
-                    isPlaying = s.isPlaying,
-                    isEnded = s.hasEnded,
-                    durationMs = s.durationMs,
-                    positionMs = s.positionMs,
-                    bufferedPositionMs = s.bufferedMs,
-                    playbackSpeed = s.playbackSpeed,
-                    volumeLevel = s.volumeLevel,
-                ),
+            // Quantize what recomposition can see: with the chrome hidden,
+            // sub-second position ticks still recomposed the whole player
+            // screen 10x/s, and at ~20ms a scene render that is most of the
+            // measured judder. Whole seconds recompose once per second; every
+            // state the UI shows survives unchanged.
+            val snapshot = PlayerPlaybackSnapshot(
+                isLoading = s.isBuffering,
+                isPlaying = s.isPlaying,
+                isEnded = s.hasEnded,
+                durationMs = s.durationMs,
+                positionMs = (position / 1000) * 1000,
+                bufferedPositionMs = (s.bufferedMs / 1000) * 1000,
+                playbackSpeed = s.playbackSpeed,
+                volumeLevel = s.volumeLevel,
             )
+            if (snapshot != lastPushed) {
+                lastPushed = snapshot
+                onSnapshot(snapshot)
+            }
             if (s.error != null && s.error != lastError) {
                 lastError = s.error
                 onError(s.error)
@@ -149,9 +168,21 @@ private class WaylandPlayerController(
     private val bridge: WaylandVideoBridge.Delegate,
 ) : PlayerEngineController {
 
+    // Seek-hold state, read by the surface's snapshot loop; see there.
+    @Volatile var pendingSeekTargetMs: Long = -1L
+        private set
+    @Volatile var pendingSeekAtNs: Long = 0L
+        private set
+
+    fun clearPendingSeek() { pendingSeekTargetMs = -1L }
+
     override fun play() = bridge.play()
     override fun pause() = bridge.pause()
-    override fun seekTo(positionMs: Long) = bridge.seekTo(positionMs)
+    override fun seekTo(positionMs: Long) {
+        pendingSeekTargetMs = positionMs
+        pendingSeekAtNs = System.nanoTime()
+        bridge.seekTo(positionMs)
+    }
     override fun seekBy(offsetMs: Long) = bridge.seekBy(offsetMs)
     override fun setPlaybackSpeed(speed: Float) = bridge.setSpeed(speed)
     override fun setMuted(muted: Boolean) = bridge.setMuted(muted)

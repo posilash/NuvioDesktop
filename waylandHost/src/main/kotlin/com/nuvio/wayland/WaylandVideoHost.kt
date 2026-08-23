@@ -98,10 +98,13 @@ class WaylandVideoHost(
      * rect. Runs on the UI thread with the window context current, after the
      * background clear and before the UI layer.
      */
+    @Volatile private var lastCompositeNs = 0L
+
     fun compositeVideo(canvas: Canvas) {
         if (!hasFile) return
         if (rectWidth <= 0f || rectHeight <= 0f) return
         val frame = pipeline.acquireDisplayFrame() ?: return
+        lastCompositeNs = System.nanoTime()
         val buf = frame.buffer
 
         val wrapper = wrappers.getOrPut(buf.generation) {
@@ -382,12 +385,18 @@ class WaylandVideoHost(
         val seeking = mpv.cachedBoolean("seeking") ?: false
         val bufferingProperty = mpv.cachedBoolean("paused-for-cache") ?: false
 
+        // Frames on glass are the ground truth for "loading": mpv's seeking
+        // flag stays up through the initial start-position seek for a second
+        // or so after playback is visibly running, which kept the loading
+        // overlay over live video.
+        val presenting = (System.nanoTime() - lastCompositeNs) < 300_000_000L
         return WaylandVideoBridge.Delegate.State(
             positionMs = (position * 1000).toLong(),
             durationMs = (duration * 1000).toLong(),
             bufferedMs = (buffered * 1000).toLong(),
             isPlaying = !paused && !idle,
-            isBuffering = bufferingProperty || seeking || (duration <= 0.0 && !idle),
+            isBuffering = bufferingProperty ||
+                ((seeking || (duration <= 0.0 && !idle)) && !presenting),
             hasEnded = mpv.cachedBoolean("eof-reached") ?: false,
             // The speed cycler and its label both read this back; without it
             // they see 1x forever and cycling sticks at the first step.
