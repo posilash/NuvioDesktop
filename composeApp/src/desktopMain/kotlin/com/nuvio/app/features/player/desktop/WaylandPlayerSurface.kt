@@ -39,6 +39,10 @@ internal fun WaylandPlayerSurface(
     resizeMode: PlayerResizeMode,
     initialPositionMs: Long,
     initialPositionRequestKey: String?,
+    playerControlsState: com.nuvio.app.features.player.PlayerControlsState,
+    onPlayerControlsEvent: (String, Double) -> Boolean,
+    onPlayerControlsScrubChange: (Long) -> Boolean,
+    onPlayerControlsScrubFinished: (Long) -> Boolean,
     onInitialPositionHandled: (key: String, handled: Boolean) -> Unit,
     onControllerReady: (PlayerEngineController) -> Unit,
     onSnapshot: (PlayerPlaybackSnapshot) -> Unit,
@@ -140,6 +144,41 @@ internal fun WaylandPlayerSurface(
 
     LaunchedEffect(resizeMode) {
         bridge.setResizeMode(resizeMode)
+    }
+
+    if (WaylandVideoBridge.webChromeActive) {
+        // Stock chrome mode: the page draws the controls; this side feeds it
+        // state and routes its events with exactly the stock controller's
+        // table (NativePlayerController.handlePlayerEvent).
+        val isFullscreen = com.nuvio.app.core.ui.isFullscreenActionActive()
+        LaunchedEffect(playerControlsState, isFullscreen) {
+            bridge.pushControlsJson(playerControlsState.toControlsJson(isFullscreen))
+        }
+        DisposableEffect(Unit) {
+            WaylandVideoBridge.onChromeEvent = { type, value ->
+                when (type) {
+                    "scrubChange" -> {
+                        if (!onPlayerControlsScrubChange(value.toLong())) Unit
+                    }
+                    "scrubFinish" -> {
+                        if (!onPlayerControlsScrubFinished(value.toLong())) {
+                            bridge.seekTo(value.toLong())
+                        }
+                    }
+                    "toggleFullscreen" -> com.nuvio.app.core.ui.toggleFullscreenAction()
+                    "volumeChange" ->
+                        bridge.setVolumeFraction(
+                            (if (value > 1.0) value / 100.0 else value).toFloat(),
+                        )
+                    "volumeChangeTemporary" ->
+                        bridge.setVolumeFraction(
+                            (if (value > 1.0) value / 100.0 else value).toFloat(),
+                        )
+                    else -> onPlayerControlsEvent(type, value)
+                }
+            }
+            onDispose { WaylandVideoBridge.onChromeEvent = null }
+        }
     }
 
     Canvas(

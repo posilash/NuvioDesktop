@@ -62,6 +62,9 @@ object WaylandVideoBridge {
         fun setResizeMode(mode: com.nuvio.app.features.player.PlayerResizeMode)
         fun stop()
 
+        /** Deliver a controls-state payload to the web chrome, if hosted. */
+        fun pushControlsJson(json: String) {}
+
         /** Current track lists, ids matching what the select methods expect. */
         fun audioTracks(): List<com.nuvio.app.features.player.AudioTrack>
         fun subtitleTracks(): List<com.nuvio.app.features.player.SubtitleTrack>
@@ -106,6 +109,18 @@ object WaylandVideoBridge {
     var delegate: Delegate? = null
 
     val isAvailable: Boolean get() = delegate != null
+
+    /**
+     * True when the host runs the stock web chrome (WPE) over the video. The
+     * Compose chrome then stays hidden through the usesNativePlayerChrome
+     * gate, exactly as on the stock desktop build.
+     */
+    @Volatile
+    var webChromeActive: Boolean = false
+
+    /** Chrome {type,value} events, routed by the player surface. */
+    @Volatile
+    var onChromeEvent: ((String, Double) -> Unit)? = null
 
     /**
      * Route the app's fullscreen action to the host's window. The stock

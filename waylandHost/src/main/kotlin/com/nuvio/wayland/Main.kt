@@ -45,6 +45,8 @@ import androidx.compose.ui.scene.CanvasLayersComposeScene
 import kotlin.system.exitProcess
 
 private var chromeWrapper: Triple<Int, org.jetbrains.skia.BackendRenderTarget, org.jetbrains.skia.Surface>? = null
+private var chromeWrapperW = 0
+private var chromeWrapperH = 0
 
 /**
  * Draw the WPE chrome texture over everything else. Wrapped the same way the
@@ -60,6 +62,11 @@ private fun drawChromeTexture(
     height: Int,
 ): Triple<Int, org.jetbrains.skia.BackendRenderTarget, org.jetbrains.skia.Surface> {
     var w = wrapper
+    if (w != null && (chromeWrapperW != layer.imageWidth || chromeWrapperH != layer.imageHeight)) {
+        w.third.close(); w.second.close()
+        org.lwjgl.opengl.GL30.glDeleteFramebuffers(w.first)
+        w = null
+    }
     if (w == null) {
         val fbo = org.lwjgl.opengl.GL30.glGenFramebuffers()
         org.lwjgl.opengl.GL30.glBindFramebuffer(org.lwjgl.opengl.GL30.GL_FRAMEBUFFER, fbo)
@@ -68,8 +75,10 @@ private fun drawChromeTexture(
             org.lwjgl.opengl.GL11.GL_TEXTURE_2D, layer.texture, 0,
         )
         org.lwjgl.opengl.GL30.glBindFramebuffer(org.lwjgl.opengl.GL30.GL_FRAMEBUFFER, 0)
+        chromeWrapperW = layer.imageWidth
+        chromeWrapperH = layer.imageHeight
         val rt = org.jetbrains.skia.BackendRenderTarget.makeGL(
-            INITIAL_WIDTH, INITIAL_HEIGHT, 0, 8, fbo,
+            chromeWrapperW, chromeWrapperH, 0, 8, fbo,
             org.jetbrains.skia.FramebufferFormat.GR_GL_RGBA8,
         )
         val surface = org.jetbrains.skia.Surface.makeFromBackendRenderTarget(
@@ -83,7 +92,7 @@ private fun drawChromeTexture(
     val snapshot = w.third.makeImageSnapshot()
     canvas.drawImageRect(
         snapshot,
-        org.jetbrains.skia.Rect.makeWH(INITIAL_WIDTH.toFloat(), INITIAL_HEIGHT.toFloat()),
+        org.jetbrains.skia.Rect.makeWH(chromeWrapperW.toFloat(), chromeWrapperH.toFloat()),
         org.jetbrains.skia.Rect.makeWH(width.toFloat(), height.toFloat()),
         org.jetbrains.skia.SamplingMode.LINEAR, null, true,
     )
@@ -481,13 +490,39 @@ fun main() {
             eglDisplay = org.lwjgl.glfw.GLFWNativeEGL.glfwGetEGLDisplay(),
             width = INITIAL_WIDTH,
             height = INITIAL_HEIGHT,
-            onMessage = { println("[wpe] message: $it") },
+            onMessage = { json ->
+                // {type,value} in either field order; value optional.
+                val type = Regex("\u0022type\u0022[ \t]*:[ \t]*\u0022([^\u0022]*)\u0022")
+                    .find(json)?.groupValues?.get(1)
+                val value = Regex("\u0022value\u0022[ \t]*:[ \t]*(-?[0-9.]+)")
+                    .find(json)?.groupValues?.get(1)?.toDoubleOrNull() ?: 0.0
+                if (type != null) {
+                    if (System.getProperty("nuvio.wayland.videoLog")?.toBoolean() == true) {
+                        println("[wpe] event: $type=$value")
+                    }
+                    if (type == "controlsReady") videoHost?.flushControlsToChrome()
+                    java.awt.EventQueue.invokeLater {
+                        com.nuvio.app.features.player.desktop.WaylandVideoBridge
+                            .onChromeEvent?.invoke(type, value)
+                    }
+                }
+            },
         ).also { it.start("file://" + page.path) }
         wpeLayer = com.nuvio.wayland.wpe.WpeChromeLayer(wpeChrome!!)
+        videoHost?.chrome = wpeChrome
+        if (runRealAppEarly) {
+            com.nuvio.app.features.player.desktop.WaylandVideoBridge.webChromeActive = true
+            println("web chrome: ACTIVE (stock controls.html via WPE)")
+        }
     }
 
     val input = InputRouter(window, scene)
     input.install()
+    wpeChrome?.let { c ->
+        input.chrome = c
+        input.chromeScaleX = 1f // chrome surface matches INITIAL size for now
+        input.chromeScaleY = 1f
+    }
 
     // Keyboard needs an owner. On the AWT path the window grants Compose focus
     // when it gains it; with a bare scene nothing does, so every key event is
@@ -507,6 +542,7 @@ fun main() {
     }
 
     var exitCode = 0
+    var lastChromeTickNs = 0L
     val timings = FrameTimings()
 
     // Scheduling state for scene-vs-video contention: the scene may only
@@ -572,6 +608,7 @@ fun main() {
                 val scale = currentScale()
                 input.scale = scale
                 if (scene.density.density != scale) scene.density = Density(scale)
+                wpeChrome?.dispatchSize(width, height)
             }
         }
 
@@ -644,6 +681,11 @@ fun main() {
         // frame is a present reason of its own.
         val chromeChanged = java.awt.EventQueue.isDispatchThread() &&
             wpeLayer?.importLatest() == true
+        // The stock bridge's periodic playback push, off the property cache.
+        if (wpeChrome != null && System.nanoTime() - lastChromeTickNs > 300_000_000L) {
+            lastChromeTickNs = System.nanoTime()
+            videoHost?.pushPlaybackUpdate()
+        }
 
         t = System.nanoTime()
         s.canvas.clear(0xFF101014.toInt())
@@ -654,7 +696,8 @@ fun main() {
         // milliseconds and dragged the whole chrome down.
         ui.draw(s.canvas, 0, 0, null)
         wpeLayer?.let { layer ->
-            if (layer.texture != 0) {
+            val chromeWanted = !runRealApp || videoHost?.hasFile == true
+            if (layer.texture != 0 && chromeWanted) {
                 chromeWrapper = drawChromeTexture(chromeWrapper, layer, s.canvas, context, width, height)
             }
         }

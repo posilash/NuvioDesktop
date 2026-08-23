@@ -14,5 +14,6 @@ internal actual val isWindows: Boolean = System.getProperty("os.name").orEmpty()
 // composed, and when it does the video lives inside the Compose scene with no
 // native overlay above it, so Compose has to draw the chrome itself.
 internal actual val usesNativePlayerChrome: Boolean
-    get() = !com.nuvio.app.features.player.desktop.WaylandVideoBridge.isAvailable
+    get() = !com.nuvio.app.features.player.desktop.WaylandVideoBridge.isAvailable ||
+        com.nuvio.app.features.player.desktop.WaylandVideoBridge.webChromeActive
 

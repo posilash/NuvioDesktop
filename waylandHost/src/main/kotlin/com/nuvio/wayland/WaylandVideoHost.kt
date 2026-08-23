@@ -198,6 +198,93 @@ class WaylandVideoHost(
         }
     }
 
+    // ---- web chrome (stock controls.html in WPE) ----
+
+    @Volatile var chrome: com.nuvio.wayland.wpe.WpeChrome? = null
+    @Volatile private var lastControlsJson: String? = null
+
+    /** JS string literal, matching the stock bridge's jsLiteral escaping. */
+    private fun jsLiteral(s: String): String = buildString {
+        append('\u0022')
+        for (c in s) when (c) {
+            '\u0022' -> append("\\\u0022")
+            '\\' -> append("\\\\")
+            '\n' -> append("\\n")
+            '\r' -> append("\\r")
+            else -> append(c)
+        }
+        append('\u0022')
+    }
+
+    override fun pushControlsJson(json: String) {
+        lastControlsJson = json
+        val c = chrome ?: return
+        // Stock's flush script verbatim: probes window.playerControls so a
+        // too-early push is detected; controlsReady re-pushes (see onMessage
+        // wiring in Main).
+        c.evaluateJs(
+            "(function(){if(!window.playerControls)return 'missing';" +
+                "window.playerControls(JSON.parse(" + jsLiteral(json) + "));" +
+                "return 'ok';})()",
+        )
+    }
+
+    /** Re-deliver pending state; called when the page reports controlsReady. */
+    fun flushControlsToChrome() {
+        lastControlsJson?.let { pushControlsJson(it) }
+    }
+
+    /**
+     * The periodic playback push the stock bridge does at its tick: position,
+     * duration, pause, loading and both track lists, into
+     * window.playerUpdate. Position and flags come from the observed-property
+     * cache (never the core); the track lists are the only core reads, so
+     * they are cached and refreshed sparsely.
+     */
+    private var cachedTracksJson: String = "[],"
+    private var tracksRefreshedAtNs = 0L
+
+    fun pushPlaybackUpdate() {
+        val c = chrome ?: return
+        if (!hasFile) return
+        val now = System.nanoTime()
+        if (now - tracksRefreshedAtNs > 3_000_000_000L) {
+            tracksRefreshedAtNs = now
+            cachedTracksJson = tracksJson("audio") + "," + tracksJson("sub")
+        }
+        val duration = mpv.cachedDouble("duration") ?: 0.0
+        val position = mpv.cachedDouble("time-pos") ?: 0.0
+        val paused = mpv.cachedBoolean("pause") ?: false
+        val loading = (mpv.cachedBoolean("paused-for-cache") ?: false) ||
+            (mpv.cachedBoolean("seeking") ?: false)
+        val (audio, subs) = cachedTracksJson.split("],[").let {
+            if (it.size == 2) Pair(it[0] + "]", "[" + it[1]) else Pair("[]", "[]")
+        }
+        c.evaluateJs(
+            "window.playerUpdate&&window.playerUpdate({duration:%.3f,position:%.3f,paused:%s,loading:%s,audioTracks:%s,subtitleTracks:%s})"
+                .format(duration, position, paused, loading, audio, subs.removeSuffix(",")),
+        )
+    }
+
+    private fun tracksJson(type: String): String = buildString {
+        append('[')
+        tracks(type).forEachIndexed { position, t ->
+            if (position > 0) append(',')
+            append("{\u0022index\u0022:").append(position)
+            append(",\u0022id\u0022:\u0022").append(t.id).append('\u0022')
+            append(",\u0022label\u0022:\u0022")
+            append(t.label(if (type == "sub") "Subtitle" else "Track").replace("\u0022", "\\\u0022"))
+            append('\u0022')
+            append(",\u0022language\u0022:\u0022")
+            append(t.language.orEmpty().replace("\u0022", "\\\u0022"))
+            append('\u0022')
+            append(",\u0022selected\u0022:").append(t.selected)
+            append(",\u0022forced\u0022:").append(t.forced)
+            append('}')
+        }
+        append(']')
+    }
+
     @Volatile
     var hasFile: Boolean = false
         private set

@@ -38,6 +38,20 @@ class InputRouter(
     /** Scale from window coordinates to framebuffer pixels (fractional scaling). */
     var scale: Float = 1f
 
+    /**
+     * Optional web-chrome sink. When set, input is ALSO forwarded to the WPE
+     * view -- the stock model: the chrome overlay sees everything over the
+     * player and its page decides what reacts. Coordinates are mapped from
+     * framebuffer pixels into the chrome's own surface size.
+     */
+    var chrome: com.nuvio.wayland.wpe.WpeChrome? = null
+    var chromeScaleX: Float = 1f
+    var chromeScaleY: Float = 1f
+    private var chromeButtons = 0
+
+    private fun chromeXY(): Pair<Int, Int> =
+        Pair((cursorX * chromeScaleX).toInt(), (cursorY * chromeScaleY).toInt())
+
     // Counted at both ends: what GLFW handed us, and what actually reached the
     // scene. If those diverge the events are being dropped between the two,
     // which is a different fault from never receiving any.
@@ -64,6 +78,11 @@ class InputRouter(
         glfwSetCursorPosCallback(window) { _, x, y ->
             cursorX = (x * scale).toFloat()
             cursorY = (y * scale).toFloat()
+            chrome?.let { c ->
+                val (cx, cy) = chromeXY()
+                c.dispatchPointer(motion = true, x = cx, y = cy, button = 0,
+                    pressed = false, modifiers = chromeButtons)
+            }
             send(PointerEventType.Move)
         }
 
@@ -83,6 +102,25 @@ class InputRouter(
             } else {
                 buttonMask and mask.inv()
             }
+            chrome?.let { c ->
+                // wpe buttons: 1=left 2=middle 3=right; button-held modifier
+                // bits start at 1<<20 (wpe_input_pointer_modifier_button1).
+                val wpeButton = when (button) {
+                    GLFW_MOUSE_BUTTON_LEFT -> 1
+                    GLFW_MOUSE_BUTTON_MIDDLE -> 2
+                    GLFW_MOUSE_BUTTON_RIGHT -> 3
+                    else -> 0
+                }
+                if (wpeButton != 0) {
+                    val bit = 1 shl (19 + wpeButton)
+                    chromeButtons = if (action == GLFW_PRESS) chromeButtons or bit
+                    else chromeButtons and bit.inv()
+                    val (cx, cy) = chromeXY()
+                    c.dispatchPointer(motion = false, x = cx, y = cy,
+                        button = wpeButton, pressed = action == GLFW_PRESS,
+                        modifiers = chromeButtons)
+                }
+            }
             send(
                 if (action == GLFW_PRESS) PointerEventType.Press else PointerEventType.Release,
                 button = composeButton,
@@ -90,6 +128,12 @@ class InputRouter(
         }
 
         glfwSetScrollCallback(window) { _, dx, dy ->
+            chrome?.let { c ->
+                val (cx, cy) = chromeXY()
+                // Web wheel steps: ~53px per notch, sign as Wayland's.
+                if (dy != 0.0) c.dispatchAxis(cx, cy, vertical = true, value = (dy * 53).toInt())
+                if (dx != 0.0) c.dispatchAxis(cx, cy, vertical = false, value = (dx * 53).toInt())
+            }
             // Compose scroll deltas run opposite to GLFW's, and are in
             // "lines"; one notch is one unit.
             send(PointerEventType.Scroll, scroll = Offset(-dx.toFloat(), -dy.toFloat()))
@@ -105,6 +149,17 @@ class InputRouter(
                 GLFW_PRESS, GLFW_REPEAT -> KeyEventType.KeyDown
                 GLFW_RELEASE -> KeyEventType.KeyUp
                 else -> return@glfwSetKeyCallback
+            }
+            chrome?.let { c ->
+                val keysym = key.toXkbKeysym(mods)
+                if (keysym != 0) {
+                    var wm = 0
+                    if (mods and GLFW_MOD_CONTROL != 0) wm = wm or 1
+                    if (mods and GLFW_MOD_SHIFT != 0) wm = wm or 2
+                    if (mods and GLFW_MOD_ALT != 0) wm = wm or 4
+                    if (mods and GLFW_MOD_SUPER != 0) wm = wm or 8
+                    c.dispatchKey(keysym, key, action != GLFW_RELEASE, wm)
+                }
             }
             val vk = key.toAwtVirtualKey() ?: return@glfwSetKeyCallback
             val mods = modifiers
@@ -193,6 +248,33 @@ class InputRouter(
      * defined in terms of AWT constants, so this bridge is unavoidable.
      * Printable ASCII maps directly; the rest is a table.
      */
+    /**
+     * GLFW key to XKB keysym, which is what wpe_input_keyboard_event carries.
+     * Basic-latin keysyms equal their ASCII codes (lowercased); the rest come
+     * from keysymdef.h.
+     */
+    private fun Int.toXkbKeysym(mods: Int): Int = when (this) {
+        in GLFW_KEY_A..GLFW_KEY_Z ->
+            if (mods and GLFW_MOD_SHIFT != 0) this else this + 32 // 'A'->'a'
+        in GLFW_KEY_0..GLFW_KEY_9 -> this
+        GLFW_KEY_SPACE -> 0x20
+        GLFW_KEY_ENTER, GLFW_KEY_KP_ENTER -> 0xFF0D
+        GLFW_KEY_ESCAPE -> 0xFF1B
+        GLFW_KEY_TAB -> 0xFF09
+        GLFW_KEY_BACKSPACE -> 0xFF08
+        GLFW_KEY_DELETE -> 0xFFFF
+        GLFW_KEY_LEFT -> 0xFF51
+        GLFW_KEY_UP -> 0xFF52
+        GLFW_KEY_RIGHT -> 0xFF53
+        GLFW_KEY_DOWN -> 0xFF54
+        GLFW_KEY_HOME -> 0xFF50
+        GLFW_KEY_END -> 0xFF57
+        GLFW_KEY_PAGE_UP -> 0xFF55
+        GLFW_KEY_PAGE_DOWN -> 0xFF56
+        in GLFW_KEY_F1..GLFW_KEY_F12 -> 0xFFBE + (this - GLFW_KEY_F1)
+        else -> 0
+    }
+
     private fun Int.toAwtVirtualKey(): Int? = when (this) {
         in GLFW_KEY_A..GLFW_KEY_Z -> AwtKeyEvent.VK_A + (this - GLFW_KEY_A)
         in GLFW_KEY_0..GLFW_KEY_9 -> AwtKeyEvent.VK_0 + (this - GLFW_KEY_0)

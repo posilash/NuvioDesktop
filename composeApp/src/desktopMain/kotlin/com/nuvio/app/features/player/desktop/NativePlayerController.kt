@@ -1124,7 +1124,7 @@ private data class NativeControlsStructureKey(
     val isFullscreen: Boolean,
 )
 
-private fun PlayerControlsState.toControlsJson(isFullscreen: Boolean): String =
+internal fun PlayerControlsState.toControlsJson(isFullscreen: Boolean): String =
     buildString {
         append('{')
         appendJsonField("title", title)

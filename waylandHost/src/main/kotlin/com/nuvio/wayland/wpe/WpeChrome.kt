@@ -102,7 +102,7 @@ class WpeChrome(
         exportable = fn(fdo, "wpe_view_backend_exportable_fdo_egl_create",
             FunctionDescriptor.of(ADDRESS, ADDRESS, ADDRESS, JAVA_INT, JAVA_INT))
             .invokeExact(client, MemorySegment.NULL, width, height) as MemorySegment
-        val viewBackend = fn(fdo, "wpe_view_backend_exportable_fdo_get_view_backend",
+        viewBackend = fn(fdo, "wpe_view_backend_exportable_fdo_get_view_backend",
             FunctionDescriptor.of(ADDRESS, ADDRESS))
             .invokeExact(exportable) as MemorySegment
 
@@ -154,10 +154,7 @@ class WpeChrome(
     internal fun handleExport(image: MemorySegment) {
         framesExported++
         // Newest wins; an unconsumed predecessor goes straight back to WPE.
-        pendingImage.getAndSet(image)?.let { stale ->
-            releaseImage(stale)
-            dispatchFrameComplete()
-        }
+        pendingImage.getAndSet(image)?.let { stale -> releaseImage(stale) }
     }
 
     internal fun handleMessage(jscValue: MemorySegment) {
@@ -180,11 +177,18 @@ class WpeChrome(
             FunctionDescriptor.of(ADDRESS, ADDRESS))
             .invokeExact(image) as MemorySegment
 
+    /**
+     * Acknowledge the current frame so WPE renders the next one. Distinct
+     * from releasing: complete means "send more", release means "this buffer
+     * is free". Conflating them deadlocks after the first frame -- WPE waits
+     * for the ack, the consumer waits for a successor that can never come.
+     */
+    fun ackFrame() {
+        Glib.post { dispatchFrameComplete() }
+    }
+
     fun frameDone(image: MemorySegment) {
-        Glib.post {
-            releaseImage(image)
-            dispatchFrameComplete()
-        }
+        Glib.post { releaseImage(image) }
     }
 
     private fun releaseImage(image: MemorySegment) {
@@ -198,6 +202,87 @@ class WpeChrome(
             FunctionDescriptor.ofVoid(ADDRESS))
             .invokeExact(exportable)
     }
+
+    // ---- input, forwarded from the host's GLFW callbacks ----
+    // Layouts from wpe/input.h: pointer/axis are 7 ints; keyboard is
+    // 3 ints + bool + pad + int. key_code is an XKB keysym.
+
+    private val pointerLayout = MemoryLayout.structLayout(
+        JAVA_INT, JAVA_INT, JAVA_INT, JAVA_INT, JAVA_INT, JAVA_INT, JAVA_INT,
+    )
+
+    fun dispatchPointer(motion: Boolean, x: Int, y: Int, button: Int, pressed: Boolean, modifiers: Int) {
+        Glib.post {
+            val backend = viewBackendOrNull() ?: return@post
+            Arena.ofConfined().use { a ->
+                val ev = a.allocate(pointerLayout)
+                ev.set(JAVA_INT, 0, if (motion) 1 else 2) // motion / button
+                ev.set(JAVA_INT, 4, (System.nanoTime() / 1_000_000L).toInt())
+                ev.set(JAVA_INT, 8, x)
+                ev.set(JAVA_INT, 12, y)
+                ev.set(JAVA_INT, 16, button)
+                ev.set(JAVA_INT, 20, if (pressed) 1 else 0)
+                ev.set(JAVA_INT, 24, modifiers)
+                fn(wpe, "wpe_view_backend_dispatch_pointer_event",
+                    FunctionDescriptor.ofVoid(ADDRESS, ADDRESS))
+                    .invokeExact(backend, ev)
+            }
+        }
+    }
+
+    fun dispatchAxis(x: Int, y: Int, vertical: Boolean, value: Int) {
+        Glib.post {
+            val backend = viewBackendOrNull() ?: return@post
+            Arena.ofConfined().use { a ->
+                val ev = a.allocate(pointerLayout) // same 7-int shape
+                ev.set(JAVA_INT, 0, 1) // motion
+                ev.set(JAVA_INT, 4, (System.nanoTime() / 1_000_000L).toInt())
+                ev.set(JAVA_INT, 8, x)
+                ev.set(JAVA_INT, 12, y)
+                ev.set(JAVA_INT, 16, if (vertical) 0 else 1) // axis
+                ev.set(JAVA_INT, 20, value)
+                ev.set(JAVA_INT, 24, 0)
+                fn(wpe, "wpe_view_backend_dispatch_axis_event",
+                    FunctionDescriptor.ofVoid(ADDRESS, ADDRESS))
+                    .invokeExact(backend, ev)
+            }
+        }
+    }
+
+    private val keyboardLayout = MemoryLayout.structLayout(
+        JAVA_INT, JAVA_INT, JAVA_INT, JAVA_BOOLEAN,
+        MemoryLayout.paddingLayout(3), JAVA_INT,
+    )
+
+    fun dispatchKey(keysym: Int, hardware: Int, pressed: Boolean, modifiers: Int) {
+        Glib.post {
+            val backend = viewBackendOrNull() ?: return@post
+            Arena.ofConfined().use { a ->
+                val ev = a.allocate(keyboardLayout)
+                ev.set(JAVA_INT, 0, (System.nanoTime() / 1_000_000L).toInt())
+                ev.set(JAVA_INT, 4, keysym)
+                ev.set(JAVA_INT, 8, hardware)
+                ev.set(JAVA_BOOLEAN, 12, pressed)
+                ev.set(JAVA_INT, 16, modifiers)
+                fn(wpe, "wpe_view_backend_dispatch_keyboard_event",
+                    FunctionDescriptor.ofVoid(ADDRESS, ADDRESS))
+                    .invokeExact(backend, ev)
+            }
+        }
+    }
+
+    fun dispatchSize(w: Int, h: Int) {
+        Glib.post {
+            val backend = viewBackendOrNull() ?: return@post
+            fn(wpe, "wpe_view_backend_dispatch_set_size",
+                FunctionDescriptor.ofVoid(ADDRESS, JAVA_INT, JAVA_INT))
+                .invokeExact(backend, w, h)
+        }
+    }
+
+    private var viewBackend: MemorySegment = MemorySegment.NULL
+    private fun viewBackendOrNull(): MemorySegment? =
+        viewBackend.takeIf { !it.equals(MemorySegment.NULL) }
 
     /** Push state into the page (stock evaluates scripts the same way). */
     fun evaluateJs(script: String) {
@@ -243,9 +328,28 @@ class WpeChromeLayer(private val chrome: WpeChrome) {
 
     var texture = 0
         private set
+    var imageWidth = 0
+        private set
+    var imageHeight = 0
+        private set
     private var displayedImage: MemorySegment? = null
     @Volatile var framesImported = 0L
         private set
+
+    private val imageWidthFn by lazy {
+        linker.downcallHandle(
+            SymbolLookup.libraryLookup("libWPEBackend-fdo-1.0.so.1", arena)
+                .find("wpe_fdo_egl_exported_image_get_width").orElseThrow(),
+            FunctionDescriptor.of(JAVA_INT, ADDRESS),
+        )
+    }
+    private val imageHeightFn by lazy {
+        linker.downcallHandle(
+            SymbolLookup.libraryLookup("libWPEBackend-fdo-1.0.so.1", arena)
+                .find("wpe_fdo_egl_exported_image_get_height").orElseThrow(),
+            FunctionDescriptor.of(JAVA_INT, ADDRESS),
+        )
+    }
 
     /**
      * Import the newest exported frame into [texture], on the current GL
@@ -270,9 +374,12 @@ class WpeChromeLayer(private val chrome: WpeChrome) {
             org.lwjgl.opengl.GL11.GL_TEXTURE_MAG_FILTER, org.lwjgl.opengl.GL11.GL_LINEAR,
         )
         org.lwjgl.opengl.GL11.glBindTexture(org.lwjgl.opengl.GL11.GL_TEXTURE_2D, 0)
+        imageWidth = imageWidthFn.invokeExact(image) as Int
+        imageHeight = imageHeightFn.invokeExact(image) as Int
         displayedImage?.let { chrome.frameDone(it) }
         displayedImage = image
         framesImported++
+        chrome.ackFrame()
         return true
     }
 }
