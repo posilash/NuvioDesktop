@@ -44,6 +44,53 @@ import androidx.compose.ui.scene.ComposeScene
 import androidx.compose.ui.scene.CanvasLayersComposeScene
 import kotlin.system.exitProcess
 
+private var chromeWrapper: Triple<Int, org.jetbrains.skia.BackendRenderTarget, org.jetbrains.skia.Surface>? = null
+
+/**
+ * Draw the WPE chrome texture over everything else. Wrapped the same way the
+ * video textures are (an FBO of ours around the shared texture, a Skia
+ * surface around that); WPE renders premultiplied RGBA, top-row-first.
+ */
+private fun drawChromeTexture(
+    wrapper: Triple<Int, org.jetbrains.skia.BackendRenderTarget, org.jetbrains.skia.Surface>?,
+    layer: com.nuvio.wayland.wpe.WpeChromeLayer,
+    canvas: org.jetbrains.skia.Canvas,
+    context: org.jetbrains.skia.DirectContext,
+    width: Int,
+    height: Int,
+): Triple<Int, org.jetbrains.skia.BackendRenderTarget, org.jetbrains.skia.Surface> {
+    var w = wrapper
+    if (w == null) {
+        val fbo = org.lwjgl.opengl.GL30.glGenFramebuffers()
+        org.lwjgl.opengl.GL30.glBindFramebuffer(org.lwjgl.opengl.GL30.GL_FRAMEBUFFER, fbo)
+        org.lwjgl.opengl.GL30.glFramebufferTexture2D(
+            org.lwjgl.opengl.GL30.GL_FRAMEBUFFER, org.lwjgl.opengl.GL30.GL_COLOR_ATTACHMENT0,
+            org.lwjgl.opengl.GL11.GL_TEXTURE_2D, layer.texture, 0,
+        )
+        org.lwjgl.opengl.GL30.glBindFramebuffer(org.lwjgl.opengl.GL30.GL_FRAMEBUFFER, 0)
+        val rt = org.jetbrains.skia.BackendRenderTarget.makeGL(
+            INITIAL_WIDTH, INITIAL_HEIGHT, 0, 8, fbo,
+            org.jetbrains.skia.FramebufferFormat.GR_GL_RGBA8,
+        )
+        val surface = org.jetbrains.skia.Surface.makeFromBackendRenderTarget(
+            context, rt, org.jetbrains.skia.SurfaceOrigin.TOP_LEFT,
+            org.jetbrains.skia.SurfaceColorFormat.RGBA_8888, org.jetbrains.skia.ColorSpace.sRGB,
+        ) ?: error("could not wrap chrome texture")
+        w = Triple(fbo, rt, surface)
+    }
+    w.third.notifyContentWillChange(org.jetbrains.skia.ContentChangeMode.DISCARD)
+    context.resetGL(org.jetbrains.skia.GLBackendState.TEXTURE_BINDING)
+    val snapshot = w.third.makeImageSnapshot()
+    canvas.drawImageRect(
+        snapshot,
+        org.jetbrains.skia.Rect.makeWH(INITIAL_WIDTH.toFloat(), INITIAL_HEIGHT.toFloat()),
+        org.jetbrains.skia.Rect.makeWH(width.toFloat(), height.toFloat()),
+        org.jetbrains.skia.SamplingMode.LINEAR, null, true,
+    )
+    snapshot.close()
+    return w
+}
+
 private const val INITIAL_WIDTH = 1280
 private const val INITIAL_HEIGHT = 800
 
@@ -418,6 +465,27 @@ fun main() {
         }
     }
 
+    // Milestone harness for the web chrome: bring WPE up against the real
+    // controls page and count exported frames. Compositing and input arrive
+    // in later stages; this proves the engine half.
+    var wpeChrome: com.nuvio.wayland.wpe.WpeChrome? = null
+    var wpeLayer: com.nuvio.wayland.wpe.WpeChromeLayer? = null
+    if (System.getProperty("nuvio.wayland.webChrome")?.toBoolean() == true) {
+        // Resolve the page against the repo root regardless of working dir.
+        val page = sequenceOf(
+            java.io.File("composeApp/src/desktopMain/resources/player-ui/controls.html"),
+            java.io.File("../composeApp/src/desktopMain/resources/player-ui/controls.html"),
+        ).map { it.absoluteFile.normalize() }.firstOrNull { it.isFile }
+            ?: error("controls.html not found from ${java.io.File(".").absolutePath}")
+        wpeChrome = com.nuvio.wayland.wpe.WpeChrome(
+            eglDisplay = org.lwjgl.glfw.GLFWNativeEGL.glfwGetEGLDisplay(),
+            width = INITIAL_WIDTH,
+            height = INITIAL_HEIGHT,
+            onMessage = { println("[wpe] message: $it") },
+        ).also { it.start("file://" + page.path) }
+        wpeLayer = com.nuvio.wayland.wpe.WpeChromeLayer(wpeChrome!!)
+    }
+
     val input = InputRouter(window, scene)
     input.install()
 
@@ -511,6 +579,11 @@ fun main() {
         val ui = uiSurface ?: return false
 
         if (videoLog) {
+            wpeChrome?.let { chrome ->
+                if (frames % 120 == 0) {
+                    println("[wpe] exported=${chrome.framesExported} imported=${wpeLayer?.framesImported} err=${chrome.lastError}")
+                }
+            }
             videoHost?.report(System.nanoTime())?.let {
                 println("[wayland-video] $it rss=${rssMb()}MB heap=${Runtime.getRuntime().let { r -> (r.totalMemory() - r.freeMemory()) / 1_048_576 }}MB")
             }
@@ -529,8 +602,9 @@ fun main() {
         // 24fps there are 40ms of them, and when the UI is heavier than that
         // it is the chrome that degrades, never the video.
         val videoChanged = videoFrameReady.getAndSet(false)
+        val chromePending = wpeChrome?.let { it.framesExported > (wpeLayer?.framesImported ?: 0L) } == true
         val sceneDirty = forceRepaint || scene.hasInvalidations()
-        if (!videoChanged && !sceneDirty) return false
+        if (!videoChanged && !sceneDirty && !chromePending) return false
 
         // A scene rasterization is uninterruptible once started; at fullscreen
         // it can take 20-50ms, and a video frame arriving mid-raster queues
@@ -566,6 +640,11 @@ fun main() {
             timings.add("scene", System.nanoTime() - t)
         }
 
+        // Chrome frames import on this thread (the GL context owner); a new
+        // frame is a present reason of its own.
+        val chromeChanged = java.awt.EventQueue.isDispatchThread() &&
+            wpeLayer?.importLatest() == true
+
         t = System.nanoTime()
         s.canvas.clear(0xFF101014.toInt())
         videoHost?.compositeVideo(s.canvas)
@@ -574,6 +653,11 @@ fun main() {
         // (14MB at 2560x1440), which is what inflated scene costs to tens of
         // milliseconds and dragged the whole chrome down.
         ui.draw(s.canvas, 0, 0, null)
+        wpeLayer?.let { layer ->
+            if (layer.texture != 0) {
+                chromeWrapper = drawChromeTexture(chromeWrapper, layer, s.canvas, context, width, height)
+            }
+        }
         timings.add("composite", System.nanoTime() - t)
 
         t = System.nanoTime()
