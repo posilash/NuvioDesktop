@@ -47,14 +47,17 @@ import kotlin.system.exitProcess
 private const val INITIAL_WIDTH = 1280
 private const val INITIAL_HEIGHT = 800
 
-/** The linux branch's config location: $XDG_CONFIG_HOME/mpv, else ~/.config/mpv. */
-private fun nuvioMpvConfPath(): String? {
-    val dir = System.getenv("NUVIO_MPV_CONFIG_DIR")
-        ?: System.getenv("XDG_CONFIG_HOME")?.takeIf { it.isNotEmpty() }?.plus("/mpv")
-        ?: System.getenv("HOME")?.plus("/.config/mpv")
-        ?: return null
-    val f = java.io.File(dir, "mpv_nuvio.conf")
-    return if (f.isFile) f.absolutePath else null
+/** The user's real mpv.conf: $XDG_CONFIG_HOME/mpv, ~/.config/mpv, ~/.mpv. */
+private fun userMpvConfPath(): String? {
+    val candidates = buildList {
+        System.getenv("XDG_CONFIG_HOME")?.takeIf { it.isNotEmpty() }
+            ?.let { add("$it/mpv/mpv.conf") }
+        System.getenv("HOME")?.let {
+            add("$it/.config/mpv/mpv.conf")
+            add("$it/.mpv/mpv.conf")
+        }
+    }
+    return candidates.firstOrNull { java.io.File(it).isFile }
 }
 
 /** Resident set size in MB, for the SIGKILL investigation: evidence, not theory. */
@@ -146,37 +149,37 @@ fun main() {
             exitProcess(1)
         }
         mpv = Mpv.create().apply {
-            // The linux branch's convention, kept so one file tunes every
-            // Nuvio build: user options come from <config-dir>/mpv_nuvio.conf
-            // via `include`, not from mpv.conf (whose vo/gpu-context target
-            // standalone mpv and would open mpv's own window here). Scripts
-            // never load: OSC replacements assume mpv owns the window and
-            // fight the app's chrome. NOTE the precedence trap: included
-            // config is parsed at initialize() and overwrites anything set
-            // through the API before it, so everything the host must own is
-            // asserted AFTER initialize(), below.
+            // NuvioLinux's config scheme, adopted because it is the better
+            // one: parse the user's ACTUAL mpv.conf explicitly with
+            // mpv_load_config_file -- at a moment we choose -- then apply the
+            // embedding invariants after it, so they always win. No config=yes
+            // trap (that file is parsed at initialize() and silently
+            // overwrites earlier API sets), no separate app-specific conf.
             setOption("config", "no")
             setOption("load-scripts", "no")
-            nuvioMpvConfPath()?.let { setOption("include", it) }
             setOption("terminal", "yes")
             setOption("msg-level", "all=info")
+            // Defaults the user's conf may override:
+            setOption("hwdec", "auto")
             if (!runRealAppEarly) setOption("audio", "no")
             if (System.getProperty("nuvio.wayland.videoLog")?.toBoolean() == true) {
                 setOption("msg-level", "all=v")
             }
-            initialize()
-            // Host-owned options, asserted after the config file has been
-            // parsed so it cannot overwrite them (see the note above):
-            // - vo=libmpv: the render API is the only output; the conf's
-            //   vo=gpu-next would open mpv's own window.
-            // - no position saving: the app manages resume itself; mpv's
-            //   watch-later would fight it.
-            // - hwdec: explicit override wins, else the conf decides, else
-            //   auto -- mpv's own default is 'no', i.e. software decode.
+            userMpvConfPath()?.let {
+                val ok = loadConfigFile(it)
+                println("mpv config: $it ${if (ok) "loaded" else "FAILED"}")
+            }
+            // Embedding invariants, applied after the user config so no
+            // config can break the player (same set NuvioLinux enforces):
+            // vo=libmpv (a user vo opens mpv's own window), force-window=no,
+            // idle=yes (a conf-driven core quit would strand the session),
+            // and no watch-later (the app manages resume itself).
             setOption("vo", "libmpv")
+            setOption("force-window", "no")
+            setOption("idle", "yes")
             setOption("save-position-on-quit", "no")
             System.getProperty("nuvio.wayland.hwdec")?.let { setOption("hwdec", it) }
-                ?: run { if (getProperty("hwdec") == "no") setOption("hwdec", "auto") }
+            initialize()
             if (System.getProperty("nuvio.wayland.videoLog")?.toBoolean() == true) {
                 requestLogMessages("v")
             }
@@ -531,7 +534,7 @@ fun main() {
             // bound: past it the scene renders even at the price of one late
             // video frame.
             val starvedMs = (t - lastSceneRenderNs) / 1e6
-            if (videoLive && starvedMs < 250.0) {
+            if (videoLive && starvedMs < 120.0) {
                 val untilNextFrameMs =
                     (lastVideoPresentNs - t) / 1e6 + videoIntervalEmaMs
                 if (untilNextFrameMs < sceneCostEmaMs * 1.2 + 3.0) {
@@ -552,9 +555,11 @@ fun main() {
         t = System.nanoTime()
         s.canvas.clear(0xFF101014.toInt())
         videoHost?.compositeVideo(s.canvas)
-        val uiSnapshot = ui.makeImageSnapshot()
-        s.canvas.drawImage(uiSnapshot, 0f, 0f)
-        uiSnapshot.close()
+        // Surface.draw, not makeImageSnapshot: a snapshot makes the next
+        // scene render pay a full-resolution copy-on-write of the UI texture
+        // (14MB at 2560x1440), which is what inflated scene costs to tens of
+        // milliseconds and dragged the whole chrome down.
+        ui.draw(s.canvas, 0, 0, null)
         timings.add("composite", System.nanoTime() - t)
 
         t = System.nanoTime()
@@ -636,8 +641,12 @@ fun main() {
         // and its dispatch queues are gone), then free the render context on
         // the thread that owns it, then destroy the handle. Freeing the
         // render context first raced VO teardown and aborted the process.
+        // Unmap the window before the slow parts: an unmapped surface gets no
+        // compositor pings, so a lengthy mpv quit cannot be flagged as "not
+        // responding" and force-killed mid-teardown.
+        glfwHideWindow(window)
         scene.close()
-        mpv?.quitAndAwaitShutdown()
+        mpv?.quitAndAwaitShutdown(onWait = { glfwPollEvents() })
         pipeline?.stop()
         mpv?.close()
         surface?.close()

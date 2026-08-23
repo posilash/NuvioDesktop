@@ -96,6 +96,9 @@ class Mpv private constructor(private val handle: MemorySegment, private val are
         private val mpvRenderContextUpdate by lazy {
             fn("mpv_render_context_update", FunctionDescriptor.of(java.lang.foreign.ValueLayout.JAVA_LONG, ADDRESS))
         }
+        private val mpvLoadConfigFile by lazy {
+            fn("mpv_load_config_file", FunctionDescriptor.of(JAVA_INT, ADDRESS, ADDRESS))
+        }
         private val mpvRenderContextSetUpdateCallback by lazy {
             fn("mpv_render_context_set_update_callback",
                 FunctionDescriptor.ofVoid(ADDRESS, ADDRESS, ADDRESS))
@@ -180,6 +183,19 @@ class Mpv private constructor(private val handle: MemorySegment, private val are
             handle, arena.allocateFrom(name), arena.allocateFrom(value),
         ) as Int
         check(r >= 0) { "mpv_set_option_string($name) -> $r" }
+    }
+
+    /**
+     * Parse a config file right now, at a caller-chosen point in option
+     * ordering -- unlike config=yes, whose file is parsed at initialize() and
+     * silently overwrites everything set before it. Options set after this
+     * call win over the file: the deterministic layering an embedding host
+     * needs (load the user's config, then assert invariants).
+     */
+    fun loadConfigFile(path: String): Boolean {
+        return Arena.ofConfined().use { a ->
+            (mpvLoadConfigFile.invokeExact(handle, a.allocateFrom(path)) as Int) >= 0
+        }
     }
 
     fun initialize() {
@@ -417,7 +433,7 @@ class Mpv private constructor(private val handle: MemorySegment, private val are
      * shutdown event, the core guarantees the VO is gone and
      * mpv_render_context_free is safe.
      */
-    fun quitAndAwaitShutdown(timeoutSeconds: Double = 5.0) {
+    fun quitAndAwaitShutdown(timeoutSeconds: Double = 5.0, onWait: () -> Unit = {}) {
         command("quit")
         // From here on the core is winding down and, per client.h, the only
         // legal call left is mpv_terminate_destroy. Anything still holding a
@@ -426,7 +442,13 @@ class Mpv private constructor(private val handle: MemorySegment, private val are
         shuttingDown = true
         val deadline = System.nanoTime() + (timeoutSeconds * 1e9).toLong()
         while (System.nanoTime() < deadline) {
-            val ev = mpvWaitEvent.invokeExact(handle, 0.25) as MemorySegment
+            // [onWait] keeps the host's event loop breathing: a wait that
+            // stops answering the compositor's pings gets the window flagged
+            // unresponsive and the process force-killed -- the "crash on
+            // close" that was really Hyprland's ANR killer (SIGKILL during
+            // teardown, RSS flat, teardown logs present).
+            onWait()
+            val ev = mpvWaitEvent.invokeExact(handle, 0.1) as MemorySegment
             if (ev.equals(MemorySegment.NULL)) continue
             val id = ev.reinterpret(64).get(JAVA_INT, 0)
             if (id == 1) return // MPV_EVENT_SHUTDOWN

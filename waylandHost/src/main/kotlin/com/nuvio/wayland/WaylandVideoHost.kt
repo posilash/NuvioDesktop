@@ -5,7 +5,6 @@ import org.jetbrains.skia.BackendRenderTarget
 import org.jetbrains.skia.BlendMode
 import org.jetbrains.skia.Canvas
 import org.jetbrains.skia.ColorSpace
-import org.jetbrains.skia.ContentChangeMode
 import org.jetbrains.skia.DirectContext
 import org.jetbrains.skia.FramebufferFormat
 import org.jetbrains.skia.Paint
@@ -146,27 +145,33 @@ class WaylandVideoHost(
             )
         }
         if (frame.fresh) {
-            // Two caches must be told the texture changed behind their backs.
-            // Skia's copy-on-write snapshot would be the first frame forever
-            // without notifyContentWillChange. And GL itself only guarantees a
-            // context sees another context's writes to a shared texture after
-            // *re-binding* it -- which Skia's state cache elides, since as far
-            // as it knows the texture never left the unit. Dropping the cached
-            // texture bindings forces the re-bind; without it, buffers
-            // alternated between live frames and their initial cleared black.
-            wrapper.surface.notifyContentWillChange(ContentChangeMode.DISCARD)
+            // GL only guarantees a context sees another context's writes to a
+            // shared texture after *re-binding* it -- which Skia's state cache
+            // elides, since as far as it knows the texture never left the
+            // unit. Dropping the cached texture bindings forces the re-bind;
+            // without it, buffers alternated between live frames and their
+            // initial cleared black.
             context.resetGL(org.jetbrains.skia.GLBackendState.TEXTURE_BINDING)
         }
-        val snapshot = wrapper.surface.makeImageSnapshot()
-        canvas.drawImageRect(
-            snapshot,
-            Rect.makeWH(buf.width.toFloat(), buf.height.toFloat()),
-            Rect.makeXYWH(rectLeft, rectTop, rectWidth, rectHeight),
-            SamplingMode.LINEAR,
-            null,
-            true,
-        )
-        snapshot.close()
+        // Surface.draw, not a snapshot: snapshots are copy-on-write and cost a
+        // full-frame copy whenever content changes -- which for video is every
+        // frame. The buffer is rendered at exactly the rect's size, so a 1:1
+        // draw at the rect's origin is the general case; a resize is a frame
+        // of mismatch at most.
+        if (rectWidth.toInt() == buf.width && rectHeight.toInt() == buf.height) {
+            wrapper.surface.draw(canvas, rectLeft.toInt(), rectTop.toInt(), null)
+        } else {
+            val snapshot = wrapper.surface.makeImageSnapshot()
+            canvas.drawImageRect(
+                snapshot,
+                Rect.makeWH(buf.width.toFloat(), buf.height.toFloat()),
+                Rect.makeXYWH(rectLeft, rectTop, rectWidth, rectHeight),
+                SamplingMode.LINEAR,
+                null,
+                true,
+            )
+            snapshot.close()
+        }
         composites++
     }
 
