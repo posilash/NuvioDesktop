@@ -66,7 +66,6 @@ actual fun PlatformPlayerSurface(
             modifier = modifier,
             playWhenReady = playWhenReady,
             initialPositionMs = initialPositionMs ?: 0L,
-            onPlayerControlsEvent = onPlayerControlsEvent,
             onControllerReady = onControllerReady,
             onSnapshot = onSnapshot,
             onError = onError,

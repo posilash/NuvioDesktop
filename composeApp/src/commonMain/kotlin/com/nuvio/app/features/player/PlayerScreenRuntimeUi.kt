@@ -421,7 +421,7 @@ internal fun PlayerScreenRuntime.RenderPlayerRuntimeUi() {
     val gestureCallbacks = rememberSurfaceGestureCallbacks()
 
     Box(
-        modifier = Modifier
+        modifier = desktopPlayerInput(Modifier)
             .fillMaxSize()
             .onSizeChanged { layoutSize = it }
             .playerSurfaceTapGestures(
