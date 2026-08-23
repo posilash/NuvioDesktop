@@ -35,7 +35,7 @@ import com.nuvio.app.features.streams.StreamItem
 import com.nuvio.app.features.streams.isSelectableForPlayback
 import com.nuvio.app.features.watchprogress.buildPlaybackVideoId
 import com.nuvio.app.features.watching.application.WatchingState
-import com.nuvio.app.isDesktop
+import com.nuvio.app.usesNativePlayerChrome
 import com.nuvio.app.isIos
 import kotlinx.coroutines.launch
 import kotlin.math.abs
@@ -527,7 +527,7 @@ internal fun PlayerScreenRuntime.RenderPlayerRuntimeUi() {
             )
         }
 
-        if (!isDesktop) {
+        if (!usesNativePlayerChrome) {
             RenderPlayerControls(displayedPositionMs = displayedPositionMs, isEpisode = isEpisode)
         }
         RenderPlaybackOverlays(
@@ -539,7 +539,7 @@ internal fun PlayerScreenRuntime.RenderPlayerRuntimeUi() {
             showP2pRebufferStats = showP2pRebufferStats,
             p2pRebufferMessage = p2pRebufferMessage,
             p2pRebufferProgress = p2pRebufferProgress,
-            suppressOpeningOverlay = isDesktop && playerSurfaceSourceUrl != null,
+            suppressOpeningOverlay = usesNativePlayerChrome && playerSurfaceSourceUrl != null,
         )
         RenderPlayerModals(displayedPositionMs = displayedPositionMs)
     }
@@ -1582,7 +1582,7 @@ private fun BoxScope.RenderPlaybackOverlays(
             renderedGestureFeedback = renderedGestureFeedback,
             initialLoadCompleted = initialLoadCompleted,
             pausedOverlayVisible = pausedOverlayVisible,
-            activeSkipInterval = activeSkipInterval.takeUnless { isDesktop },
+            activeSkipInterval = activeSkipInterval.takeUnless { usesNativePlayerChrome },
             skipIntervalDismissed = skipIntervalDismissed,
             controlsVisible = controlsVisible,
             onSkipInterval = { interval ->
@@ -1598,7 +1598,7 @@ private fun BoxScope.RenderPlaybackOverlays(
             overlayBottomPadding = overlayBottomPadding,
             isSeries = isSeries,
             nextEpisodeInfo = nextEpisodeInfo,
-            showNextEpisodeCard = showNextEpisodeCard && !isDesktop,
+            showNextEpisodeCard = showNextEpisodeCard && !usesNativePlayerChrome,
             nextEpisodeAutoPlaySearching = nextEpisodeAutoPlaySearching,
             nextEpisodeAutoPlaySourceName = nextEpisodeAutoPlaySourceName,
             nextEpisodeAutoPlayCountdown = nextEpisodeAutoPlayCountdown,

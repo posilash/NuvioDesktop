@@ -9,8 +9,14 @@ import androidx.compose.material3.Text
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
+import androidx.compose.foundation.focusable as androidxFocusable
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.input.key.key
+import androidx.compose.ui.input.key.onKeyEvent
+import androidx.compose.ui.input.key.type
+import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.graphics.asComposeCanvas
 import androidx.compose.ui.graphics.drawscope.drawIntoCanvas
 import androidx.compose.ui.graphics.nativeCanvas
@@ -204,7 +210,36 @@ fun main() {
         }
     } else {
         scene.setContent {
-            Box(Modifier.fillMaxSize()) {
+            // Echoes what Compose itself receives, which is the only proof that
+            // input survives the whole GLFW -> InputRouter -> scene path. The
+            // router's own counters stop at "we called sendPointerEvent".
+            val focusRequester = androidx.compose.runtime.remember {
+                androidx.compose.ui.focus.FocusRequester()
+            }
+            androidx.compose.runtime.LaunchedEffect(Unit) {
+                runCatching { focusRequester.requestFocus() }
+            }
+            Box(
+                Modifier.fillMaxSize()
+                    .focusRequester(focusRequester)
+                    .androidxFocusable()
+                    .onKeyEvent { e ->
+                        println("[wayland-input] compose key: ${e.key} ${e.type}")
+                        true
+                    }
+                    .pointerInput(Unit) {
+                        awaitPointerEventScope {
+                            while (true) {
+                                val ev = awaitPointerEvent()
+                                // Moves would flood; presses are the signal.
+                                if (ev.type != androidx.compose.ui.input.pointer.PointerEventType.Move) {
+                                    val at = ev.changes.firstOrNull()?.position
+                                    println("[wayland-input] compose pointer: ${ev.type} at $at")
+                                }
+                            }
+                        }
+                    },
+            ) {
                 val vh = videoHost
                 if (vh != null) {
                     androidx.compose.foundation.Canvas(Modifier.fillMaxSize()) {
