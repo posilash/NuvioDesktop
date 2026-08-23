@@ -172,6 +172,9 @@ class Mpv private constructor(private val handle: MemorySegment, private val are
     private var renderCtx: MemorySegment = MemorySegment.NULL
     private var procAddressStub: MemorySegment = MemorySegment.NULL
 
+    @Volatile
+    private var shuttingDown = false
+
     fun setOption(name: String, value: String) {
         val r = mpvSetOptionString.invokeExact(
             handle, arena.allocateFrom(name), arena.allocateFrom(value),
@@ -185,6 +188,7 @@ class Mpv private constructor(private val handle: MemorySegment, private val are
     }
 
     fun command(vararg args: String) {
+        if (shuttingDown) return
         val arr = arena.allocate(ADDRESS, (args.size + 1).toLong())
         args.forEachIndexed { i, a -> arr.setAtIndex(ADDRESS, i.toLong(), arena.allocateFrom(a)) }
         arr.setAtIndex(ADDRESS, args.size.toLong(), MemorySegment.NULL)
@@ -380,6 +384,7 @@ class Mpv private constructor(private val handle: MemorySegment, private val are
     }
 
     fun setProperty(name: String, value: String) {
+        if (shuttingDown) return
         Arena.ofConfined().use { a ->
             mpvSetPropertyString.invokeExact(
                 handle, a.allocateFrom(name), a.allocateFrom(value),
@@ -388,12 +393,15 @@ class Mpv private constructor(private val handle: MemorySegment, private val are
     }
 
     /** Null when the property is unavailable, which mpv reports routinely. */
-    fun getProperty(name: String): String? = Arena.ofConfined().use { a ->
+    fun getProperty(name: String): String? {
+        if (shuttingDown) return null
+        return Arena.ofConfined().use { a ->
         val p = mpvGetPropertyString.invokeExact(handle, a.allocateFrom(name)) as MemorySegment
         if (p.equals(MemorySegment.NULL)) return null
         val s = p.reinterpret(Long.MAX_VALUE).getString(0)
         mpvFree.invokeExact(p)
         s
+    }
     }
 
     fun getDouble(name: String): Double? = getProperty(name)?.toDoubleOrNull()
@@ -411,6 +419,11 @@ class Mpv private constructor(private val handle: MemorySegment, private val are
      */
     fun quitAndAwaitShutdown(timeoutSeconds: Double = 5.0) {
         command("quit")
+        // From here on the core is winding down and, per client.h, the only
+        // legal call left is mpv_terminate_destroy. Anything still holding a
+        // reference -- a composable's onDispose, a straggling poll -- gets a
+        // no-op instead of an abort or a use of a freed arena.
+        shuttingDown = true
         val deadline = System.nanoTime() + (timeoutSeconds * 1e9).toLong()
         while (System.nanoTime() < deadline) {
             val ev = mpvWaitEvent.invokeExact(handle, 0.25) as MemorySegment

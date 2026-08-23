@@ -463,15 +463,18 @@ fun main() {
             }
         }
     } finally {
-        // Teardown order matters, per the render API's contract: quit the core
-        // and wait for its shutdown event (so the VO and its dispatch queues
-        // are gone), then free the render context on the thread that owns it,
-        // then destroy the handle. Freeing the render context first raced VO
-        // teardown and aborted the process on exit-after-playback.
+        // Teardown order matters twice over. The scene goes first: disposing
+        // the composition runs the player surface's onDispose, which stops
+        // playback through the bridge -- that must reach a live mpv, not a
+        // destroyed handle whose arena is gone. Then the render API's own
+        // contract: quit the core and wait for its shutdown event (so the VO
+        // and its dispatch queues are gone), then free the render context on
+        // the thread that owns it, then destroy the handle. Freeing the
+        // render context first raced VO teardown and aborted the process.
+        scene.close()
         mpv?.quitAndAwaitShutdown()
         pipeline?.stop()
         mpv?.close()
-        scene.close()
         surface?.close()
         renderTarget?.close()
         uiSurface?.close()
