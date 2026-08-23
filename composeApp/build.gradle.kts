@@ -1275,6 +1275,13 @@ compose.desktop {
             "--add-opens=java.desktop/sun.awt.windows=ALL-UNNAMED",
             "--add-opens=java.desktop/sun.awt.X11=ALL-UNNAMED",
             smokePlayerUrl?.takeIf { it.isNotBlank() }?.let { "-Dnuvio.desktop.smokePlayerUrl=$it" },
+            // Opt into AWT's Wayland toolkit. Only present on JDKs built with
+            // Project Wakefield (e.g. jdk-openjdk-wakefield on Arch); on a
+            // stock JDK the property is simply ignored and AWT stays on X11.
+            //   ./gradlew :composeApp:run -Pnuvio.desktop.wayland=true
+            providers.gradleProperty("nuvio.desktop.wayland").orNull
+                ?.takeIf { it.toBoolean() }
+                ?.let { "-Dawt.toolkit.name=WLToolkit" },
         )
 
         nativeDistributions {

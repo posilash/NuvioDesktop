@@ -27,6 +27,7 @@ import com.nuvio.app.features.player.desktop.DesktopAppFullscreenController
 import com.nuvio.app.features.player.desktop.DesktopHostOs
 import com.nuvio.app.features.player.desktop.DesktopWindowGeometry
 import com.nuvio.app.features.player.desktop.DesktopWindowModeStorage
+import com.nuvio.app.features.player.desktop.DesktopWaylandToolkit
 import com.nuvio.app.features.player.desktop.NativePlayerBridge
 import com.nuvio.app.features.player.desktop.applyNativeDesktopWindowChrome
 import com.nuvio.app.features.player.desktop.installDesktopAppFullscreenShortcuts
@@ -47,7 +48,15 @@ private const val MacosDarkAquaAppearance = "NSAppearanceNameDarkAqua"
 fun main(args: Array<String>) {
     // On Linux, initialize GTK BEFORE AWT/Compose/Skia to prevent GdkDisplayManager
     // type registration conflict (Skiko partially loads GDK without full GTK init).
-    if (System.getProperty("os.name", "").lowercase().contains("linux")) {
+    //
+    // Skipped under AWT's Wayland toolkit: initGtkEarly() pins GDK to the X11
+    // backend, because the control overlay is captured with XComposite, which has
+    // no Wayland equivalent. Forcing X11 there fails at gtk_init_check() and the
+    // overlay could not work anyway, so leave GTK alone and let the Wayland path
+    // run without it.
+    if (System.getProperty("os.name", "").lowercase().contains("linux") &&
+        !DesktopWaylandToolkit.inUse
+    ) {
         runCatching { NativePlayerBridge.initGtkEarly() }
     }
     applyDesktopRendererPreference()
