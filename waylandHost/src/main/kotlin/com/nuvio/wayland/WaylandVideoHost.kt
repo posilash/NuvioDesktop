@@ -1,12 +1,15 @@
 package com.nuvio.wayland
 
 import com.nuvio.app.features.player.desktop.WaylandVideoBridge
-import org.jetbrains.skia.BackendTexture
+import org.jetbrains.skia.BackendRenderTarget
+import org.jetbrains.skia.ColorSpace
 import org.jetbrains.skia.ColorType
 import org.jetbrains.skia.DirectContext
-import org.jetbrains.skia.Image
+import org.jetbrains.skia.FramebufferFormat
 import org.jetbrains.skia.Rect
 import org.jetbrains.skia.SamplingMode
+import org.jetbrains.skia.Surface
+import org.jetbrains.skia.SurfaceColorFormat
 import org.jetbrains.skia.SurfaceOrigin
 import org.lwjgl.opengl.GL11
 import org.lwjgl.opengl.GL30
@@ -31,7 +34,8 @@ class WaylandVideoHost(
     private var texture = 0
     private var texWidth = 0
     private var texHeight = 0
-    private var image: Image? = null
+    private var renderTarget: BackendRenderTarget? = null
+    private var videoSurface: Surface? = null
 
     /** Render one frame, if mpv has a new one. Must run on the GL thread. */
     fun renderFrame(width: Int, height: Int) {
@@ -39,9 +43,16 @@ class WaylandVideoHost(
         ensureTarget(width, height)
         if (!mpv.hasNewFrame()) return
 
+        // Start from opaque black: mpv letterboxes rather than filling, and a
+        // stale frame would otherwise show through the bars.
+        GL30.glBindFramebuffer(GL30.GL_FRAMEBUFFER, fbo)
+        GL11.glClearColor(0f, 0f, 0f, 1f)
+        GL11.glClear(GL11.GL_COLOR_BUFFER_BIT)
+
         mpv.render(fbo, width, height)
 
-        // mpv leaves its own framebuffer, scissor and viewport bound.
+        // mpv restores the framebuffer binding to 0 itself, but not the scissor
+        // or viewport, and Skia's cached GL state is stale either way.
         GL30.glBindFramebuffer(GL30.GL_FRAMEBUFFER, 0)
         GL11.glDisable(GL11.GL_SCISSOR_TEST)
         GL11.glViewport(0, 0, width, height)
@@ -71,31 +82,44 @@ class WaylandVideoHost(
 
         texWidth = width
         texHeight = height
-        image = Image.adoptTextureFrom(
-            context,
-            BackendTexture.makeGL(width, height, false, texture, GL11.GL_TEXTURE_2D, GL11.GL_RGBA8),
-            SurfaceOrigin.BOTTOM_LEFT,
-            ColorType.RGBA_8888,
+
+        // A Skia surface over the same FBO, rather than an adopted texture.
+        // Image.adoptTextureFrom() hands Skia ownership of an image it treats
+        // as immutable, so it never re-read what mpv wrote: the picture only
+        // refreshed when a resize rebuilt it. Snapshotting a surface each frame
+        // is copy-on-write and always current.
+        //
+        // TOP_LEFT, not BOTTOM_LEFT: rendering into an FBO with flip_y=0 leaves
+        // mpv's output top-row-first. Declaring it bottom-first is what turned
+        // the picture upside down.
+        renderTarget = BackendRenderTarget.makeGL(
+            width, height, 0, 8, fbo, FramebufferFormat.GR_GL_RGBA8,
+        )
+        videoSurface = Surface.makeFromBackendRenderTarget(
+            context, renderTarget!!, SurfaceOrigin.TOP_LEFT,
+            SurfaceColorFormat.RGBA_8888, ColorSpace.sRGB,
         )
     }
 
     private fun releaseTarget() {
-        image?.close(); image = null
+        videoSurface?.close(); videoSurface = null
+        renderTarget?.close(); renderTarget = null
         if (fbo != 0) { GL30.glDeleteFramebuffers(fbo); fbo = 0 }
         if (texture != 0) { GL11.glDeleteTextures(texture); texture = 0 }
         texWidth = 0; texHeight = 0
     }
 
     override fun drawVideo(canvas: org.jetbrains.skia.Canvas, width: Float, height: Float) {
-        val img = image ?: return
+        val snapshot = videoSurface?.makeImageSnapshot() ?: return
         canvas.drawImageRect(
-            img,
+            snapshot,
             Rect.makeWH(texWidth.toFloat(), texHeight.toFloat()),
             Rect.makeWH(width, height),
             SamplingMode.LINEAR,
             null,
             true,
         )
+        snapshot.close()
     }
 
     @Volatile
