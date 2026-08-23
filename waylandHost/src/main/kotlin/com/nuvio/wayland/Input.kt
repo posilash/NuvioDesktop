@@ -1,0 +1,185 @@
+@file:Suppress("INVISIBLE_MEMBER", "INVISIBLE_REFERENCE")
+
+package com.nuvio.wayland
+
+import androidx.compose.ui.ExperimentalComposeUiApi
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.input.key.InternalKeyEvent
+import androidx.compose.ui.input.key.Key
+import androidx.compose.ui.input.key.KeyEvent
+import androidx.compose.ui.input.key.KeyEventType
+import androidx.compose.ui.input.pointer.PointerButton
+import androidx.compose.ui.input.pointer.PointerButtons
+import androidx.compose.ui.input.pointer.PointerEventType
+import androidx.compose.ui.input.pointer.PointerKeyboardModifiers
+import androidx.compose.ui.input.pointer.PointerType
+import androidx.compose.ui.scene.ComposeScene
+import org.lwjgl.glfw.GLFW.*
+import java.awt.event.KeyEvent as AwtKeyEvent
+
+/**
+ * Routes GLFW input into a [ComposeScene].
+ *
+ * Nothing here touches AWT as a windowing system; `java.awt.event.KeyEvent` is
+ * referenced only for its virtual-key constants, which are what Compose's
+ * desktop [Key] values are built from. GLFW's key codes are its own, so they
+ * have to be translated.
+ */
+@OptIn(ExperimentalComposeUiApi::class)
+class InputRouter(
+    private val window: Long,
+    private val scene: ComposeScene,
+) {
+    private var cursorX = 0f
+    private var cursorY = 0f
+    private var buttonMask = 0
+    private var modifiers = PointerKeyboardModifiers(0)
+
+    /** Scale from window coordinates to framebuffer pixels (fractional scaling). */
+    var scale: Float = 1f
+
+    fun install() {
+        glfwSetCursorPosCallback(window) { _, x, y ->
+            cursorX = (x * scale).toFloat()
+            cursorY = (y * scale).toFloat()
+            send(PointerEventType.Move)
+        }
+
+        glfwSetMouseButtonCallback(window) { _, button, action, mods ->
+            modifiers = mods.toComposeModifiers()
+            val composeButton = when (button) {
+                GLFW_MOUSE_BUTTON_LEFT -> PointerButton.Primary
+                GLFW_MOUSE_BUTTON_RIGHT -> PointerButton.Secondary
+                GLFW_MOUSE_BUTTON_MIDDLE -> PointerButton.Tertiary
+                else -> return@glfwSetMouseButtonCallback
+            }
+            // Compose expects the button mask to already reflect the new state
+            // when the press arrives, and to have it cleared before the release.
+            val mask = 1 shl button
+            buttonMask = if (action == GLFW_PRESS) {
+                buttonMask or mask
+            } else {
+                buttonMask and mask.inv()
+            }
+            send(
+                if (action == GLFW_PRESS) PointerEventType.Press else PointerEventType.Release,
+                button = composeButton,
+            )
+        }
+
+        glfwSetScrollCallback(window) { _, dx, dy ->
+            // Compose scroll deltas run opposite to GLFW's, and are in
+            // "lines"; one notch is one unit.
+            send(PointerEventType.Scroll, scroll = Offset(-dx.toFloat(), -dy.toFloat()))
+        }
+
+        glfwSetCursorEnterCallback(window) { _, entered ->
+            send(if (entered) PointerEventType.Enter else PointerEventType.Exit)
+        }
+
+        glfwSetKeyCallback(window) { _, key, _, action, mods ->
+            modifiers = mods.toComposeModifiers()
+            val type = when (action) {
+                GLFW_PRESS, GLFW_REPEAT -> KeyEventType.KeyDown
+                GLFW_RELEASE -> KeyEventType.KeyUp
+                else -> return@glfwSetKeyCallback
+            }
+            val vk = key.toAwtVirtualKey() ?: return@glfwSetKeyCallback
+            val mods = modifiers
+            onUiThread {
+                scene.sendKeyEvent(
+                    KeyEvent(InternalKeyEvent(Key(vk), type, 0, mods, null)),
+                )
+            }
+        }
+
+        // Text input arrives separately from key events: GLFW's key callback
+        // reports physical keys, while this reports the composed character,
+        // which is what text fields need.
+        glfwSetCharCallback(window) { _, codepoint ->
+            val mods = modifiers
+            onUiThread {
+                scene.sendKeyEvent(
+                    KeyEvent(
+                        InternalKeyEvent(
+                            Key.Unknown, KeyEventType.KeyDown, codepoint, mods, null,
+                        ),
+                    ),
+                )
+            }
+        }
+    }
+
+    /** Compose state must only be touched from the thread that renders it. */
+    private fun onUiThread(block: () -> Unit) = java.awt.EventQueue.invokeLater(block)
+
+    private fun send(
+        type: PointerEventType,
+        scroll: Offset = Offset.Zero,
+        button: PointerButton? = null,
+    ) = onUiThread {
+        scene.sendPointerEvent(
+            eventType = type,
+            position = Offset(cursorX, cursorY),
+            scrollDelta = scroll,
+            timeMillis = System.currentTimeMillis(),
+            type = PointerType.Mouse,
+            buttons = PointerButtons(buttonMask),
+            keyboardModifiers = modifiers,
+            button = button,
+        )
+    }
+
+    private fun Int.toComposeModifiers(): PointerKeyboardModifiers {
+        // Bit layout matches java.awt.event.InputEvent's extended modifiers,
+        // which is what Compose's desktop implementation reads.
+        var m = 0
+        if (this and GLFW_MOD_SHIFT != 0) m = m or (1 shl 6)
+        if (this and GLFW_MOD_CONTROL != 0) m = m or (1 shl 7)
+        if (this and GLFW_MOD_ALT != 0) m = m or (1 shl 9)
+        if (this and GLFW_MOD_SUPER != 0) m = m or (1 shl 8)
+        return PointerKeyboardModifiers(m)
+    }
+
+    /**
+     * GLFW key code to AWT virtual key. Compose's desktop [Key] values are
+     * defined in terms of AWT constants, so this bridge is unavoidable.
+     * Printable ASCII maps directly; the rest is a table.
+     */
+    private fun Int.toAwtVirtualKey(): Int? = when (this) {
+        in GLFW_KEY_A..GLFW_KEY_Z -> AwtKeyEvent.VK_A + (this - GLFW_KEY_A)
+        in GLFW_KEY_0..GLFW_KEY_9 -> AwtKeyEvent.VK_0 + (this - GLFW_KEY_0)
+        in GLFW_KEY_F1..GLFW_KEY_F12 -> AwtKeyEvent.VK_F1 + (this - GLFW_KEY_F1)
+        GLFW_KEY_SPACE -> AwtKeyEvent.VK_SPACE
+        GLFW_KEY_ENTER, GLFW_KEY_KP_ENTER -> AwtKeyEvent.VK_ENTER
+        GLFW_KEY_ESCAPE -> AwtKeyEvent.VK_ESCAPE
+        GLFW_KEY_TAB -> AwtKeyEvent.VK_TAB
+        GLFW_KEY_BACKSPACE -> AwtKeyEvent.VK_BACK_SPACE
+        GLFW_KEY_DELETE -> AwtKeyEvent.VK_DELETE
+        GLFW_KEY_INSERT -> AwtKeyEvent.VK_INSERT
+        GLFW_KEY_HOME -> AwtKeyEvent.VK_HOME
+        GLFW_KEY_END -> AwtKeyEvent.VK_END
+        GLFW_KEY_PAGE_UP -> AwtKeyEvent.VK_PAGE_UP
+        GLFW_KEY_PAGE_DOWN -> AwtKeyEvent.VK_PAGE_DOWN
+        GLFW_KEY_LEFT -> AwtKeyEvent.VK_LEFT
+        GLFW_KEY_RIGHT -> AwtKeyEvent.VK_RIGHT
+        GLFW_KEY_UP -> AwtKeyEvent.VK_UP
+        GLFW_KEY_DOWN -> AwtKeyEvent.VK_DOWN
+        GLFW_KEY_LEFT_SHIFT, GLFW_KEY_RIGHT_SHIFT -> AwtKeyEvent.VK_SHIFT
+        GLFW_KEY_LEFT_CONTROL, GLFW_KEY_RIGHT_CONTROL -> AwtKeyEvent.VK_CONTROL
+        GLFW_KEY_LEFT_ALT, GLFW_KEY_RIGHT_ALT -> AwtKeyEvent.VK_ALT
+        GLFW_KEY_LEFT_SUPER, GLFW_KEY_RIGHT_SUPER -> AwtKeyEvent.VK_META
+        GLFW_KEY_MINUS -> AwtKeyEvent.VK_MINUS
+        GLFW_KEY_EQUAL -> AwtKeyEvent.VK_EQUALS
+        GLFW_KEY_COMMA -> AwtKeyEvent.VK_COMMA
+        GLFW_KEY_PERIOD -> AwtKeyEvent.VK_PERIOD
+        GLFW_KEY_SLASH -> AwtKeyEvent.VK_SLASH
+        GLFW_KEY_SEMICOLON -> AwtKeyEvent.VK_SEMICOLON
+        GLFW_KEY_APOSTROPHE -> AwtKeyEvent.VK_QUOTE
+        GLFW_KEY_LEFT_BRACKET -> AwtKeyEvent.VK_OPEN_BRACKET
+        GLFW_KEY_RIGHT_BRACKET -> AwtKeyEvent.VK_CLOSE_BRACKET
+        GLFW_KEY_BACKSLASH -> AwtKeyEvent.VK_BACK_SLASH
+        GLFW_KEY_GRAVE_ACCENT -> AwtKeyEvent.VK_BACK_QUOTE
+        else -> null
+    }
+}

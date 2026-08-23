@@ -69,6 +69,37 @@ native build. Two things that bite:
   - Skia caches GL state, and mpv issues its own GL calls against the same
     context, so DirectContext.resetGLAll() is required between the two.
 
+## The real app
+
+    LD_PRELOAD=/tmp/libglxshim.so ./gradlew :waylandHost:run -Pnuvio.wayland.realApp=true
+
+renders `com.nuvio.app.App()` -- the same root composable `Main.kt` shows in its
+AWT window -- with no change to composeApp.
+
+### Threading
+
+Compose's lifecycle enforces that state changes happen on "the main thread",
+which on desktop means the AWT event queue; GLFW requires the real main thread
+for event polling. Both are satisfied by splitting them: the EDT owns the GL
+context and does all rendering and all Compose work, and the main thread only
+polls GLFW and forwards input to the EDT. Everything touching GL -- context
+creation, the Skia surface, mpv's render context -- has to run there too, or
+LWJGL aborts the VM with "No context is current".
+
+This is AWT the event loop, not AWT the window system. There is no Canvas and
+no JAWT, so nothing drags the process back onto X11.
+
+### Input
+
+`Input.kt` routes GLFW callbacks into the scene: pointer move/press/release,
+scroll, enter/exit, keys and text. Two wrinkles worth knowing:
+
+  - Compose's desktop `Key` values are defined in terms of AWT virtual-key
+    constants, so GLFW key codes need translating. Only the constants are used;
+    no AWT event is constructed.
+  - Pointer positions arrive in window coordinates but the scene works in
+    framebuffer pixels, which differ under fractional scaling.
+
 ## Verified
 
     GLFW platform: Wayland

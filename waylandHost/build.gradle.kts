@@ -37,7 +37,14 @@ kotlin {
             "androidx.compose.ui.ExperimentalComposeUiApi",
             "androidx.compose.ui.InternalComposeUiApi",
         )
-        freeCompilerArgs.add("-Xexpect-actual-classes")
+        freeCompilerArgs.addAll(
+            "-Xexpect-actual-classes",
+            // InternalKeyEvent is internal to compose-ui, and there is no public
+            // way to synthesise a key event without an AWT KeyEvent -- which
+            // would mean instantiating an AWT Component, the very thing this
+            // module exists to avoid.
+            "-Xdont-warn-on-error-suppression",
+        )
     }
 }
 
@@ -49,6 +56,10 @@ java {
 }
 
 dependencies {
+    // The real application. Depending on it here is what lets the same UI run
+    // on Wayland; nothing in composeApp needs to change.
+    implementation(project(":composeApp"))
+
     implementation(compose.runtime)
     implementation(compose.foundation)
     implementation(compose.material3)
@@ -75,7 +86,7 @@ application {
         add("-Dorg.lwjgl.util.Debug=false")
         // libmpv is bound through FFM rather than JNI, so no native build.
         add("--enable-native-access=ALL-UNNAMED")
-        for (k in listOf("media", "libmpv", "hwdec")) {
+        for (k in listOf("media", "libmpv", "hwdec", "realApp")) {
             providers.gradleProperty("nuvio.wayland.$k").orNull
                 ?.let { add("-Dnuvio.wayland.$k=$it") }
         }
