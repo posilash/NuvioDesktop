@@ -45,12 +45,44 @@ the interface gets assembled. Build and preload it:
 This is a proof of concept, not a shipping answer. The real fix is a Skiko/Skia
 build with EGL support, which would make the shim unnecessary.
 
+## Video
+
+Pass a file to render mpv underneath the Compose UI:
+
+    gcc -shared -fPIC -o /tmp/libglxshim.so native/glxshim.c
+    LD_PRELOAD=/tmp/libglxshim.so ./gradlew :waylandHost:run \
+        -Pnuvio.wayland.media=/path/to/file.mkv \
+        -Pnuvio.wayland.libmpv=/path/to/libmpv.so.2 \
+        -Pnuvio.wayland.hwdec=nvdec
+
+mpv renders into the same GL context, beneath Compose, through the libmpv
+render API with `api-type=opengl-next` -- the libplacebo renderer, so this keeps
+vo=gpu-next quality instead of the legacy gl_video one. There is no embedded
+window, no "wid", and no XComposite capture of a control overlay: the UI is just
+Compose drawing on top of the video in one framebuffer.
+
+libmpv is bound with FFM (java.lang.foreign) rather than JNI, so it needs no
+native build. Two things that bite:
+
+  - mpv_create() returns NULL unless LC_NUMERIC is "C"; the JVM sets a locale
+    from the environment, so setlocale() has to be called first.
+  - Skia caches GL state, and mpv issues its own GL calls against the same
+    context, so DirectContext.resetGLAll() is required between the two.
+
 ## Verified
 
     GLFW platform: Wayland
     GL_RENDERER: NVIDIA GeForce RTX 3070 Laptop GPU/PCIe/SSE2
     RESULT: rendered 120 frames on Wayland
     OK: clean shutdown
+
+With video, on Wayland:
+
+    mpv render context: opengl-next
+    Using hardware decoding (nvdec).
+    VO: [libmpv] 1280x720 cuda[nv12]        # zero-copy
+    VO: [libmpv] 1920x1080 yuv420p10        # HDR10 10-bit
+    RESULT: rendered 120 frames on Wayland
 
 GLFW is asked for `GLFW_PLATFORM_WAYLAND` explicitly, so falling back to
 XWayland would be a visible failure rather than a silent one.

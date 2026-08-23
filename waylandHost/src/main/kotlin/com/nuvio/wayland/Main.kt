@@ -77,6 +77,35 @@ fun main() {
     // Wayland while the AWT one cannot.
     val context = DirectContext.makeGL()
 
+    // Optional video layer. mpv renders into the same GL context, underneath
+    // Compose, via the render API -- no embedded window, no "wid", no
+    // XComposite capture of an overlay. The api-type asks for the libplacebo
+    // renderer, so this keeps vo=gpu-next quality rather than dropping to the
+    // legacy one.
+    val mediaUrl = System.getProperty("nuvio.wayland.media")
+    val mpvPath = System.getProperty("nuvio.wayland.libmpv")
+    var mpv: Mpv? = null
+    if (mediaUrl != null) {
+        if (!Mpv.load(mpvPath)) {
+            System.err.println("FAIL: could not load libmpv (nuvio.wayland.libmpv=$mpvPath)")
+            exitProcess(1)
+        }
+        mpv = Mpv.create().apply {
+            setOption("config", "no")
+            setOption("terminal", "yes")
+            setOption("msg-level", "all=info")
+            setOption("audio", "no")
+            setOption("vo", "libmpv")
+            System.getProperty("nuvio.wayland.hwdec")?.let { setOption("hwdec", it) }
+            initialize()
+            createRenderContext(Mpv.MPV_RENDER_API_TYPE_OPENGL_NEXT) { name ->
+                glfwGetProcAddress(name)
+            }
+            command("loadfile", mediaUrl)
+        }
+        println("mpv render context: ${Mpv.MPV_RENDER_API_TYPE_OPENGL_NEXT}")
+    }
+
     var width = INITIAL_WIDTH
     var height = INITIAL_HEIGHT
     var renderTarget: BackendRenderTarget? = null
@@ -105,7 +134,7 @@ fun main() {
         coroutineContext = MainUIDispatcher,
     )
     scene.setContent {
-        Box(Modifier.fillMaxSize().background(Color(0xFF101014))) {
+        Box(Modifier.fillMaxSize()) {
             Column(Modifier.padding(32.dp)) {
                 Text("Compose on Wayland, without AWT", color = Color(0xFFE0E0E0))
                 Text("GLFW platform: $platformName", color = Color(0xFF9AD29A))
@@ -130,7 +159,18 @@ fun main() {
             }
 
             val s = surface ?: break
-            s.canvas.clear(0xFF101014.toInt())
+
+            if (mpv != null) {
+                // Video first, straight into the window framebuffer, then
+                // Compose composites its UI on top of it. Skia must be told
+                // its cached GL state is stale, because mpv has been issuing
+                // its own GL calls against the same context.
+                if (mpv.hasNewFrame()) mpv.render(0, width, height)
+                context.resetGLAll()
+            } else {
+                s.canvas.clear(0xFF101014.toInt())
+            }
+
             scene.render(s.canvas.asComposeCanvas(), System.nanoTime())
             context.flush()
             glfwSwapBuffers(window)
@@ -146,6 +186,7 @@ fun main() {
             }
         }
     } finally {
+        mpv?.close()
         scene.close()
         surface?.close()
         renderTarget?.close()

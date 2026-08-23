@@ -29,7 +29,8 @@ val lwjglVersion = "3.3.6"
 
 kotlin {
     compilerOptions {
-        jvmTarget.set(JvmTarget.JVM_17)
+        // FFM (java.lang.foreign) is used to bind libmpv, so this needs 22+.
+        jvmTarget.set(JvmTarget.JVM_22)
         // Driving ComposeScene directly is what lets us render without AWT.
         // It is deliberately not stable API, so opt in explicitly.
         optIn.addAll(
@@ -41,7 +42,10 @@ kotlin {
 }
 
 java {
-    toolchain { languageVersion.set(JavaLanguageVersion.of(17)) }
+    // No toolchain pin: use the JDK Gradle runs on, which must be 22 or newer
+    // for the Foreign Function & Memory API.
+    sourceCompatibility = JavaVersion.VERSION_22
+    targetCompatibility = JavaVersion.VERSION_22
 }
 
 dependencies {
@@ -66,8 +70,14 @@ dependencies {
 
 application {
     mainClass = "com.nuvio.wayland.MainKt"
-    applicationDefaultJvmArgs = listOf(
+    applicationDefaultJvmArgs = buildList {
         // GLFW on Wayland drives EGL; nothing here touches GLX or X11.
-        "-Dorg.lwjgl.util.Debug=false",
-    )
+        add("-Dorg.lwjgl.util.Debug=false")
+        // libmpv is bound through FFM rather than JNI, so no native build.
+        add("--enable-native-access=ALL-UNNAMED")
+        for (k in listOf("media", "libmpv", "hwdec")) {
+            providers.gradleProperty("nuvio.wayland.$k").orNull
+                ?.let { add("-Dnuvio.wayland.$k=$it") }
+        }
+    }
 }
