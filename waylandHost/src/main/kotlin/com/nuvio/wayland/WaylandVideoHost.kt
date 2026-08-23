@@ -4,6 +4,7 @@ import com.nuvio.app.features.player.desktop.WaylandVideoBridge
 import org.jetbrains.skia.BackendRenderTarget
 import org.jetbrains.skia.ColorSpace
 import org.jetbrains.skia.ColorType
+import org.jetbrains.skia.ContentChangeMode
 import org.jetbrains.skia.DirectContext
 import org.jetbrains.skia.FramebufferFormat
 import org.jetbrains.skia.Rect
@@ -42,6 +43,13 @@ class WaylandVideoHost(
         if (!hasFile || width <= 0 || height <= 0) return
         ensureTarget(width, height)
         if (!mpv.hasNewFrame()) return
+
+        // Skia's snapshots are copy-on-write, invalidated by Skia's own draw
+        // calls. mpv writes into this FBO through raw GL, which Skia never
+        // sees, so without this it keeps handing back the first snapshot it
+        // took and the picture freezes -- refreshing only when a resize
+        // rebuilds the surface. This is the API for exactly that case.
+        videoSurface?.notifyContentWillChange(ContentChangeMode.DISCARD)
 
         // Start from opaque black: mpv letterboxes rather than filling, and a
         // stale frame would otherwise show through the bars.

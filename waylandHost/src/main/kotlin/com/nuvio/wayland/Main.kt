@@ -251,18 +251,26 @@ fun main() {
         if (probePixels && frames % 15 == 0) {
             // Same pixel, now after Compose has drawn. If mpv's value was
             // non-black and this is black, Compose is painting over the video.
-            val px2 = java.nio.ByteBuffer.allocateDirect(4)
+            // Hash a region rather than sample one pixel: a single centre
+            // pixel is constant in plenty of content, so it cannot tell a live
+            // frame from a frozen one -- which is exactly the bug it missed.
+            val n = 64
+            val buf = java.nio.ByteBuffer.allocateDirect(n * n * 4)
             GL30.glBindFramebuffer(GL30.GL_FRAMEBUFFER, 0)
             GL11.glReadPixels(
-                width / 2, height / 2, 1, 1,
-                GL11.GL_RGBA, GL11.GL_UNSIGNED_BYTE, px2,
+                (width - n) / 2, (height - n) / 2, n, n,
+                GL11.GL_RGBA, GL11.GL_UNSIGNED_BYTE, buf,
             )
-            println(
-                "probe: centre pixel after compose = " +
-                    "${px2.get(0).toInt() and 0xFF}," +
-                    "${px2.get(1).toInt() and 0xFF}," +
-                    "${px2.get(2).toInt() and 0xFF}",
-            )
+            var hash = 0
+            var nonBlack = 0
+            for (i in 0 until n * n) {
+                val r = buf.get(i * 4).toInt() and 0xFF
+                val g = buf.get(i * 4 + 1).toInt() and 0xFF
+                val b = buf.get(i * 4 + 2).toInt() and 0xFF
+                hash = hash * 31 + (r shl 16 or (g shl 8) or b)
+                if (r + g + b > 12) nonBlack++
+            }
+            println("probe: frame=$frames hash=$hash nonBlackPixels=$nonBlack/${n * n}")
         }
         glfwSwapBuffers(window)
 
