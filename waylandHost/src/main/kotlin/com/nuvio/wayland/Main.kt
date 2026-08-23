@@ -428,6 +428,7 @@ fun main() {
     // due. Costs and cadence are measured, not assumed.
     var sceneCostEmaMs = 8.0
     var videoIntervalEmaMs = 41.7
+    var lastSceneRenderNs = System.nanoTime()
     // Cadence evidence for judder: how far apart video presents actually land.
     // A 24fps source on a 165Hz panel should alternate cleanly between 7- and
     // 6-vsync intervals (42.4/36.4ms); anything outside that pattern is
@@ -524,7 +525,13 @@ fun main() {
         if (sceneDirty && !videoChanged) {
             val videoLive = videoHost?.hasFile == true &&
                 lastVideoPresentNs != 0L && (t - lastVideoPresentNs) < 500_000_000L
-            if (videoLive) {
+            // When the scene costs more than a whole frame interval the defer
+            // condition would hold forever and the UI would simply stop --
+            // observed as "the player ui disappeared". Starvation gets a hard
+            // bound: past it the scene renders even at the price of one late
+            // video frame.
+            val starvedMs = (t - lastSceneRenderNs) / 1e6
+            if (videoLive && starvedMs < 250.0) {
                 val untilNextFrameMs =
                     (lastVideoPresentNs - t) / 1e6 + videoIntervalEmaMs
                 if (untilNextFrameMs < sceneCostEmaMs * 1.2 + 3.0) {
@@ -534,6 +541,7 @@ fun main() {
                 }
             }
             forceRepaint = false
+            lastSceneRenderNs = t
             ui.canvas.clear(0x00000000)
             scene.render(ui.canvas.asComposeCanvas(), System.nanoTime())
             val costMs = (System.nanoTime() - t) / 1e6

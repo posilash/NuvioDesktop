@@ -563,7 +563,19 @@ private fun ProgressControls(
             verticalAlignment = Alignment.CenterVertically,
         ) {
             TimePill(text = formatPlaybackTime(displayedPositionMs), fontSize = metrics.timeSize)
-            TimePill(text = formatPlaybackTime(durationMs), fontSize = metrics.timeSize)
+            Row(
+                horizontalArrangement = Arrangement.spacedBy(10.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                if (playbackSnapshot.volumeLevel != null && onVolumeChange != null && onMuteToggle != null) {
+                    VolumeControl(
+                        volumeLevel = playbackSnapshot.volumeLevel,
+                        onVolumeChange = onVolumeChange,
+                        onMuteToggle = onMuteToggle,
+                    )
+                }
+                TimePill(text = formatPlaybackTime(durationMs), fontSize = metrics.timeSize)
+            }
         }
         Row(
             modifier = Modifier.fillMaxWidth(),
@@ -603,13 +615,6 @@ private fun ProgressControls(
                         painter = audioPainter,
                         onClick = onAudioClick,
                     )
-                    if (playbackSnapshot.volumeLevel != null && onVolumeChange != null && onMuteToggle != null) {
-                        VolumeControlPill(
-                            volumeLevel = playbackSnapshot.volumeLevel,
-                            onVolumeChange = onVolumeChange,
-                            onMuteToggle = onMuteToggle,
-                        )
-                    }
                     if (onSourcesClick != null) {
                         PlayerActionPillButton(
                             label = stringResource(Res.string.compose_player_sources),
@@ -729,11 +734,12 @@ internal fun LockedPlayerOverlay(
     }
 }
 
-// Ported from the NuvioLinux fork (its PlayerControls.kt), which is the
-// reference desktop chrome: icon toggles mute, slider drives the level, and a
-// local value keeps the thumb stable mid-drag while snapshots lag behind.
+// The web chrome's volume control (player-ui/controls.html: volume-button +
+// volume-slider in the playback-status row), expressed in Compose: icon
+// toggles mute, slider drives the level, and a local value keeps the thumb
+// stable mid-drag while snapshots lag behind.
 @Composable
-private fun VolumeControlPill(
+private fun VolumeControl(
     volumeLevel: Float?,
     onVolumeChange: (Float) -> Unit,
     onMuteToggle: () -> Unit,
