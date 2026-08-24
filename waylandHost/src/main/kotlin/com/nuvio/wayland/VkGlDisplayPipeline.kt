@@ -12,10 +12,12 @@ import org.lwjgl.opengl.GL45
  * Adapts [VideoPipelineVk] to the GL scene: mpv renders with Vulkan
  * (zero-copy nvdec, the same API the user's reference build runs), and each
  * exported VkImage is imported into this GL context once per generation via
- * GL_EXT_memory_object_fd. Per fresh frame the only GL-side cost is a
- * glWaitSemaphoreEXT -- the driver-level fence that replaces the GL
- * pipeline's fence handoff. Everything downstream (Skia FBO wrap, composite)
- * is unchanged.
+ * GL_EXT_memory_object_fd. Per fresh frame the GL-side cost is one
+ * glWaitSemaphoreEXT (render-done: orders sampling after mpv's write) and
+ * one glSignalSemaphoreEXT (glDone, on the buffer being replaced: orders
+ * mpv's next write after this context's reads) -- the driver-level fences
+ * that replace the GL pipeline's fence handoff. Everything downstream (Skia
+ * FBO wrap, composite) is unchanged.
  *
  * Must be constructed and used on the thread that owns the window GL context
  * (the EDT): imports and waits are context operations.
@@ -31,6 +33,10 @@ class VkGlDisplayPipeline(private val vk: VideoPipelineVk) : DisplayPipeline {
         val memoryObject: Int,
         val texture: Int,
         val semaphore: Int,
+        /** GL twin of [VideoPipelineVk.Buffer.glDoneSemaphore]: signaled here
+         * when this texture stops being the displayed frame, waited VK-side
+         * before mpv writes into the image again. */
+        val glDoneSemaphore: Int,
     )
 
     private val imports = HashMap<Int, Imported>()
@@ -84,8 +90,13 @@ class VkGlDisplayPipeline(private val vk: VideoPipelineVk) : DisplayPipeline {
             sem, EXTSemaphoreFD.GL_HANDLE_TYPE_OPAQUE_FD_EXT, b.semaphoreFd,
         )
         b.semaphoreFd = -1 // consumed above
+        val glDone = EXTSemaphore.glGenSemaphoresEXT()
+        EXTSemaphoreFD.glImportSemaphoreFdEXT(
+            glDone, EXTSemaphoreFD.GL_HANDLE_TYPE_OPAQUE_FD_EXT, b.glDoneSemaphoreFd,
+        )
+        b.glDoneSemaphoreFd = -1 // consumed above
         b.fdsOwnedByConsumer = true
-        return Imported(b.generation, memObj, tex, sem)
+        return Imported(b.generation, memObj, tex, sem, glDone)
     }
 
     /** Stale imports awaiting GPU retirement before their GL objects die. */
@@ -124,6 +135,7 @@ class VkGlDisplayPipeline(private val vk: VideoPipelineVk) : DisplayPipeline {
                 GL11.glDeleteTextures(p.imported.texture)
                 EXTMemoryObject.glDeleteMemoryObjectsEXT(p.imported.memoryObject)
                 EXTSemaphore.glDeleteSemaphoresEXT(p.imported.semaphore)
+                EXTSemaphore.glDeleteSemaphoresEXT(p.imported.glDoneSemaphore)
                 it.remove()
             }
         }
@@ -138,6 +150,26 @@ class VkGlDisplayPipeline(private val vk: VideoPipelineVk) : DisplayPipeline {
         }
         collectRetiredDeletes()
         if (f.fresh) {
+            // The buffer this frame replaces owes the render thread a glDone
+            // signal before mpv may write into it again. Every sampling of
+            // that texture was issued in earlier composites, so a signal
+            // inserted now is ordered after those reads in this context's
+            // command stream. The flush is load-bearing: the Vulkan side
+            // enqueues a GPU wait on the strength of notifyGlDone, and a
+            // wait whose signal never reached a queue would hang the device.
+            f.retired?.let { prev ->
+                imports[prev.generation]?.let { prevImp ->
+                    EXTSemaphore.glSignalSemaphoreEXT(
+                        prevImp.glDoneSemaphore, intArrayOf(),
+                        intArrayOf(prevImp.texture), intArrayOf(glLayoutGeneral),
+                    )
+                    GL45.glFlush()
+                    vk.notifyGlDone(prev)
+                }
+                // No import (cannot normally happen for a displayed buffer):
+                // leave glDoneOwed unset -- the buffer stays parked rather
+                // than risking a wait with no signal.
+            }
             // Inherit the render-done wait from the Vulkan side. The GL
             // driver orders subsequent sampling of the texture after mpv's
             // queue signal, layouts handled by the transition hint.

@@ -92,7 +92,7 @@ application {
         add("--enable-native-access=ALL-UNNAMED")
         for (k in listOf(
             "media", "libmpv", "hwdec", "realApp", "probe", "videoLog",
-            "smokePlayer", "demoFrames", "uiScale", "resizeTest", "subTest", "mpvExtra", "webChrome", "chromePage", "chromeProbe", "chromeBgRed", "chromeNoBlit", "chromeInitOnly", "vk", "paced", "sceneHoldMs", "sampled",
+            "smokePlayer", "demoFrames", "uiScale", "resizeTest", "subTest", "mpvExtra", "webChrome", "chromePage", "chromeProbe", "chromeBgRed", "chromeNoBlit", "chromeInitOnly", "vk", "paced", "sceneHoldMs", "noPlayerUi", "sampled",
         )) {
             providers.gradleProperty("nuvio.wayland.$k").orNull
                 ?.let { add("-Dnuvio.wayland.$k=$it") }

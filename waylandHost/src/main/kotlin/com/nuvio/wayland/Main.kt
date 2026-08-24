@@ -285,6 +285,14 @@ fun main() {
         videoHost = WaylandVideoHost(mpv!!, pipeline!!, context)
         if (runRealAppEarly) {
             com.nuvio.app.features.player.desktop.WaylandVideoBridge.delegate = videoHost
+            if (System.getProperty("nuvio.wayland.noPlayerUi")?.toBoolean() == true) {
+                // Diagnostic: tell the app the platform owns the player
+                // chrome (so Compose draws none) without starting the web
+                // chrome either -- video with no controls at all, to see
+                // what the video path does with nothing drawn over it.
+                com.nuvio.app.features.player.desktop.WaylandVideoBridge.webChromeActive = true
+                println("player UI: DISABLED (no compose chrome, no web chrome)")
+            }
             println("video bridge: installed")
         }
         if (mediaUrl != null) videoHost!!.markLoaded()

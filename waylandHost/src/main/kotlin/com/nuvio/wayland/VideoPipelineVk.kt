@@ -76,6 +76,28 @@ import org.lwjgl.vulkan.VkSubmitInfo
  * consumer took it still carries a pending signal, so the render thread drains
  * it with an empty queue submission before reusing the buffer -- otherwise the
  * second signal is a validation error and, on some drivers, a hang.
+ *
+ * The protocol is two-directional. The render-done semaphore above orders
+ * GL reads after mpv's writes; a second per-buffer semaphore ([Buffer
+ * .glDoneSemaphore], "glDone") orders mpv's *next* write after GL's reads.
+ * Without it there is a write-after-read hazard on wrap-around: when a buffer
+ * rotates back to the render thread, mpv's queue starts overwriting the image
+ * while the consumer's earlier sampling commands may still be executing --
+ * periodic corruption that shows as flicker. The consumer signals glDone (via
+ * its imported GL twin, plus a flush) when a fresh frame replaces the buffer
+ * it was displaying, then calls [notifyGlDone]; the render thread submits an
+ * empty queue batch waiting that semaphore before handing the image back to
+ * mpv. Same-queue submission order then carries the dependency into mpv's own
+ * submissions, so no CPU wait is needed. mpv_vulkan_fbo.wait_semaphore is NOT
+ * used for this: the fork rewraps the VkImage every frame (buffers
+ * alternate), and libplacebo's release-with-semaphore path early-returns on a
+ * freshly wrapped ("unheld") image, silently dropping the wait.
+ *
+ * The handoff has a race the [retiring] slot closes: the instant
+ * acquireDisplayFrame() switches [displayed], the old buffer would be free
+ * for the render thread to pick -- but the consumer can only signal glDone
+ * *after* that call returns. So the replaced buffer parks in [retiring],
+ * excluded from the rotation, until notifyGlDone() marks its signal pending.
  */
 class VideoPipelineVk(private val mpv: Mpv) {
 
@@ -126,6 +148,16 @@ class VideoPipelineVk(private val mpv: Mpv) {
         var memoryFd = -1
         /** Opaque fd for [semaphore]; same ownership rule. */
         var semaphoreFd = -1
+        /** GL-done semaphore: the consumer signals it (through the imported
+         * GL twin) when it stops displaying this buffer; the render thread
+         * waits it before mpv writes into the image again. */
+        var glDoneSemaphore = VK_NULL_HANDLE
+        /** Opaque fd for [glDoneSemaphore]; same ownership rule. */
+        var glDoneSemaphoreFd = -1
+        /** True between the consumer's glDone signal (set on the consumer
+         * thread, after its flush) and the render thread's matching wait.
+         * A fresh buffer never sampled stays false and needs no wait. */
+        @Volatile var glDoneOwed = false
         /** Layout mpv left the image in after the last render; the GL side
          * passes it to glWaitSemaphoreEXT so the driver can transition. */
         var outLayout = VK_IMAGE_LAYOUT_UNDEFINED
@@ -162,10 +194,17 @@ class VideoPipelineVk(private val mpv: Mpv) {
     // -- Buffer handoff, same triple-buffer protocol as VideoPipeline. ------
 
     private val lock = Object()
-    private val buffers = Array(3) { Buffer() }
+    // Diagnostic lever: -Dnuvio.wayland.vkBuffers=1 removes rotation (and
+    // therefore every wrap-around hazard) to bisect corruption sources.
+    private val buffers = Array(
+        System.getProperty("nuvio.wayland.vkBuffers")?.toIntOrNull()?.coerceIn(1, 3) ?: 3,
+    ) { Buffer() }
     private var front: Buffer? = null      // latest published, not yet taken
     private var displayed: Buffer? = null  // held by the consumer
     private var rendering: Buffer? = null  // owned by the video thread
+    // Replaced-as-displayed, awaiting the consumer's glDone signal; excluded
+    // from the render rotation until notifyGlDone() flips glDoneOwed.
+    private var retiring: Buffer? = null
 
     @Volatile private var targetWidth = 0
     @Volatile private var targetHeight = 0
@@ -180,6 +219,10 @@ class VideoPipelineVk(private val mpv: Mpv) {
     @Volatile private var renders = 0L
     @Volatile private var renderNanos = 0L
     @Volatile private var renderFails = 0L
+    /** glDone waits submitted; should track renders/s once playback is
+     * steady, and reads 0 if the consumer ever stops signalling back --
+     * i.e. it is the write-after-read protection's liveness check. */
+    @Volatile private var glDoneWaits = 0L
     @Volatile private var lastGeneration = 0
     @Volatile var totalRenders = 0L
         private set
@@ -219,9 +262,10 @@ class VideoPipelineVk(private val mpv: Mpv) {
         val r = renders; renders = 0
         val ns = renderNanos; renderNanos = 0
         val f = renderFails; renderFails = 0
+        val gd = glDoneWaits; glDoneWaits = 0
         val avgMs = if (r > 0) ns / 1e6 / r else 0.0
-        return "vk-pipeline: renders/s=%.0f renderAvg=%.1fms fails=%d target=%dx%d gen=%d"
-            .format(r / elapsedSeconds, avgMs, f, targetWidth, targetHeight, lastGeneration)
+        return "vk-pipeline: renders/s=%.0f renderAvg=%.1fms fails=%d glDone/s=%.0f target=%dx%d gen=%d"
+            .format(r / elapsedSeconds, avgMs, f, gd / elapsedSeconds, targetWidth, targetHeight, lastGeneration)
     }
 
     /** What a GL consumer needs to import one buffer, frozen for printing. */
@@ -233,13 +277,14 @@ class VideoPipelineVk(private val mpv: Mpv) {
         val memoryFd: Int,
         val allocationSize: Long,
         val semaphoreFd: Int,
+        val glDoneSemaphoreFd: Int,
         val outLayout: Int,
     )
 
     fun exportSnapshot(): List<ExportInfo> = synchronized(lock) {
         buffers.mapIndexed { i, b ->
             ExportInfo(i, b.generation, b.width, b.height,
-                b.memoryFd, b.allocationSize, b.semaphoreFd, b.outLayout)
+                b.memoryFd, b.allocationSize, b.semaphoreFd, b.glDoneSemaphoreFd, b.outLayout)
         }
     }
 
@@ -372,7 +417,15 @@ class VideoPipelineVk(private val mpv: Mpv) {
     /** Pick the buffer that is neither published nor being displayed. */
     private fun acquireBuffer(w: Int, h: Int): Buffer? {
         val buf = synchronized(lock) {
-            buffers.firstOrNull { it !== front && it !== displayed }?.also { rendering = it }
+            buffers.firstOrNull {
+                it !== front && it !== displayed &&
+                    // A retiring buffer is untouchable until the consumer's
+                    // glDone signal is in flight (see acquireDisplayFrame).
+                    (it !== retiring || it.glDoneOwed)
+            }?.also {
+                if (it === retiring) retiring = null
+                rendering = it
+            }
         } ?: return null
         if (buf.signalPending) {
             // Dropped frame: its signal was never consumed. Unsignal on the
@@ -384,10 +437,19 @@ class VideoPipelineVk(private val mpv: Mpv) {
             releaseBuffer(buf)
             allocateBuffer(buf, w, h)
         }
+        if (buf.glDoneOwed) {
+            // The consumer finished with this image and signaled glDone (its
+            // flush happened before the flag was set, so the signal is on its
+            // way to the GPU). Queue a wait so mpv's upcoming write is
+            // ordered after the consumer's reads -- the WAR hazard fix.
+            waitGlDone(buf.glDoneSemaphore)
+            buf.glDoneOwed = false
+            glDoneWaits++
+        }
         return buf
     }
 
-    class DisplayFrame(val buffer: Buffer, val fresh: Boolean)
+    class DisplayFrame(val buffer: Buffer, val fresh: Boolean, val retired: Buffer?)
 
     /**
      * Latest published frame, for the consumer.
@@ -397,20 +459,44 @@ class VideoPipelineVk(private val mpv: Mpv) {
      * semaphore, with [Buffer.outLayout], before sampling -- the pipeline
      * stops tracking that signal the moment the frame is handed over. A
      * generation change means the fds are new and must be re-imported.
+     *
+     * When [DisplayFrame.retired] is non-null the consumer owes that buffer a
+     * glDone signal: it must signal the buffer's glDone semaphore (GL twin),
+     * flush so the signal reaches the GPU, then call [notifyGlDone]. Until
+     * then the buffer sits in [retiring], excluded from the render rotation,
+     * so mpv cannot overwrite it under the consumer's still-executing reads.
      */
     fun acquireDisplayFrame(): DisplayFrame? {
         var fresh = false
+        var retired: Buffer? = null
         val buf = synchronized(lock) {
             val f = front
             if (f != null) {
                 front = null
+                val prev = displayed
+                if (prev != null && prev !== f) {
+                    retiring = prev
+                    retired = prev
+                }
                 displayed = f
                 f.signalPending = false // the consumer owns the wait now
                 fresh = true
             }
             displayed
         } ?: return null
-        return DisplayFrame(buf, fresh)
+        return DisplayFrame(buf, fresh, retired)
+    }
+
+    /**
+     * Consumer callback: the glDone signal for [b] has been issued and
+     * flushed. Only now may the render thread wait it -- enqueueing a GPU
+     * wait for a signal that never reaches the queue would hang the device.
+     * The unpark retries any render skipped while [b] was excluded.
+     */
+    fun notifyGlDone(b: Buffer) {
+        b.glDoneOwed = true
+        updatePending = true
+        thread?.let { LockSupport.unpark(it) }
     }
 
     // -- Vulkan plumbing. ----------------------------------------------------
@@ -629,10 +715,21 @@ class VideoPipelineVk(private val mpv: Mpv) {
             vkCheck(vkGetSemaphoreFdKHR(device, sgfi, pFd), "vkGetSemaphoreFdKHR")
             b.semaphoreFd = pFd.get(0)
 
+            // The reverse-direction twin: GL signals, this queue waits.
+            // Same exportable-binary shape as the render-done semaphore.
+            vkCheck(vkCreateSemaphore(device, sci, null, pl), "vkCreateSemaphore(glDone)")
+            b.glDoneSemaphore = pl.get(0)
+            vkCheck(
+                vkGetSemaphoreFdKHR(device, sgfi.semaphore(b.glDoneSemaphore), pFd),
+                "vkGetSemaphoreFdKHR(glDone)",
+            )
+            b.glDoneSemaphoreFd = pFd.get(0)
+
             b.width = w
             b.height = h
             b.outLayout = VK_IMAGE_LAYOUT_UNDEFINED
             b.fdsOwnedByConsumer = false
+            b.glDoneOwed = false
             b.generation = ++generationCounter
         }
     }
@@ -640,6 +737,26 @@ class VideoPipelineVk(private val mpv: Mpv) {
     private var generationCounter = 0
 
     private fun releaseBuffer(b: Buffer) {
+        if (b.glDoneOwed) {
+            // The consumer signaled glDone but no render waited it yet.
+            // Drain: unsignals the semaphore and proves the GL-side signal
+            // operation retired, so the destroy below cannot yank the payload
+            // out from under it. (The signal was flushed before the flag was
+            // set, so the bounded wait cannot time out in practice.)
+            //
+            // Non-fatal, unlike the dropped-frame drain: this also runs on the
+            // teardown path, where the consumer's GL context may already be
+            // gone. A signal that can then never arrive must not throw out of
+            // destroyVulkan and leave the device -- and mpv's imported view of
+            // it -- undestroyed; the vkDeviceWaitIdle/vkQueueWaitIdle around
+            // this is what actually gates the destroys.
+            try {
+                drainSemaphore(b.glDoneSemaphore)
+            } catch (t: Throwable) {
+                println("[wayland-video] vk-pipeline: glDone drain failed: ${t.message}")
+            }
+            b.glDoneOwed = false
+        }
         // The buffer's last render may still be executing on the GPU: when a
         // consumer took the frame it inherited the semaphore wait, so nothing
         // here proves mpv's submission targeting this image has retired.
@@ -654,12 +771,17 @@ class VideoPipelineVk(private val mpv: Mpv) {
         if (!b.fdsOwnedByConsumer) {
             if (b.memoryFd >= 0) Posix.close(b.memoryFd)
             if (b.semaphoreFd >= 0) Posix.close(b.semaphoreFd)
+            if (b.glDoneSemaphoreFd >= 0) Posix.close(b.glDoneSemaphoreFd)
         }
         b.memoryFd = -1
         b.semaphoreFd = -1
+        b.glDoneSemaphoreFd = -1
         b.fdsOwnedByConsumer = false
         if (b.semaphore != VK_NULL_HANDLE) {
             vkDestroySemaphore(device, b.semaphore, null); b.semaphore = VK_NULL_HANDLE
+        }
+        if (b.glDoneSemaphore != VK_NULL_HANDLE) {
+            vkDestroySemaphore(device, b.glDoneSemaphore, null); b.glDoneSemaphore = VK_NULL_HANDLE
         }
         if (b.image != VK_NULL_HANDLE) {
             vkDestroyImage(device, b.image, null); b.image = VK_NULL_HANDLE
@@ -691,6 +813,26 @@ class VideoPipelineVk(private val mpv: Mpv) {
             val r = vkWaitForFences(device, drainFence, true, 1_000_000_000L)
             check(r == VK_SUCCESS) { "semaphore drain did not retire (VkResult $r)" }
             vkResetFences(device, drainFence)
+        }
+    }
+
+    /**
+     * Order mpv's next write into a buffer after the consumer's finished
+     * reads: an empty submission that waits the buffer's glDone semaphore.
+     * No fence and no CPU wait -- a semaphore wait's second synchronization
+     * scope covers everything later in submission order on this queue, and
+     * mpv submits to this same queue (single-queue device, imported by the
+     * render context), so every subsequent render is ordered after it.
+     * Runs on the render thread, so it cannot race mpv's own submissions.
+     */
+    private fun waitGlDone(sem: Long) {
+        stackPush().use { s ->
+            val si = VkSubmitInfo.calloc(s)
+                .sType(VK_STRUCTURE_TYPE_SUBMIT_INFO)
+                .waitSemaphoreCount(1)
+                .pWaitSemaphores(s.longs(sem))
+                .pWaitDstStageMask(s.ints(VK_PIPELINE_STAGE_ALL_COMMANDS_BIT))
+            vkCheck(vkQueueSubmit(queue, si, VK_NULL_HANDLE), "vkQueueSubmit(glDone wait)")
         }
     }
 
