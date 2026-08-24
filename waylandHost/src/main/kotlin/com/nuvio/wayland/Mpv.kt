@@ -604,6 +604,12 @@ class Mpv private constructor(private val handle: MemorySegment, private val are
     private val shutdownLatch = java.util.concurrent.CountDownLatch(1)
     private var eventThread: Thread? = null
 
+    /** Fired when mpv begins opening a file (playback of it has not started). */
+    @Volatile var onStartFile: (() -> Unit)? = null
+
+    /** Fired when playback actually starts/restarts, i.e. a frame is ready. */
+    @Volatile var onPlaybackRestart: (() -> Unit)? = null
+
     fun startEventLoop(logSink: ((String) -> Unit)?) {
         check(eventThread == null)
         eventThread = Thread({
@@ -626,6 +632,13 @@ class Mpv private constructor(private val handle: MemorySegment, private val are
                             logSink("[mpv/$prefix] " + text.trimEnd())
                         }
                     }
+                    // A file boundary. The consumer uses these to stop
+                    // compositing the OUTGOING file's last frame: the
+                    // pipeline keeps its texture until the new file renders,
+                    // so without this the previous stream's final frame
+                    // flashes up before the new one appears.
+                    6 -> onStartFile?.invoke()          // MPV_EVENT_START_FILE
+                    21 -> onPlaybackRestart?.invoke()   // MPV_EVENT_PLAYBACK_RESTART
                     22 -> { // MPV_EVENT_PROPERTY_CHANGE
                         // struct mpv_event_property { name; format:int; data; }
                         val data = e.get(ADDRESS, 16)

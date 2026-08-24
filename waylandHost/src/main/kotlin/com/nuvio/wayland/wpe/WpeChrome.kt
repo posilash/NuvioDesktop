@@ -92,7 +92,45 @@ class WpeChrome(
     private val wlClient by lazy { SymbolLookup.libraryLookup("libwayland-client.so.0", arena) }
     private val eglLib by lazy { SymbolLookup.libraryLookup("libEGL.so.1", arena) }
 
+    private var pageUri: String = ""
+
+    /**
+     * Bumped every time the page is (re)loaded. Upstream gives each playback
+     * session a NEW web view (created in createPlayer, destroyed with the
+     * player), so its page always starts in bootstrap state: the controls
+     * page keys its opening overlay off `!hasReceivedPlayerControls`, and a
+     * recycled page has that false -- which is why a reused page shows the
+     * PREVIOUS session's controls, and replays its stale playback state back
+     * to the app as a spurious pause. Reloading gives the same fresh JS
+     * context without paying WPE's process startup again.
+     */
+    @Volatile var sessionEpoch: Long = 0L
+        private set
+
+    /** True while the page has not been fed any state since its last load. */
+    @Volatile var pageFresh: Boolean = false
+        private set
+
+    /** Reload the controls page, so the next session starts from bootstrap. */
+    fun reloadPage() {
+        if (pageUri.isEmpty()) return
+        sessionEpoch++
+        pageFresh = true
+        Glib.post {
+            runCatching {
+                fn(webkit, "webkit_web_view_load_uri", FunctionDescriptor.ofVoid(ADDRESS, ADDRESS))
+                    .invokeExact(webView, arena.allocateFrom(pageUri))
+                Unit
+            }.onFailure { lastError = it.toString() }
+        }
+    }
+
+    /** Called when state is pushed into the page: it is no longer pristine. */
+    fun markPageUsed() { pageFresh = false }
+
     fun start(pageUri: String) {
+        this.pageUri = pageUri
+        pageFresh = true
         Glib.ensureStarted()
         Glib.post {
             runCatching { init(pageUri) }.onFailure {

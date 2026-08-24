@@ -600,6 +600,11 @@ fun main() {
     // branch's rule, copied: composite only while loading/paused/interacting
     // (plus fade grace) -- "normal watching pays nothing".
     val chromeActiveUntilNs = java.util.concurrent.atomic.AtomicLong(Long.MAX_VALUE)
+    // Frame count after which the chrome may be shown: set when the page
+    // reports controlsReady and we push its first state. Long.MAX_VALUE means
+    // "not ready yet".
+    val chromeRevealAfterFrame = java.util.concurrent.atomic.AtomicLong(Long.MAX_VALUE)
+    var chromeEpochSeen = 0L
     // The stock web chrome is the player UI: it renders on the GPU, costs
     // ~0.09ms a frame regardless of window size, and leaves Compose with
     // nothing to draw during playback. -Pnuvio.wayland.webChrome=false falls
@@ -639,7 +644,32 @@ fun main() {
                             // Fade grace: the hide animation still needs frames.
                             chromeActiveUntilNs.set(System.nanoTime() + 600_000_000L)
                     }
-                    if (type == "controlsReady") videoHost?.flushControlsToChrome()
+                    if (type == "controlsReady") {
+                        // The page says it has rendered: only now is it safe
+                        // to show. Before this it composites in a partially
+                        // laid-out state, which reads as the chrome flashing
+                        // up half-built.
+                        // Only feed a page that has a session to show. The
+                        // controls page starts with isLoading=true and shows
+                        // its opening overlay while `!hasReceivedPlayerControls`
+                        // -- and receiving ANY controls JSON clears that flag,
+                        // so a warm-up push is what makes a fresh page render
+                        // controls instead of the overlay.
+                        if (videoHost?.hasFile == true) videoHost?.flushControlsToChrome()
+                        // controlsReady means the page can RECEIVE state, not
+                        // that it has PAINTED any. Guessing a frame margin
+                        // here revealed half-drawn or stale content; ask the
+                        // page instead. Two rAFs guarantee a frame has been
+                        // rendered after the current state, at which point
+                        // the opening overlay is on screen.
+                        // Reveal once the page has exported frames of its
+                        // current state. (A paint report from the page itself
+                        // would be exact, but rAF is throttled while the view
+                        // is hidden, so it never fires -- measured.)
+                        chromeRevealAfterFrame.set(
+                            (wpeChrome?.framesExported ?: 0L) + 2L,
+                        )
+                    }
                     java.awt.EventQueue.invokeLater {
                         com.nuvio.app.features.player.desktop.WaylandVideoBridge
                             .onChromeEvent?.invoke(type, value)
@@ -860,7 +890,22 @@ fun main() {
             // about, so it is the case the numbers have to come from.
             val active = chromeAlwaysOn ||
                 !playing || System.nanoTime() < chromeActiveUntilNs.get()
-            val wantChrome = (!runRealApp || videoHost?.hasFile == true) && active
+            // A reload resets the page to bootstrap: hide it again until it
+            // reports ready and has drawn the state we push.
+            if (chrome.sessionEpoch != chromeEpochSeen) {
+                chromeEpochSeen = chrome.sessionEpoch
+                chromeRevealAfterFrame.set(Long.MAX_VALUE)
+            }
+            val chromeDrawn = chrome.framesExported >= chromeRevealAfterFrame.get()
+            val wantChrome = (!runRealApp || videoHost?.hasFile == true) &&
+                active && chromeDrawn
+            if (videoLog && wantChrome != chromeShown) {
+                println(
+                    "[session] chrome ${if (wantChrome) "SHOW" else "hide"} " +
+                        "(hasFile=${videoHost?.hasFile} active=$active " +
+                        "drawn=$chromeDrawn frames=${chrome.framesExported})",
+                )
+            }
             if (wantChrome != chromeShown) {
                 chromeShown = wantChrome
                 chrome.visible = wantChrome
@@ -904,7 +949,9 @@ fun main() {
                     // than ~30fps, no matter how fast this loop spins. Every
                     // un-throttled ack scheme so far turned into the page
                     // re-rendering at whatever rate the acking thread ran.
-                    chrome.ackFrameAfter(33)
+                    // Same reasoning as ChromeLayer.ackDelayMs: only the
+                    // CPU path needs a frame budget.
+                    chrome.ackFrameAfter(if (chrome.gpuActive) 8 else 33)
                 }
             }
         }

@@ -10,6 +10,9 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.getValue
 import androidx.compose.ui.Modifier
 import com.nuvio.app.features.player.AudioTrack
 import com.nuvio.app.features.player.PlayerEngineController
@@ -148,9 +151,24 @@ internal fun WaylandPlayerSurface(
     }
 
     // The chrome's play/pause flows through shouldPlay -> playWhenReady, not
-    // through a controller call -- same as stock's NativePlayerSurface, which
-    // drives the engine from exactly this effect.
-    LaunchedEffect(playWhenReady) {
+    // through a controller call -- same as stock, which drives the engine
+    // from exactly this effect.
+    //
+    // Gated like upstream's `if (!sourceAvailable) return@LaunchedEffect`:
+    // the runtime computes playWhenReady as `shouldPlay && currentSource !=
+    // null`, so it also goes false while a source is being switched, with
+    // the surface still composed against the retained one. Acting on that
+    // paused the new file the moment it opened ("sometimes the video starts
+    // paused"). Only the first composition for a given source is skipped;
+    // real pause/play transitions after it still apply.
+    LaunchedEffect(sourceUrl, playWhenReady) {
+        // A false here can mean "user paused" OR "source momentarily
+        // unavailable", because the runtime computes playWhenReady as
+        // `shouldPlay && currentSource != null`. Upstream keeps those
+        // separate and returns early when the source is not available; the
+        // equivalent state here is the host still opening the file, and
+        // acting on it paused the stream ~200ms after it started.
+        if (!playWhenReady && bridge.isOpening()) return@LaunchedEffect
         if (playWhenReady) bridge.play() else bridge.pause()
     }
 

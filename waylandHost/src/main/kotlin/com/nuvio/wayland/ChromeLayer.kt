@@ -99,8 +99,17 @@ class ChromeLayer(private val chrome: WpeChrome) {
      * when acked, so this is what paces it. 30fps matches the SHM path's long
      * standing throttle; the GPU path can afford more, hence the lever.
      */
-    private val ackDelayMs: Int =
-        1000 / (System.getProperty("nuvio.wayland.chromeFps")?.toIntOrNull() ?: 30)
+    private val ackDelayMs: Int by lazy {
+        // The 30fps cap dates from the SHM path, where a frame cost 4-12ms of
+        // CPU raster plus ~220MB/s of copying. On the GPU path a frame costs
+        // ~0.1ms and copies nothing, so the cap is pure input latency: the
+        // page was measured running at 15-21fps while visible, which is what
+        // makes hover and scrubbing feel laggy. Let it run at display rate
+        // there; keep the old cap for SHM.
+        val fps = System.getProperty("nuvio.wayland.chromeFps")?.toIntOrNull()
+            ?: if (chrome.gpuActive) 120 else 30
+        (1000 / fps).coerceAtLeast(1)
+    }
 
     /**
      * Whether the sampled texture has to be flipped vertically when drawn.

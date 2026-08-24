@@ -73,6 +73,14 @@ object WaylandVideoBridge {
         fun snapshot(): State
 
         /**
+         * True while a file is opening and no frame of it has been shown.
+         * Upstream gates play/pause on a separate `sourceAvailable` flag;
+         * this fork folds availability into playWhenReady, which therefore
+         * flips false mid-open and pauses the file that is starting.
+         */
+        fun isOpening(): Boolean = false
+
+        /**
          * Report where the video surface sits, in scene (framebuffer) pixels.
          * Called from layout whenever the surface's bounds change; the host
          * renders and composites the video into exactly this rectangle.

@@ -100,10 +100,24 @@ class WaylandVideoHost(
      */
     @Volatile private var lastCompositeNs = 0L
 
+    /** True from START_FILE until the new file's first frame is published. */
+    @Volatile private var awaitingFirstFrame = false
+    @Volatile private var restartSeen = false
+
     fun compositeVideo(canvas: Canvas) {
         if (!hasFile) return
         if (rectWidth <= 0f || rectHeight <= 0f) return
         val frame = pipeline.acquireFrame() ?: return
+        // Across a file change the pipeline still holds the OUTGOING file's
+        // last frame, and drawing it flashes the previous stream before the
+        // new one appears. PLAYBACK_RESTART alone is not enough -- the core
+        // resumes before the pipeline publishes -- so wait for a freshly
+        // published frame as well. One acquire only: a second one would
+        // report fresh=false and skip the cache invalidation below.
+        if (awaitingFirstFrame) {
+            if (!restartSeen || !frame.fresh) return
+            awaitingFirstFrame = false
+        }
         lastCompositeNs = System.nanoTime()
 
         val wrapper = wrappers.getOrPut(frame.generation) {
@@ -237,6 +251,12 @@ class WaylandVideoHost(
 
     /** Re-deliver pending state; called when the page reports controlsReady. */
     fun flushControlsToChrome() {
+        traceSession("push controls json (isLoading=${isLoadingNow()})")
+        // Only a LIVE session consumes the page. The warm-up flush that
+        // follows a reload (controlsReady with no file open) must leave it
+        // pristine, or the next open() sees a used page, reloads again, and
+        // that reload gap is a black flash before the opening overlay.
+        if (hasFile) chrome?.markPageUsed()
         lastControlsJson?.let { pushControlsJson(it) }
     }
 
@@ -250,6 +270,48 @@ class WaylandVideoHost(
     private var updatePushes = 0L
     private var cachedTracksJson: String = "[],"
     private var tracksRefreshedAtNs = 0L
+
+    /**
+     * Is playback still loading, i.e. should the page keep its opening
+     * overlay up and its controls hidden?
+     *
+     * Frames on glass are the ground truth, not mpv's flags: `seeking` stays
+     * up through the initial start-position seek for a second or so after
+     * playback is visibly running (which used to leave the overlay over live
+     * video), and before the first frame `duration` is not known yet. Both
+     * the Compose snapshot and the page's periodic update read this, so the
+     * two can never disagree -- they did, and the page (told "not loading"
+     * before any frame existed) dismissed its overlay and showed the
+     * controls before the video appeared.
+     */
+    /**
+     * Upstream's rawLoadingWithPaused (macos/player_bridge.mm), copied:
+     *
+     *   !fileReady || (core-idle && !paused && !eof) || paused-for-cache
+     *
+     * `core-idle` (the core is producing no frames) is the load-bearing
+     * property -- not `idle-active` -- and `fileReady` is duration OR a
+     * track list, so the whole file-open phase reports loading and the
+     * page keeps its opening overlay up instead of revealing black.
+     */
+    private fun isLoadingNow(): Boolean {
+        // Upstream's playerLoading(): `!firstFrameShown || computeLoading()`.
+        // The latch keeps the opening overlay up for the WHOLE open --
+        // through mpv's flag flicker and the resume seek -- because the page
+        // dismisses that overlay the first time isLoading goes false and
+        // never brings it back. awaitingFirstFrame is our firstFrameShown,
+        // inverted: it clears when a frame of this file is actually drawn.
+        if (awaitingFirstFrame) return true
+        val paused = mpv.cachedBoolean("pause") ?: false
+        val eof = mpv.cachedBoolean("eof-reached") ?: false
+        // Fallback YES, as upstream: unknown means the core is not running.
+        val coreIdle = mpv.cachedBoolean("core-idle") ?: true
+        val bufferingCache = mpv.cachedBoolean("paused-for-cache") ?: false
+        val duration = mpv.cachedDouble("duration") ?: 0.0
+        val trackCount = mpv.cachedString("track-list")?.let { topLevelObjects(it).size } ?: 0
+        val fileReady = duration > 0.0 || trackCount > 0
+        return !fileReady || (coreIdle && !paused && !eof) || bufferingCache
+    }
 
     /** Pause/buffer state from the observed cache -- never a core poll. */
     fun isPausedOrLoading(): Boolean =
@@ -268,8 +330,7 @@ class WaylandVideoHost(
         val duration = mpv.cachedDouble("duration") ?: 0.0
         val position = mpv.cachedDouble("time-pos") ?: 0.0
         val paused = mpv.cachedBoolean("pause") ?: false
-        val loading = (mpv.cachedBoolean("paused-for-cache") ?: false) ||
-            (mpv.cachedBoolean("seeking") ?: false)
+        val loading = isLoadingNow()
         val (audio, subs) = cachedTracksJson.split("],[").let {
             if (it.size == 2) Pair(it[0] + "]", "[" + it[1]) else Pair("[]", "[]")
         }
@@ -310,6 +371,12 @@ class WaylandVideoHost(
     /** For the demo path, where the file is loaded directly rather than via open(). */
     fun markLoaded() { hasFile = true }
 
+    init {
+        mpv.onStartFile = { awaitingFirstFrame = true; restartSeen = false }
+        mpv.onPlaybackRestart = { restartSeen = true }
+    }
+
+
     override fun open(
         url: String,
         headers: List<String>,
@@ -334,6 +401,8 @@ class WaylandVideoHost(
         } else {
             mpv.command("change-list", "audio-files", "clr", "")
         }
+        sessionStartNs = System.nanoTime()
+        traceSession("open(playWhenReady=$playWhenReady)")
         mpv.setProperty("pause", if (playWhenReady) "no" else "yes")
         if (startPositionMs > 0) {
             mpv.setProperty("start", (startPositionMs / 1000.0).toString())
@@ -348,10 +417,21 @@ class WaylandVideoHost(
             )
         }
         hasFile = true
+        // Source switches can open a new file without a stop() in between.
+        chrome?.let { if (!it.pageFresh) it.reloadPage() }
     }
 
-    override fun play() = mpv.setProperty("pause", "no")
-    override fun pause() = mpv.setProperty("pause", "yes")
+    private fun traceSession(what: String) {
+        if (System.getProperty("nuvio.wayland.videoLog")?.toBoolean() == true) {
+            println("[session] +%.2fs %s (hasFile=%s awaitingFirstFrame=%s loading=%s)"
+                .format((System.nanoTime() - sessionStartNs) / 1e9, what,
+                    hasFile, awaitingFirstFrame, isLoadingNow()))
+        }
+    }
+    @Volatile private var sessionStartNs = System.nanoTime()
+
+    override fun play() { traceSession("play()"); mpv.setProperty("pause", "no") }
+    override fun pause() { traceSession("pause()"); mpv.setProperty("pause", "yes") }
     override fun setSpeed(speed: Float) = mpv.setProperty("speed", speed.toString())
     override fun setMuted(muted: Boolean) = mpv.setProperty("mute", if (muted) "yes" else "no")
 
@@ -578,7 +658,14 @@ class WaylandVideoHost(
     override fun stop() {
         hasFile = false
         mpv.command("stop")
+        // Upstream destroys the player's web view here and builds a new one
+        // for the next session; reloading is the same thing for page state,
+        // and doing it now (nothing is on screen) means the next session
+        // finds the page already loaded -- upstream's warmup trick.
+        chrome?.reloadPage()
     }
+
+    override fun isOpening(): Boolean = awaitingFirstFrame
 
     override fun snapshot(): WaylandVideoBridge.Delegate.State {
         if (!hasFile) return WaylandVideoBridge.Delegate.State()
@@ -591,23 +678,16 @@ class WaylandVideoHost(
         // demuxer-cache-time is an absolute timestamp, not a length, which is
         // exactly what a buffered *position* wants.
         val buffered = mpv.cachedDouble("demuxer-cache-time") ?: position
+        // Only what this function still needs: the loading/buffering reads
+        // live in isLoadingNow(), which both this and the page's update call.
         val paused = mpv.cachedBoolean("pause") ?: false
         val idle = mpv.cachedBoolean("idle-active") ?: false
-        val seeking = mpv.cachedBoolean("seeking") ?: false
-        val bufferingProperty = mpv.cachedBoolean("paused-for-cache") ?: false
-
-        // Frames on glass are the ground truth for "loading": mpv's seeking
-        // flag stays up through the initial start-position seek for a second
-        // or so after playback is visibly running, which kept the loading
-        // overlay over live video.
-        val presenting = (System.nanoTime() - lastCompositeNs) < 300_000_000L
         return WaylandVideoBridge.Delegate.State(
             positionMs = (position * 1000).toLong(),
             durationMs = (duration * 1000).toLong(),
             bufferedMs = (buffered * 1000).toLong(),
             isPlaying = !paused && !idle,
-            isBuffering = bufferingProperty ||
-                ((seeking || (duration <= 0.0 && !idle)) && !presenting),
+            isBuffering = isLoadingNow(),
             hasEnded = mpv.cachedBoolean("eof-reached") ?: false,
             // The speed cycler and its label both read this back; without it
             // they see 1x forever and cycling sticks at the first step.
@@ -621,7 +701,7 @@ class WaylandVideoHost(
         val OBSERVED_PROPERTIES = listOf(
             "time-pos", "duration", "demuxer-cache-time", "pause",
             "idle-active", "seeking", "paused-for-cache", "eof-reached",
-            "speed", "volume", "mute",
+            "speed", "volume", "mute", "core-idle",
             // As STRING this arrives as the full JSON blob -- pushed by the
             // core only when tracks actually change, never polled.
             "track-list",
