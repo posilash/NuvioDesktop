@@ -99,6 +99,23 @@ class UiPipeline(
     /** Called (from this thread) after each publish; wired to wake the host loop. */
     @Volatile var onFrame: (() -> Unit)? = null
 
+    /**
+     * The web chrome, composited over the scene into the same published
+     * texture. Owned by this thread once set. Keeping it here rather than on
+     * the presenting thread is the point of the GPU chrome path: the present
+     * loop keeps drawing exactly one UI quad no matter what the chrome costs.
+     */
+    @Volatile var overlay: ChromeLayer? = null
+
+    /** Set when WPE has exported a frame; the analogue of [framePending]. */
+    @Volatile private var overlayDirty = false
+
+    /** Wake this thread for a chrome frame (called from the GLib thread). */
+    fun requestOverlayFrame() {
+        overlayDirty = true
+        thread?.let { LockSupport.unpark(it) }
+    }
+
     // Telemetry, read by report(). This is where scene cost is now reported --
     // it no longer exists anywhere on the present path.
     @Volatile private var renders = 0L
@@ -236,8 +253,9 @@ class UiPipeline(
             System.err.println("[wayland-ui] UI thread died")
             t.printStackTrace()
         } finally {
-            // Everything Skia and Compose owns here must die on this thread,
-            // with this context current.
+            // Everything Skia, Compose and GL owns here must die on this
+            // thread, with this context current.
+            runCatching { overlay?.close() }.onFailure { it.printStackTrace() }
             runCatching { scene.close() }.onFailure { it.printStackTrace() }
             synchronized(lock) {
                 if (frontFence != 0L) { GL32.glDeleteSync(frontFence); frontFence = 0L }
@@ -254,9 +272,10 @@ class UiPipeline(
             drainTasks()
             if (!running) return
 
-            if (!framePending) {
-                // Parked until an invalidation, a resize or posted work. The
-                // timeout is only a shutdown/robustness backstop.
+            if (!framePending && !overlayDirty) {
+                // Parked until an invalidation, a chrome frame, a resize or
+                // posted work. The timeout is only a shutdown/robustness
+                // backstop.
                 LockSupport.parkNanos(100_000_000L)
                 continue
             }
@@ -274,7 +293,22 @@ class UiPipeline(
             // Cleared BEFORE rendering: invalidations raised during the render
             // (Compose's frame clock resumes animations inside render()) must
             // re-arm it rather than be swallowed.
+            val sceneWanted = framePending
             framePending = false
+
+            // Adopt a waiting chrome frame. This is GL work against the
+            // exported EGLImage (or a texture upload on the SHM path), so it
+            // has to happen here, on the thread that owns the context -- never
+            // on the presenting thread, which is the whole point.
+            val overlayChanged = if (overlayDirty) {
+                overlayDirty = false
+                overlay?.update() ?: false
+            } else {
+                false
+            }
+
+            // Woken for nothing that changed a pixel.
+            if (!sceneWanted && !overlayChanged && !sizeDirty) continue
 
             if (sizeDirty) {
                 sizeDirty = false
@@ -318,6 +352,19 @@ class UiPipeline(
             renders++
             renderNanos += elapsed
             if (elapsed > maxRenderNanos) maxRenderNanos = elapsed
+
+            // The chrome goes on top, into the same buffer, as one textured
+            // quad. Raw GL is deliberate: Skia treats a wrapped render target
+            // as opaque, which would turn the chrome into a black sheet over
+            // the video, and this way the premultiplied source-over blend is
+            // stated outright. Skia's cached GL state is invalidated straight
+            // after, since this all happened behind its back.
+            overlay?.let { o ->
+                GL30.glBindFramebuffer(GL30.GL_FRAMEBUFFER, buf.fbo)
+                o.draw(w, h)
+                GL30.glBindFramebuffer(GL30.GL_FRAMEBUFFER, 0)
+                context.resetGLAll()
+            }
 
             val fence = GL32.glFenceSync(GL32.GL_SYNC_GPU_COMMANDS_COMPLETE, 0)
             // The fence must reach the GPU before another context waits on it.

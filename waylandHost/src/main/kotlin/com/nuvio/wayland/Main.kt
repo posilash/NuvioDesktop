@@ -44,8 +44,12 @@ import androidx.compose.ui.scene.ComposeScene
 import androidx.compose.ui.scene.CanvasLayersComposeScene
 import kotlin.system.exitProcess
 
-private const val INITIAL_WIDTH = 1280
-private const val INITIAL_HEIGHT = 800
+// Overridable so chrome cost can be measured against pixel area by launching
+// at different sizes, rather than by resizing the user's live window.
+private val INITIAL_WIDTH =
+    System.getProperty("nuvio.wayland.winW")?.toIntOrNull() ?: 1280
+private val INITIAL_HEIGHT =
+    System.getProperty("nuvio.wayland.winH")?.toIntOrNull() ?: 800
 
 /** The user's real mpv.conf: $XDG_CONFIG_HOME/mpv, ~/.config/mpv, ~/.mpv. */
 private fun userMpvConfPath(): String? {
@@ -567,8 +571,26 @@ fun main() {
     // controls page and count exported frames. Compositing and input arrive
     // in later stages; this proves the engine half.
     var wpeChrome: com.nuvio.wayland.wpe.WpeChrome? = null
+    var chromeLayer: ChromeLayer? = null
+    // Legacy in-loop consumer only (uiThread=false): with the UI thread the
+    // chrome is a texture composited there, and this stays null.
     var chromeImage: org.jetbrains.skia.Image? = null
     var chromeShown = true
+    // Zero-copy GPU chrome: WebKit renders on the GPU and the exported
+    // EGLImage is imported as a texture on the UI thread, so no chrome frame
+    // is ever copied and the per-frame CPU cost stops scaling with area.
+    // false selects the software SHM path, kept for A/B.
+    val chromeGpuRequested = System.getProperty("nuvio.wayland.chromeGpu")?.toBoolean() ?: true
+    // Defeats the activity gate so chrome cost can be measured against rolling
+    // video. Diagnostic only; the gate's real semantics are untouched.
+    val chromeAlwaysOn = System.getProperty("nuvio.wayland.chromeAlwaysOn")?.toBoolean() ?: false
+    // Multiplies the chrome's device scale factor, so WebKit rasters and
+    // exports a LARGER buffer while the window stays exactly where it is.
+    // Purely a measurement lever: under a tiling compositor the window size
+    // is not ours to choose, and driving the compositor to get one is off
+    // limits, but chrome cost has to be shown against pixel area somehow.
+    val chromeScaleMul =
+        System.getProperty("nuvio.wayland.chromeScaleMul")?.toFloatOrNull() ?: 1f
     // Nanotime until which the chrome layer is considered active. The linux
     // branch's rule, copied: composite only while loading/paused/interacting
     // (plus fade grace) -- "normal watching pays nothing".
@@ -584,6 +606,10 @@ fun main() {
         wpeChrome = com.nuvio.wayland.wpe.WpeChrome(
             width = INITIAL_WIDTH,
             height = INITIAL_HEIGHT,
+            // The GPU path needs a GL context to import the exported EGLImage
+            // into, and that context is the UI thread's. On the legacy in-loop
+            // path there is no such thread, so WPE stays on SHM.
+            allowGpu = chromeGpuRequested && uiPipeline != null,
             onMessage = { json ->
                 // {type,value} in either field order; value optional.
                 val type = Regex("\u0022type\u0022[ \t]*:[ \t]*\u0022([^\u0022]*)\u0022")
@@ -615,6 +641,24 @@ fun main() {
             chrome.start(pageOverride ?: ("file://" + page.path))
         }
         videoHost?.chrome = wpeChrome
+        // Chrome frames are consumed on the UI thread, where the GL context
+        // that can import them lives. The presenting thread is not involved at
+        // all any more -- it just draws whatever texture the UI thread last
+        // published, at a cost that does not depend on the chrome.
+        uiPipeline?.let { p ->
+            val chrome = wpeChrome!!
+            val layer = ChromeLayer(chrome)
+            chromeLayer = layer
+            // Construction is cheap, but every GL object it makes must be born
+            // on the UI thread with its context current.
+            p.post { p.overlay = layer }
+            chrome.onFrame = { p.requestOverlayFrame() }
+        }
+        if (uiPipeline == null) {
+            // Legacy in-loop path: the present loop still adopts SHM frames
+            // itself, so it has to be woken the old way.
+            wpeChrome!!.onFrame = { glfwPostEmptyEvent() }
+        }
         if (runRealAppEarly) {
             com.nuvio.app.features.player.desktop.WaylandVideoBridge.webChromeActive = true
             println("web chrome: ACTIVE (stock controls.html via WPE)")
@@ -741,7 +785,7 @@ fun main() {
                 // set_size -> view.setSize verbatim), so it must be LOGICAL;
                 // the scale factor makes WebKit raster it at logical*scale =
                 // physical, which this scene then draws 1:1.
-                wpeChrome?.dispatchScale(scale)
+                wpeChrome?.dispatchScale(scale * chromeScaleMul)
                 wpeChrome?.dispatchSize(logicalW, logicalH)
             }
         }
@@ -768,6 +812,10 @@ fun main() {
                     val elapsed = (System.nanoTime() - lastUiReportNs) / 1e9
                     lastUiReportNs = System.nanoTime()
                     println("[wayland-video] ${p.report(elapsed)}")
+                    // Chrome cost is reported from the thread that pays it.
+                    // perMpx is the number that matters: it is what used to
+                    // grow with the window and made fullscreen chrome lag.
+                    chromeLayer?.let { l -> println("[wayland-video] ${l.report(elapsed)}") }
                 }
             }
             input.report(System.nanoTime())?.let { println("[wayland-video] $it") }
@@ -796,7 +844,13 @@ fun main() {
             // loop does no chrome work at all. Paused/loading playback is
             // free for mpv, so the chrome runs whenever video is not rolling.
             val playing = videoHost?.hasFile == true && !(videoHost?.isPausedOrLoading() ?: true)
-            val active = !playing || System.nanoTime() < chromeActiveUntilNs.get()
+            // chromeAlwaysOn is a measurement lever, not a behaviour change:
+            // the gate normally hides the chrome seconds into playback, which
+            // is correct but leaves nothing to measure. Holding it visible
+            // over rolling video is the case the user actually complains
+            // about, so it is the case the numbers have to come from.
+            val active = chromeAlwaysOn ||
+                !playing || System.nanoTime() < chromeActiveUntilNs.get()
             val wantChrome = (!runRealApp || videoHost?.hasFile == true) && active
             if (wantChrome != chromeShown) {
                 chromeShown = wantChrome
@@ -804,6 +858,9 @@ fun main() {
                 if (!wantChrome) {
                     chromeImage?.close()
                     chromeImage = null
+                    // The layer's own teardown must happen on its thread.
+                    chromeLayer?.let { l -> uiPipeline?.post { l.clear() } }
+                    uiPipeline?.requestOverlayFrame()
                     chromeChanged = true
                 } else {
                     // On show, WPE may be idle waiting on an ack a hidden
@@ -814,25 +871,32 @@ fun main() {
             // Chrome frames ride this scene, Stremio-style: ONE surface,
             // ONE present stream. (A separate subsurface commit stream made
             // the chrome and the video fight in the compositor whenever
-            // both were animating.) Adoption is pure CPU; the consume-side
-            // ack paces the page to the window's present rate.
-            chrome.takeShmFrame()?.let { frame ->
-                chromeImage?.close()
-                chromeImage = org.jetbrains.skia.Image.makeRaster(
-                    org.jetbrains.skia.ImageInfo(
-                        frame.width, frame.height,
-                        org.jetbrains.skia.ColorType.BGRA_8888,
-                        org.jetbrains.skia.ColorAlphaType.PREMUL,
-                    ),
-                    frame.pixels.let { b -> ByteArray(b.remaining()).also { a -> b.get(a) } },
-                    frame.width * 4,
-                )
-                chromeChanged = true
-                // The delayed ack is the page's frame budget: never faster
-                // than ~30fps, no matter how fast this loop spins. Every
-                // un-throttled ack scheme so far turned into the page
-                // re-rendering at whatever rate the acking thread ran.
-                chrome.ackFrameAfter(33)
+            // both were animating.)
+            //
+            // With the UI thread present, adoption happens THERE -- see
+            // ChromeLayer -- and this loop never touches a chrome frame. What
+            // follows is the legacy in-loop consumer, which pays a full-frame
+            // raster rebuild per frame and is exactly the cost the GPU path
+            // exists to delete.
+            if (uiPipeline == null) {
+                chrome.takeShmFrame()?.let { frame ->
+                    chromeImage?.close()
+                    chromeImage = org.jetbrains.skia.Image.makeRaster(
+                        org.jetbrains.skia.ImageInfo(
+                            frame.width, frame.height,
+                            org.jetbrains.skia.ColorType.BGRA_8888,
+                            org.jetbrains.skia.ColorAlphaType.PREMUL,
+                        ),
+                        frame.pixels.let { b -> ByteArray(b.remaining()).also { a -> b.get(a) } },
+                        frame.width * 4,
+                    )
+                    chromeChanged = true
+                    // The delayed ack is the page's frame budget: never faster
+                    // than ~30fps, no matter how fast this loop spins. Every
+                    // un-throttled ack scheme so far turned into the page
+                    // re-rendering at whatever rate the acking thread ran.
+                    chrome.ackFrameAfter(33)
+                }
             }
         }
         // With threaded rasterization this thread never asks the scene
@@ -932,8 +996,14 @@ fun main() {
         // composites with proper premultiplied alpha (its opaque-surface
         // rule only applies to wrapped render targets). The buffer is
         // already physical resolution, so this is a crisp 1:1 blit.
+        // Legacy path only -- with the UI thread the chrome is already inside
+        // the texture drawn just above.
         chromeImage?.let { s.canvas.drawImage(it, 0f, 0f) }
 
+        // The presenting thread's whole variable cost, in one number: video
+        // quad + UI quad (+ legacy chrome). This is the figure that must stay
+        // flat as the window grows.
+        timings.add("composite", System.nanoTime() - t)
 
         t = System.nanoTime()
         context.flush()
@@ -1059,7 +1129,7 @@ fun main() {
         glfwGetFramebufferSize(window, fw, fh)
         if (ww[0] > 0) {
             // Logical size + scale factor: see the resize handler.
-            wpeChrome?.dispatchScale(currentScale())
+            wpeChrome?.dispatchScale(currentScale() * chromeScaleMul)
             wpeChrome?.dispatchSize(ww[0], wh[0])
         }
     }

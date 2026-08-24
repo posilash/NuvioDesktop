@@ -35,3 +35,10 @@ PERFORMANCE_FINDINGS.md
 
 # Local MPVKit iOS build environment (sparse APFS image, see MPVKit docs)
 .mpvkit-build.sparseimage
+
+# JVM crash dumps. A batch of these was committed and removed once already;
+# the wayland host runs against native libmpv/WebKit, so they turn up whenever
+# a native thread faults during teardown.
+hs_err_pid*.log
+replay_pid*.log
+core.[0-9]*

@@ -93,6 +93,12 @@ application {
         for (k in listOf(
             "media", "libmpv", "hwdec", "realApp", "probe", "videoLog",
             "smokePlayer", "demoFrames", "uiScale", "resizeTest", "subTest", "mpvExtra", "webChrome", "chromePage", "chromeProbe", "chromeBgRed", "chromeNoBlit", "chromeInitOnly", "vk", "paced", "sceneHoldMs", "noPlayerUi", "sampled", "uiThread", "uiFps",
+            // Zero-copy GPU chrome and its levers.
+            "chromeGpu", "chromeFps", "chromeSoftware", "chromeFlipGpu", "chromeFlipShm",
+            "chromeAlwaysOn", "chromeScaleMul",
+            // Test lever: the window size the host asks for, so chrome cost
+            // can be measured against pixel area without touching the compositor.
+            "winW", "winH",
         )) {
             providers.gradleProperty("nuvio.wayland.$k").orNull
                 ?.let { add("-Dnuvio.wayland.$k=$it") }
@@ -115,14 +121,9 @@ tasks.register<JavaExec>("vkSmoke") {
     }
 }
 
-// NVIDIA's DMABUF path exports the web chrome with destroyed alpha (the same
-// degradation the stock bridge documents); disabling it makes the WPE web
-// process hand over SHM buffers whose alpha is correct.
-tasks.named<JavaExec>("run") {
-    // Full software WebKit, same as upstream's linux branch (its
-    // player_bridge.cpp documents why: the DMABUF/GPU paths yield chrome
-    // frames with degraded or fully opaque alpha on NVIDIA). Cost is
-    // controlled by the host's activity gate, not by the renderer.
-    environment("WEBKIT_DISABLE_DMABUF_RENDERER", "1")
-    environment("WEBKIT_DISABLE_COMPOSITING_MODE", "1")
-}
+// WEBKIT_DISABLE_DMABUF_RENDERER / WEBKIT_DISABLE_COMPOSITING_MODE used to be
+// set here, unconditionally, which forced the web process to rasterize every
+// chrome frame on the CPU at full window size -- fine in a window, the cause of
+// the fullscreen lag. They now belong to the SHM path alone and are set from
+// Kotlin (WpeChrome.init) only when that path is selected, still before any web
+// process spawns. The GPU path wants neither.
