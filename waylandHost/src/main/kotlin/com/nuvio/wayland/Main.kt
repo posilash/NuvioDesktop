@@ -237,7 +237,11 @@ fun main() {
         // reason, and with the usage-bit and lifetime fixes it measures
         // 1.4-1.9ms renders with zero-copy nvdec. -Pnuvio.wayland.vk=false
         // selects the GL sample-at-present pipeline for A/B.
-        val useVk = System.getProperty("nuvio.wayland.vk")?.toBoolean() != false
+        // GL by default. Vulkan renders mpv fine (and gets zero-copy nvdec
+        // from the fork), but it can only reach a GL/Skia window through an
+        // interop handoff whose corruption showed up as flicker -- opt in
+        // with -Pnuvio.wayland.vk=true when working on that path.
+        val useVk = System.getProperty("nuvio.wayland.vk")?.toBoolean() == true
         pipeline = when {
             useVk ->
                 // mpv renders with Vulkan -- the API the user's reference
@@ -247,11 +251,12 @@ fun main() {
             Mpv.pacedMode ->
                 // The blocking-paced model needs its own thread.
                 VideoPipeline(mpv!!, videoWindow)
-            System.getProperty("nuvio.wayland.sampled")?.toBoolean() != false ->
-                // Free-run GL: Stremio's model exactly -- render at present
-                // time on the presenting thread. (Known issue: black scene
-                // in the real app -- Skia/mpv shared-context interop -- use
-                // -Pnuvio.wayland.sampled=false for the threaded pipeline.)
+            System.getProperty("nuvio.wayland.sampled")?.toBoolean() == true ->
+                // Free-run GL, rendering at present time on the presenting
+                // thread (Stremio's literal model). Opt-in only: it black
+                // -screens the real app -- a Skia/mpv shared-context interop
+                // problem that is still open. The threaded pipeline below is
+                // the default.
                 EdtSampledPipeline(mpv!!)
             else ->
                 // Threaded free-run GL: this morning's verified-on-screen
@@ -595,7 +600,11 @@ fun main() {
     // branch's rule, copied: composite only while loading/paused/interacting
     // (plus fade grace) -- "normal watching pays nothing".
     val chromeActiveUntilNs = java.util.concurrent.atomic.AtomicLong(Long.MAX_VALUE)
-    if (System.getProperty("nuvio.wayland.webChrome")?.toBoolean() == true) {
+    // The stock web chrome is the player UI: it renders on the GPU, costs
+    // ~0.09ms a frame regardless of window size, and leaves Compose with
+    // nothing to draw during playback. -Pnuvio.wayland.webChrome=false falls
+    // back to Compose-drawn controls.
+    if (System.getProperty("nuvio.wayland.webChrome")?.toBoolean() != false) {
         // Resolve the page against the repo root regardless of working dir.
         val page = sequenceOf(
             java.io.File("composeApp/src/desktopMain/resources/player-ui/controls.html"),
