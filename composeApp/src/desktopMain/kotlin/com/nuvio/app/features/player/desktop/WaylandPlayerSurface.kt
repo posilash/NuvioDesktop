@@ -40,6 +40,7 @@ internal fun WaylandPlayerSurface(
     initialPositionMs: Long,
     initialPositionRequestKey: String?,
     playerControlsState: com.nuvio.app.features.player.PlayerControlsState,
+    onPlayerControlsAction: (com.nuvio.app.features.player.PlayerControlsAction) -> Boolean,
     onPlayerControlsEvent: (String, Double) -> Boolean,
     onPlayerControlsScrubChange: (Long) -> Boolean,
     onPlayerControlsScrubFinished: (Long) -> Boolean,
@@ -146,12 +147,25 @@ internal fun WaylandPlayerSurface(
         bridge.setResizeMode(resizeMode)
     }
 
+    // The chrome's play/pause flows through shouldPlay -> playWhenReady, not
+    // through a controller call -- same as stock's NativePlayerSurface, which
+    // drives the engine from exactly this effect.
+    LaunchedEffect(playWhenReady) {
+        if (playWhenReady) bridge.play() else bridge.pause()
+    }
+
     if (WaylandVideoBridge.webChromeActive) {
         // Stock chrome mode: the page draws the controls; this side feeds it
         // state and routes its events with exactly the stock controller's
         // table (NativePlayerController.handlePlayerEvent).
         val isFullscreen = com.nuvio.app.core.ui.isFullscreenActionActive()
-        LaunchedEffect(playerControlsState, isFullscreen) {
+        // Push only on STRUCTURAL changes, exactly like stock's
+        // NativeControlsStructureKey dedup: position/duration/loading tick
+        // through playerUpdate instead. Re-pushing the whole controls JSON on
+        // every position tick made the page rebuild its DOM once a second --
+        // visible as flicker whenever the sources/episodes panes were open.
+        val structureKey = playerControlsState.nativeControlsStructureKey()
+        LaunchedEffect(structureKey, isFullscreen) {
             bridge.pushControlsJson(playerControlsState.toControlsJson(isFullscreen))
         }
         DisposableEffect(Unit) {
@@ -174,7 +188,19 @@ internal fun WaylandPlayerSurface(
                         bridge.setVolumeFraction(
                             (if (value > 1.0) value / 100.0 else value).toFloat(),
                         )
-                    else -> onPlayerControlsEvent(type, value)
+                    else -> {
+                        // Stock's full chain (handlePlayerEvent): the raw
+                        // event first, then the PlayerControlsAction mapping,
+                        // then the engine-level fallback. Routing only the
+                        // first leg silently dropped every action-mapped
+                        // button on the chrome (play/pause, skip, panes...).
+                        if (!onPlayerControlsEvent(type, value)) {
+                            val action = type.toPlayerControlsAction()
+                            if (action != null && !onPlayerControlsAction(action)) {
+                                handleWaylandFallbackAction(action, bridge)
+                            }
+                        }
+                    }
                 }
             }
             onDispose { WaylandVideoBridge.onChromeEvent = null }
@@ -262,4 +288,40 @@ private class WaylandPlayerController(
     // loads; the app's style panel is not mapped onto it.
     override fun applySubtitleStyle(style: SubtitleStyleState, useLibass: Boolean) {}
     override fun setSubtitleDelayMs(delayMs: Int) = bridge.setSubtitleDelayMs(delayMs)
+}
+
+/**
+ * Stock handleFallbackAction, expressed against the Wayland bridge: the
+ * last-resort behaviours the engine owes the chrome when neither the screen's
+ * event handler nor its action handler claims an action.
+ */
+private fun handleWaylandFallbackAction(
+    action: com.nuvio.app.features.player.PlayerControlsAction,
+    bridge: WaylandVideoBridge.Delegate,
+) {
+    when (action) {
+        com.nuvio.app.features.player.PlayerControlsAction.TogglePlayback,
+        com.nuvio.app.features.player.PlayerControlsAction.KeyboardTogglePlayback -> {
+            val s = bridge.snapshot()
+            when {
+                s.hasEnded -> {
+                    bridge.seekTo(0L)
+                    bridge.play()
+                }
+                s.isPlaying -> bridge.pause()
+                else -> bridge.play()
+            }
+        }
+        com.nuvio.app.features.player.PlayerControlsAction.SeekBack,
+        com.nuvio.app.features.player.PlayerControlsAction.KeyboardSeekBack ->
+            bridge.seekBy(-10_000L)
+        com.nuvio.app.features.player.PlayerControlsAction.SeekForward,
+        com.nuvio.app.features.player.PlayerControlsAction.KeyboardSeekForward ->
+            bridge.seekBy(10_000L)
+        com.nuvio.app.features.player.PlayerControlsAction.KeyboardVolumeDown ->
+            bridge.setVolumeFraction(((bridge.snapshot().volumeLevel ?: 1f) - 0.05f).coerceIn(0f, 1f))
+        com.nuvio.app.features.player.PlayerControlsAction.KeyboardVolumeUp ->
+            bridge.setVolumeFraction(((bridge.snapshot().volumeLevel ?: 1f) + 0.05f).coerceIn(0f, 1f))
+        else -> Unit
+    }
 }

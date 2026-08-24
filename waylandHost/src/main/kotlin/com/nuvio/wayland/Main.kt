@@ -44,77 +44,6 @@ import androidx.compose.ui.scene.ComposeScene
 import androidx.compose.ui.scene.CanvasLayersComposeScene
 import kotlin.system.exitProcess
 
-private var chromeWrapper: Triple<Int, org.jetbrains.skia.BackendRenderTarget, org.jetbrains.skia.Surface>? = null
-private var chromeWrapperW = 0
-private var chromeWrapperH = 0
-
-/**
- * Draw the WPE chrome texture over everything else. Wrapped the same way the
- * video textures are (an FBO of ours around the shared texture, a Skia
- * surface around that); WPE renders premultiplied RGBA, top-row-first.
- */
-private fun drawChromeTexture(
-    wrapper: Triple<Int, org.jetbrains.skia.BackendRenderTarget, org.jetbrains.skia.Surface>?,
-    layer: com.nuvio.wayland.wpe.WpeChromeLayer,
-    canvas: org.jetbrains.skia.Canvas,
-    context: org.jetbrains.skia.DirectContext,
-    width: Int,
-    height: Int,
-): Triple<Int, org.jetbrains.skia.BackendRenderTarget, org.jetbrains.skia.Surface> {
-    var w = wrapper
-    if (w != null && (chromeWrapperW != layer.imageWidth || chromeWrapperH != layer.imageHeight)) {
-        w.third.close(); w.second.close()
-        org.lwjgl.opengl.GL30.glDeleteFramebuffers(w.first)
-        w = null
-    }
-    if (w == null) {
-        val fbo = org.lwjgl.opengl.GL30.glGenFramebuffers()
-        org.lwjgl.opengl.GL30.glBindFramebuffer(org.lwjgl.opengl.GL30.GL_FRAMEBUFFER, fbo)
-        org.lwjgl.opengl.GL30.glFramebufferTexture2D(
-            org.lwjgl.opengl.GL30.GL_FRAMEBUFFER, org.lwjgl.opengl.GL30.GL_COLOR_ATTACHMENT0,
-            org.lwjgl.opengl.GL11.GL_TEXTURE_2D, layer.texture, 0,
-        )
-        org.lwjgl.opengl.GL30.glBindFramebuffer(org.lwjgl.opengl.GL30.GL_FRAMEBUFFER, 0)
-        chromeWrapperW = layer.imageWidth
-        chromeWrapperH = layer.imageHeight
-        val rt = org.jetbrains.skia.BackendRenderTarget.makeGL(
-            chromeWrapperW, chromeWrapperH, 0, 8, fbo,
-            org.jetbrains.skia.FramebufferFormat.GR_GL_RGBA8,
-        )
-        val surface = org.jetbrains.skia.Surface.makeFromBackendRenderTarget(
-            context, rt, org.jetbrains.skia.SurfaceOrigin.TOP_LEFT,
-            org.jetbrains.skia.SurfaceColorFormat.RGBA_8888, org.jetbrains.skia.ColorSpace.sRGB,
-        ) ?: error("could not wrap chrome texture")
-        w = Triple(fbo, rt, surface)
-    }
-    if (System.getProperty("nuvio.wayland.chromeProbe")?.toBoolean() == true) {
-        val px = java.nio.ByteBuffer.allocateDirect(4)
-        org.lwjgl.opengl.GL30.glBindFramebuffer(org.lwjgl.opengl.GL30.GL_READ_FRAMEBUFFER, w.first)
-        org.lwjgl.opengl.GL11.glReadPixels(
-            chromeWrapperW / 2, chromeWrapperH / 2, 1, 1,
-            org.lwjgl.opengl.GL11.GL_RGBA, org.lwjgl.opengl.GL11.GL_UNSIGNED_BYTE, px,
-        )
-        org.lwjgl.opengl.GL30.glBindFramebuffer(org.lwjgl.opengl.GL30.GL_READ_FRAMEBUFFER, 0)
-        println(
-            "[wpe] texel rgba=(%d,%d,%d,%d)".format(
-                px.get(0).toInt() and 0xFF, px.get(1).toInt() and 0xFF,
-                px.get(2).toInt() and 0xFF, px.get(3).toInt() and 0xFF,
-            ),
-        )
-    }
-    w.third.notifyContentWillChange(org.jetbrains.skia.ContentChangeMode.DISCARD)
-    context.resetGL(org.jetbrains.skia.GLBackendState.TEXTURE_BINDING)
-    val snapshot = w.third.makeImageSnapshot()
-    canvas.drawImageRect(
-        snapshot,
-        org.jetbrains.skia.Rect.makeWH(chromeWrapperW.toFloat(), chromeWrapperH.toFloat()),
-        org.jetbrains.skia.Rect.makeWH(width.toFloat(), height.toFloat()),
-        org.jetbrains.skia.SamplingMode.LINEAR, null, true,
-    )
-    snapshot.close()
-    return w
-}
-
 private const val INITIAL_WIDTH = 1280
 private const val INITIAL_HEIGHT = 800
 
@@ -141,6 +70,11 @@ private fun rssMb(): Long = runCatching {
 
 @OptIn(ExperimentalComposeUiApi::class)
 fun main() {
+    // LWJGL's per-thread MemoryStack default (64KB) is captured when the
+    // class first loads -- which happens at glfwInit, so raising it later
+    // (as the Vulkan pipeline needs: VkInstance enumerates ~230 device
+    // extensions on the stack) has no effect. It must be first.
+    org.lwjgl.system.Configuration.STACK_SIZE.set(512)
     GLFWErrorCallback.createPrint(System.err).set()
 
     // Ask for Wayland explicitly rather than letting GLFW autodetect, so that
@@ -211,7 +145,7 @@ fun main() {
     val mpvPath = System.getProperty("nuvio.wayland.libmpv")
     val runRealAppEarly = System.getProperty("nuvio.wayland.realApp")?.toBoolean() ?: false
     var mpv: Mpv? = null
-    var pipeline: VideoPipeline? = null
+    var pipeline: DisplayPipeline? = null
     var videoHost: WaylandVideoHost? = null
     val videoFrameReady = java.util.concurrent.atomic.AtomicBoolean(false)
     if (mediaUrl != null || runRealAppEarly) {
@@ -249,6 +183,25 @@ fun main() {
             setOption("force-window", "no")
             setOption("idle", "yes")
             setOption("save-position-on-quit", "no")
+            // The host presents only when something changed, so when the UI
+            // is static mpv's swap feedback sees frame-rate cadence, not
+            // vsync cadence. Left to estimate the display rate from that,
+            // mpv concluded "display FPS: 12", paced its renders to it, and
+            // locked a death spiral (renders slow -> presents slow -> the
+            // estimate stays low; measured as 14fps presents and hundreds of
+            // dropped frames whenever startup jitter seeded a low estimate).
+            // Tell it the real refresh rate instead.
+            if (Mpv.pacedMode) run {
+                // Only the paced model wants a display-rate hint; in free-run
+                // the core times frames on its own clock, hint-free, exactly
+                // like Stremio's embedding.
+                val mon = glfwGetPrimaryMonitor()
+                val hz = if (mon != NULL) glfwGetVideoMode(mon)?.refreshRate() ?: 0 else 0
+                if (hz > 0) {
+                    setOption("display-fps-override", hz.toString())
+                    println("mpv display-fps-override=$hz")
+                }
+            }
             System.getProperty("nuvio.wayland.hwdec")?.let { setOption("hwdec", it) }
             initialize()
             // Event loop owns the queue; observed properties feed the state
@@ -265,10 +218,53 @@ fun main() {
                 requestLogMessages("v")
             }
         }
-        pipeline = VideoPipeline(mpv!!, videoWindow).apply {
-            onFrame = { videoFrameReady.set(true) }
+        // Vulkan by default -- the user's reference build runs Vulkan for a
+        // reason, and with the usage-bit and lifetime fixes it measures
+        // 1.4-1.9ms renders with zero-copy nvdec. -Pnuvio.wayland.vk=false
+        // selects the GL sample-at-present pipeline for A/B.
+        val useVk = System.getProperty("nuvio.wayland.vk")?.toBoolean() != false
+        pipeline = when {
+            useVk ->
+                // mpv renders with Vulkan -- the API the user's reference
+                // build runs -- with zero-copy nvdec; the scene imports the
+                // exported images into GL. See VkGlDisplayPipeline.
+                VkGlDisplayPipeline(VideoPipelineVk(mpv!!))
+            Mpv.pacedMode ->
+                // The blocking-paced model needs its own thread.
+                VideoPipeline(mpv!!, videoWindow)
+            System.getProperty("nuvio.wayland.sampled")?.toBoolean() != false ->
+                // Free-run GL: Stremio's model exactly -- render at present
+                // time on the presenting thread. (Known issue: black scene
+                // in the real app -- Skia/mpv shared-context interop -- use
+                // -Pnuvio.wayland.sampled=false for the threaded pipeline.)
+                EdtSampledPipeline(mpv!!)
+            else ->
+                // Threaded free-run GL: this morning's verified-on-screen
+                // configuration.
+                VideoPipeline(mpv!!, videoWindow)
+        }
+        val edtSampled = pipeline is EdtSampledPipeline
+        pipeline!!.apply {
+            onFrame = {
+                videoFrameReady.set(true)
+                // The threaded GL pipeline wakes the loop itself; the others
+                // are window-agnostic, so the wake lives here.
+                if (useVk) glfwPostEmptyEvent()
+            }
             probe = System.getProperty("nuvio.wayland.probe")?.toBoolean() ?: false
-            start()
+            if (edtSampled) {
+                // Render context binds to the creating thread's GL context;
+                // for the sampled pipeline that must be the EDT, which owns
+                // the window context. Creation runs mpv/libplacebo GL init
+                // behind Skia's back -- reset, or the scene draws black
+                // from the very first frame.
+                java.awt.EventQueue.invokeAndWait {
+                    start()
+                    context.resetGLAll()
+                }
+            } else {
+                start()
+            }
         }
         // The render context is created on the pipeline's thread; loading a
         // file before it exists makes video-output init fail.
@@ -279,7 +275,11 @@ fun main() {
             println("mpvExtra: $k=$v")
         }
         if (mediaUrl != null) mpv!!.command("loadfile", mediaUrl)
-        println("mpv render context: ${Mpv.MPV_RENDER_API_TYPE_OPENGL_NEXT} (video thread)")
+        println(
+            "mpv render context: " +
+                (if (useVk) Mpv.MPV_RENDER_API_TYPE_VULKAN else Mpv.MPV_RENDER_API_TYPE_OPENGL_NEXT) +
+                " (video thread)",
+        )
         // Hand the app a video sink so its player surface stops reaching
         // for SwingPanel, which needs an AWT-backed scene we do not have.
         videoHost = WaylandVideoHost(mpv!!, pipeline!!, context)
@@ -493,7 +493,12 @@ fun main() {
     // controls page and count exported frames. Compositing and input arrive
     // in later stages; this proves the engine half.
     var wpeChrome: com.nuvio.wayland.wpe.WpeChrome? = null
-    var wpeLayer: com.nuvio.wayland.wpe.WpeChromeLayer? = null
+    var chromeImage: org.jetbrains.skia.Image? = null
+    var chromeShown = true
+    // Nanotime until which the chrome layer is considered active. The linux
+    // branch's rule, copied: composite only while loading/paused/interacting
+    // (plus fade grace) -- "normal watching pays nothing".
+    val chromeActiveUntilNs = java.util.concurrent.atomic.AtomicLong(Long.MAX_VALUE)
     if (System.getProperty("nuvio.wayland.webChrome")?.toBoolean() == true) {
         // Resolve the page against the repo root regardless of working dir.
         val page = sequenceOf(
@@ -503,7 +508,6 @@ fun main() {
             ?: error("controls.html not found from ${java.io.File(".").absolutePath}")
         val pageOverride = System.getProperty("nuvio.wayland.chromePage")
         wpeChrome = com.nuvio.wayland.wpe.WpeChrome(
-            eglDisplay = org.lwjgl.glfw.GLFWNativeEGL.glfwGetEGLDisplay(),
             width = INITIAL_WIDTH,
             height = INITIAL_HEIGHT,
             onMessage = { json ->
@@ -516,6 +520,16 @@ fun main() {
                     if (System.getProperty("nuvio.wayland.videoLog")?.toBoolean() == true) {
                         println("[wpe] event: $type=$value")
                     }
+                    // The linux branch's overlayActive latch, verbatim: the
+                    // page's own signals say when the chrome is on screen.
+                    when (type) {
+                        "keepChromeVisible", "cursorActivity", "toggleChrome",
+                        "controlsReady" ->
+                            chromeActiveUntilNs.set(System.nanoTime() + 5_000_000_000L)
+                        "hideChrome" ->
+                            // Fade grace: the hide animation still needs frames.
+                            chromeActiveUntilNs.set(System.nanoTime() + 600_000_000L)
+                    }
                     if (type == "controlsReady") videoHost?.flushControlsToChrome()
                     java.awt.EventQueue.invokeLater {
                         com.nuvio.app.features.player.desktop.WaylandVideoBridge
@@ -523,8 +537,9 @@ fun main() {
                     }
                 }
             },
-        ).also { it.start(pageOverride ?: ("file://" + page.path)) }
-        wpeLayer = com.nuvio.wayland.wpe.WpeChromeLayer(wpeChrome!!)
+        ).also { chrome ->
+            chrome.start(pageOverride ?: ("file://" + page.path))
+        }
         videoHost?.chrome = wpeChrome
         if (runRealAppEarly) {
             com.nuvio.app.features.player.desktop.WaylandVideoBridge.webChromeActive = true
@@ -536,7 +551,12 @@ fun main() {
     input.install()
     wpeChrome?.let { c ->
         input.chrome = c
-        input.chromeScaleX = 1f // chrome surface matches INITIAL size for now
+        // With a device scale factor the page hit-tests in PHYSICAL pixels
+        // (Cog multiplies surface coords by the output scale the same way);
+        // InputRouter's cursor is already framebuffer pixels, so 1:1. On a
+        // compositor without viewporter the page runs at logical size and
+        // coordinates scale down instead.
+        input.chromeScaleX = 1f
         input.chromeScaleY = 1f
     }
 
@@ -559,6 +579,8 @@ fun main() {
 
     var exitCode = 0
     var lastChromeTickNs = 0L
+    // Diagnostic lever: how long scene rasters are held during playback.
+    val sceneHoldNs = (System.getProperty("nuvio.wayland.sceneHoldMs")?.toLongOrNull() ?: 250L) * 1_000_000L
     val timings = FrameTimings()
 
     // Scheduling state for scene-vs-video contention: the scene may only
@@ -624,7 +646,17 @@ fun main() {
                 val scale = currentScale()
                 input.scale = scale
                 if (scene.density.density != scale) scene.density = Density(scale)
-                wpeChrome?.dispatchSize(width, height)
+                val logicalW = Math.round(width / scale)
+                val logicalH = Math.round(height / scale)
+                if (videoLog) {
+                    println("[chrome-size] fb=${width}x$height logical=${logicalW}x$logicalH scale=$scale")
+                }
+                // set_size IS the CSS layout size (WPEWebViewLegacy:
+                // set_size -> view.setSize verbatim), so it must be LOGICAL;
+                // the scale factor makes WebKit raster it at logical*scale =
+                // physical, which this scene then draws 1:1.
+                wpeChrome?.dispatchScale(scale)
+                wpeChrome?.dispatchSize(logicalW, logicalH)
             }
         }
 
@@ -634,7 +666,7 @@ fun main() {
         if (videoLog) {
             wpeChrome?.let { chrome ->
                 if (frames % 120 == 0) {
-                    println("[wpe] exported=${chrome.framesExported} imported=${wpeLayer?.framesImported} err=${chrome.lastError}")
+                    println("[wpe] exported=${chrome.framesExported} err=${chrome.lastError}")
                 }
             }
             videoHost?.report(System.nanoTime())?.let {
@@ -655,9 +687,69 @@ fun main() {
         // 24fps there are 40ms of them, and when the UI is heavier than that
         // it is the chrome that degrades, never the video.
         val videoChanged = videoFrameReady.getAndSet(false)
-        val chromePending = wpeChrome?.let { it.framesExported > (wpeLayer?.framesImported ?: 0L) } == true
+        // The chrome takes no part in this loop: it is a compositor-layered
+        // subsurface fed on the GLib thread. Keeping it (and every other
+        // foreign concern) out of this window's GL and present cadence is
+        // what preserves the measured-healthy video path.
+        var chromeChanged = false
+        wpeChrome?.let { chrome ->
+            // Activity gate (linux-branch parity): while video plays with the
+            // chrome hidden, the page is starved down to a trickle and this
+            // loop does no chrome work at all. Paused/loading playback is
+            // free for mpv, so the chrome runs whenever video is not rolling.
+            val playing = videoHost?.hasFile == true && !(videoHost?.isPausedOrLoading() ?: true)
+            val active = !playing || System.nanoTime() < chromeActiveUntilNs.get()
+            val wantChrome = (!runRealApp || videoHost?.hasFile == true) && active
+            if (wantChrome != chromeShown) {
+                chromeShown = wantChrome
+                chrome.visible = wantChrome
+                if (!wantChrome) {
+                    chromeImage?.close()
+                    chromeImage = null
+                    chromeChanged = true
+                } else {
+                    // On show, WPE may be idle waiting on an ack a hidden
+                    // frame swallowed; kick it so the page exports again.
+                    chrome.ackFrame()
+                }
+            }
+            // Chrome frames ride this scene, Stremio-style: ONE surface,
+            // ONE present stream. (A separate subsurface commit stream made
+            // the chrome and the video fight in the compositor whenever
+            // both were animating.) Adoption is pure CPU; the consume-side
+            // ack paces the page to the window's present rate.
+            chrome.takeShmFrame()?.let { frame ->
+                chromeImage?.close()
+                chromeImage = org.jetbrains.skia.Image.makeRaster(
+                    org.jetbrains.skia.ImageInfo(
+                        frame.width, frame.height,
+                        org.jetbrains.skia.ColorType.BGRA_8888,
+                        org.jetbrains.skia.ColorAlphaType.PREMUL,
+                    ),
+                    frame.pixels.let { b -> ByteArray(b.remaining()).also { a -> b.get(a) } },
+                    frame.width * 4,
+                )
+                chromeChanged = true
+                // The delayed ack is the page's frame budget: never faster
+                // than ~30fps, no matter how fast this loop spins. Every
+                // un-throttled ack scheme so far turned into the page
+                // re-rendering at whatever rate the acking thread ran.
+                chrome.ackFrameAfter(33)
+            }
+        }
         val sceneDirty = forceRepaint || scene.hasInvalidations()
-        if (!videoChanged && !sceneDirty && !chromePending) return false
+        // Stremio's presentation model, completed: while video plays, present
+        // EVERY iteration -- vsync-paced by the swap -- and sample mpv's
+        // latest frame. Present-on-arrival exposed the core's frame-delivery
+        // jitter as a visible wobble (frames landing a vsync early/late);
+        // continuous presents give 24-in-165 the steady pulldown a sampling
+        // player is supposed to have. Safe now that free-run mode reports no
+        // swaps to mpv: the old continuous-present experiment spiralled only
+        // because paced mode fed those noisy timestamps back as vsync hints.
+        // Idle (no file, or paused beyond a grace) stays demand-driven.
+        val videoRolling = videoHost?.hasFile == true &&
+            !(videoHost?.isPausedOrLoading() ?: true) && !Mpv.pacedMode
+        if (!videoChanged && !sceneDirty && !chromeChanged && !videoRolling) return false
 
         // A scene rasterization is uninterruptible once started; at fullscreen
         // it can take 20-50ms, and a video frame arriving mid-raster queues
@@ -666,7 +758,16 @@ fun main() {
         // heavier than the gap between frames, chrome updates degrade and the
         // video cadence stays intact, which is the right way round.
         var t = System.nanoTime()
-        if (sceneDirty && !videoChanged) {
+        // While video rolls in sampling mode, scene rasterizations are the
+        // only variable-cost work left in this loop; each one knocks the
+        // present off its vsync slot -- a once-per-state-tick micro-hiccup
+        // (Stremio never pays this: its scene is constant-cheap because the
+        // web engine's raster work lives out of process). Throttling rasters
+        // to 4/s keeps the sampling grid steady; anything Compose needs to
+        // show still appears within 250ms.
+        val rasterThrottled = videoRolling &&
+            (t - lastSceneRenderNs) < sceneHoldNs
+        if (sceneDirty && !videoChanged && !rasterThrottled) {
             val videoLive = videoHost?.hasFile == true &&
                 lastVideoPresentNs != 0L && (t - lastVideoPresentNs) < 500_000_000L
             // When the scene costs more than a whole frame interval the defer
@@ -693,10 +794,6 @@ fun main() {
             timings.add("scene", System.nanoTime() - t)
         }
 
-        // Chrome frames import on this thread (the GL context owner); a new
-        // frame is a present reason of its own.
-        val chromeChanged = java.awt.EventQueue.isDispatchThread() &&
-            wpeLayer?.importLatest() == true
         // The stock bridge's periodic playback push, off the property cache.
         if (wpeChrome != null && System.nanoTime() - lastChromeTickNs > 300_000_000L) {
             lastChromeTickNs = System.nanoTime()
@@ -706,18 +803,18 @@ fun main() {
         t = System.nanoTime()
         s.canvas.clear(0xFF101014.toInt())
         videoHost?.compositeVideo(s.canvas)
+
         // Surface.draw, not makeImageSnapshot: a snapshot makes the next
         // scene render pay a full-resolution copy-on-write of the UI texture
         // (14MB at 2560x1440), which is what inflated scene costs to tens of
         // milliseconds and dragged the whole chrome down.
         ui.draw(s.canvas, 0, 0, null)
-        wpeLayer?.let { layer ->
-            val chromeWanted = !runRealApp || videoHost?.hasFile == true
-            if (layer.texture != 0 && chromeWanted) {
-                chromeWrapper = drawChromeTexture(chromeWrapper, layer, s.canvas, context, width, height)
-            }
-        }
-        timings.add("composite", System.nanoTime() - t)
+        // Chrome above everything: a raster image draw, which Skia
+        // composites with proper premultiplied alpha (its opaque-surface
+        // rule only applies to wrapped render targets). The buffer is
+        // already physical resolution, so this is a crisp 1:1 blit.
+        chromeImage?.let { s.canvas.drawImage(it, 0f, 0f) }
+
 
         t = System.nanoTime()
         context.flush()
@@ -832,13 +929,20 @@ fun main() {
         return true
     }
 
-    // The chrome view must match the framebuffer from the first frame, not
-    // only after a resize -- a stale 1280x800 view under a differently-sized
-    // window skews every click through the stretch factor.
+    // The chrome view must match the window from the first frame, not only
+    // after a resize -- a stale 1280x800 view under a differently-sized
+    // window skews every click through the stretch factor. Logical size: the
+    // subsurface buffer is 1:1 with surface coordinates.
     run {
+        val ww = IntArray(1); val wh = IntArray(1)
+        glfwGetWindowSize(window, ww, wh)
         val fw = IntArray(1); val fh = IntArray(1)
         glfwGetFramebufferSize(window, fw, fh)
-        if (fw[0] > 0) wpeChrome?.dispatchSize(fw[0], fh[0])
+        if (ww[0] > 0) {
+            // Logical size + scale factor: see the resize handler.
+            wpeChrome?.dispatchScale(currentScale())
+            wpeChrome?.dispatchSize(ww[0], wh[0])
+        }
     }
 
     var presented = true
@@ -881,7 +985,11 @@ fun main() {
             runCatching {
                 java.awt.EventQueue.invokeAndWait { scene.close() }
                 mpv?.quitAndAwaitShutdown()
-                pipeline?.stop()
+                if (pipeline is EdtSampledPipeline) {
+                    java.awt.EventQueue.invokeAndWait { pipeline?.stop() }
+                } else {
+                    pipeline?.stop()
+                }
                 mpv?.close()
                 java.awt.EventQueue.invokeAndWait {
                     surface?.close()
@@ -895,6 +1003,7 @@ fun main() {
         while (!teardownDone.await(10, java.util.concurrent.TimeUnit.MILLISECONDS)) {
             glfwPollEvents()
         }
+        chromeImage?.close()
         glfwDestroyWindow(videoWindow)
         glfwDestroyWindow(window)
         glfwTerminate()

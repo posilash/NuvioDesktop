@@ -71,6 +71,7 @@ actual fun PlatformPlayerSurface(
             initialPositionMs = initialPositionMs ?: 0L,
             initialPositionRequestKey = initialPositionRequestKey,
             playerControlsState = playerControlsState,
+            onPlayerControlsAction = onPlayerControlsAction,
             onPlayerControlsEvent = onPlayerControlsEvent,
             onPlayerControlsScrubChange = onPlayerControlsScrubChange,
             onPlayerControlsScrubFinished = onPlayerControlsScrubFinished,

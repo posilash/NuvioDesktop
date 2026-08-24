@@ -32,7 +32,7 @@ import java.util.concurrent.locks.LockSupport
 class VideoPipeline(
     private val mpv: Mpv,
     private val videoWindow: Long,
-) {
+) : DisplayPipeline {
     class Buffer {
         var texture = 0
         var fbo = 0
@@ -66,15 +66,15 @@ class VideoPipeline(
     @Volatile private var lastGeneration = 0
 
     /** Per-publish diagnostics; costs a readback per frame, so opt-in. */
-    @Volatile var probe = false
+    @Volatile override var probe = false
 
     /** Called (from any thread) after each publish; wired to wake the host loop. */
-    @Volatile var onFrame: (() -> Unit)? = null
+    @Volatile override var onFrame: (() -> Unit)? = null
 
     // Source cadence measured at the publish point, where mpv's own pacing
     // sets it -- present times are downstream and get contaminated by the
     // very stalls a scheduler needs this number to avoid.
-    @Volatile var publishIntervalMs: Double = 41.7
+    @Volatile override var publishIntervalMs: Double = 41.7
         private set
     private var lastPublishNs = 0L
 
@@ -87,7 +87,7 @@ class VideoPipeline(
         lastPublishNs = now
     }
 
-    fun setTargetSize(width: Int, height: Int) {
+    override fun setTargetSize(width: Int, height: Int) {
         if (width == targetWidth && height == targetHeight) return
         targetWidth = width
         targetHeight = height
@@ -96,27 +96,27 @@ class VideoPipeline(
         thread?.let { LockSupport.unpark(it) }
     }
 
-    fun start() {
+    override fun start() {
         thread = Thread({ run() }, "nuvio-video").apply {
             isDaemon = true
             start()
         }
     }
 
-    fun stop() {
+    override fun stop() {
         running = false
         thread?.let { LockSupport.unpark(it) }
         thread?.join(3000)
     }
 
     /** Blocks until the mpv render context exists; loadfile before it fails. */
-    fun awaitReady() {
+    override fun awaitReady() {
         ready.await()
         initError?.let { throw IllegalStateException("video pipeline failed to start", it) }
     }
 
     /** Per-second telemetry line, or null. */
-    fun report(elapsedSeconds: Double): String {
+    override fun report(elapsedSeconds: Double): String {
         val r = renders; renders = 0
         val ns = renderNanos; renderNanos = 0
         val f = renderFails; renderFails = 0
@@ -279,6 +279,14 @@ class VideoPipeline(
      * unchanged. The buffer stays valid until the next call. Null when nothing
      * was ever published.
      */
+    override fun acquireFrame(): DisplayPipeline.Frame? {
+        val f = acquireDisplayFrame() ?: return null
+        return DisplayPipeline.Frame(
+            f.buffer.texture, f.buffer.width, f.buffer.height,
+            f.buffer.generation, f.fresh,
+        )
+    }
+
     fun acquireDisplayFrame(): DisplayFrame? {
         var fence = 0L
         var fresh = false

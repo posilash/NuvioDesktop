@@ -69,6 +69,10 @@ dependencies {
     implementation("org.lwjgl:lwjgl:$lwjglVersion")
     implementation("org.lwjgl:lwjgl-glfw:$lwjglVersion")
     implementation("org.lwjgl:lwjgl-opengl:$lwjglVersion")
+    // No natives-linux artifact exists for lwjgl-vulkan: on Linux it binds the
+    // system libvulkan.so.1 at runtime (the natives jar is macOS-only, for
+    // MoltenVK).
+    implementation("org.lwjgl:lwjgl-vulkan:$lwjglVersion")
     runtimeOnly("org.lwjgl:lwjgl:$lwjglVersion:natives-linux")
     runtimeOnly("org.lwjgl:lwjgl-glfw:$lwjglVersion:natives-linux")
     runtimeOnly("org.lwjgl:lwjgl-opengl:$lwjglVersion:natives-linux")
@@ -88,7 +92,7 @@ application {
         add("--enable-native-access=ALL-UNNAMED")
         for (k in listOf(
             "media", "libmpv", "hwdec", "realApp", "probe", "videoLog",
-            "smokePlayer", "demoFrames", "uiScale", "resizeTest", "subTest", "mpvExtra", "webChrome", "chromePage", "chromeProbe", "chromeBgRed",
+            "smokePlayer", "demoFrames", "uiScale", "resizeTest", "subTest", "mpvExtra", "webChrome", "chromePage", "chromeProbe", "chromeBgRed", "chromeNoBlit", "chromeInitOnly", "vk", "paced", "sceneHoldMs", "sampled",
         )) {
             providers.gradleProperty("nuvio.wayland.$k").orNull
                 ?.let { add("-Dnuvio.wayland.$k=$it") }
@@ -96,9 +100,29 @@ application {
     }
 }
 
+// Headless proof of the Vulkan render path: no window, no GL, no compositor.
+// Verifies the libmpv "vulkan" context, zero-copy nvdec, and that every target
+// image's memory and semaphore export as fds a GL consumer could import.
+tasks.register<JavaExec>("vkSmoke") {
+    group = "verification"
+    description = "Headless libmpv Vulkan render smoke test (VideoPipelineVk)"
+    mainClass = "com.nuvio.wayland.VkSmokeKt"
+    classpath = sourceSets["main"].runtimeClasspath
+    jvmArgs("--enable-native-access=ALL-UNNAMED")
+    for (k in listOf("media", "libmpv", "hwdec", "videoLog")) {
+        providers.gradleProperty("nuvio.wayland.$k").orNull
+            ?.let { systemProperty("nuvio.wayland.$k", it) }
+    }
+}
+
 // NVIDIA's DMABUF path exports the web chrome with destroyed alpha (the same
 // degradation the stock bridge documents); disabling it makes the WPE web
 // process hand over SHM buffers whose alpha is correct.
 tasks.named<JavaExec>("run") {
+    // Full software WebKit, same as upstream's linux branch (its
+    // player_bridge.cpp documents why: the DMABUF/GPU paths yield chrome
+    // frames with degraded or fully opaque alpha on NVIDIA). Cost is
+    // controlled by the host's activity gate, not by the renderer.
     environment("WEBKIT_DISABLE_DMABUF_RENDERER", "1")
+    environment("WEBKIT_DISABLE_COMPOSITING_MODE", "1")
 }

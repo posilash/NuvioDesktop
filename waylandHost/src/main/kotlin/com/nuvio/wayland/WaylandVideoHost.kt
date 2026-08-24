@@ -30,7 +30,7 @@ import org.lwjgl.opengl.GL30
  */
 class WaylandVideoHost(
     private val mpv: Mpv,
-    private val pipeline: VideoPipeline,
+    private val pipeline: DisplayPipeline,
     private val context: DirectContext,
 ) : WaylandVideoBridge.Delegate {
 
@@ -103,20 +103,19 @@ class WaylandVideoHost(
     fun compositeVideo(canvas: Canvas) {
         if (!hasFile) return
         if (rectWidth <= 0f || rectHeight <= 0f) return
-        val frame = pipeline.acquireDisplayFrame() ?: return
+        val frame = pipeline.acquireFrame() ?: return
         lastCompositeNs = System.nanoTime()
-        val buf = frame.buffer
 
-        val wrapper = wrappers.getOrPut(buf.generation) {
+        val wrapper = wrappers.getOrPut(frame.generation) {
             val fbo = GL30.glGenFramebuffers()
             GL30.glBindFramebuffer(GL30.GL_FRAMEBUFFER, fbo)
             GL30.glFramebufferTexture2D(
                 GL30.GL_FRAMEBUFFER, GL30.GL_COLOR_ATTACHMENT0,
-                GL11.GL_TEXTURE_2D, buf.texture, 0,
+                GL11.GL_TEXTURE_2D, frame.texture, 0,
             )
             GL30.glBindFramebuffer(GL30.GL_FRAMEBUFFER, 0)
             val rt = BackendRenderTarget.makeGL(
-                buf.width, buf.height, 0, 8, fbo, FramebufferFormat.GR_GL_RGBA8,
+                frame.width, frame.height, 0, 8, fbo, FramebufferFormat.GR_GL_RGBA8,
             )
             // TOP_LEFT: mpv renders with flip_y=0 into an FBO, leaving the
             // image top-row-first.
@@ -124,12 +123,12 @@ class WaylandVideoHost(
                 context, rt, SurfaceOrigin.TOP_LEFT,
                 SurfaceColorFormat.RGBA_8888, ColorSpace.sRGB,
             ) ?: error("could not wrap video texture for Skia")
-            evictStaleWrappers(keep = buf.generation)
+            evictStaleWrappers(keep = frame.generation)
             // The FBO creation above went through raw GL behind Skia's back;
             // its cached bindings are stale until told. Rare: once per
             // texture generation, i.e. per resize.
             context.resetGLAll()
-            Wrapper(fbo, rt, surface, buf.generation)
+            Wrapper(fbo, rt, surface, frame.generation)
         }
 
         if (pipeline.probe && frame.fresh) {
@@ -138,14 +137,14 @@ class WaylandVideoHost(
             GL30.glBindFramebuffer(GL30.GL_READ_FRAMEBUFFER, wrapper.fbo)
             val px = java.nio.ByteBuffer.allocateDirect(4)
             GL11.glReadPixels(
-                buf.width / 2, buf.height / 2, 1, 1,
+                frame.width / 2, frame.height / 2, 1, 1,
                 GL11.GL_RGBA, GL11.GL_UNSIGNED_BYTE, px,
             )
             GL30.glBindFramebuffer(GL30.GL_READ_FRAMEBUFFER, 0)
             val v = (px.get(0).toInt() and 0xFF shl 16) or
                 (px.get(1).toInt() and 0xFF shl 8) or (px.get(2).toInt() and 0xFF)
             println(
-                "[wayland-video] consume: gen=${buf.generation} tex=${buf.texture} " +
+                "[wayland-video] consume: gen=${frame.generation} tex=${frame.texture} " +
                     "center=%06x".format(v),
             )
         }
@@ -161,20 +160,27 @@ class WaylandVideoHost(
             // another context's writes to a shared texture after re-binding
             // it, which Skia's state tracker would otherwise elide.
             wrapper.surface.notifyContentWillChange(ContentChangeMode.DISCARD)
-            context.resetGL(org.jetbrains.skia.GLBackendState.TEXTURE_BINDING)
+            if (pipeline.rendersOnConsumerThread) {
+                // mpv's whole renderer just ran on this context (sampled
+                // mode): Skia's entire state mirror is fiction. Stremio's
+                // window()->resetOpenGLState() bracket, Skia edition.
+                context.resetGLAll()
+            } else {
+                context.resetGL(org.jetbrains.skia.GLBackendState.TEXTURE_BINDING)
+            }
         }
         // Surface.draw, not a snapshot: snapshots are copy-on-write and cost a
         // full-frame copy whenever content changes -- which for video is every
         // frame. The buffer is rendered at exactly the rect's size, so a 1:1
         // draw at the rect's origin is the general case; a resize is a frame
         // of mismatch at most.
-        if (rectWidth.toInt() == buf.width && rectHeight.toInt() == buf.height) {
+        if (rectWidth.toInt() == frame.width && rectHeight.toInt() == frame.height) {
             wrapper.surface.draw(canvas, rectLeft.toInt(), rectTop.toInt(), null)
         } else {
             val snapshot = wrapper.surface.makeImageSnapshot()
             canvas.drawImageRect(
                 snapshot,
-                Rect.makeWH(buf.width.toFloat(), buf.height.toFloat()),
+                Rect.makeWH(frame.width.toFloat(), frame.height.toFloat()),
                 Rect.makeXYWH(rectLeft, rectTop, rectWidth, rectHeight),
                 SamplingMode.LINEAR,
                 null,
@@ -241,8 +247,15 @@ class WaylandVideoHost(
      * cache (never the core); the track lists are the only core reads, so
      * they are cached and refreshed sparsely.
      */
+    private var updatePushes = 0L
     private var cachedTracksJson: String = "[],"
     private var tracksRefreshedAtNs = 0L
+
+    /** Pause/buffer state from the observed cache -- never a core poll. */
+    fun isPausedOrLoading(): Boolean =
+        (mpv.cachedBoolean("pause") ?: false) ||
+            (mpv.cachedBoolean("paused-for-cache") ?: false) ||
+            (mpv.cachedBoolean("seeking") ?: false)
 
     fun pushPlaybackUpdate() {
         val c = chrome ?: return
@@ -260,10 +273,15 @@ class WaylandVideoHost(
         val (audio, subs) = cachedTracksJson.split("],[").let {
             if (it.size == 2) Pair(it[0] + "]", "[" + it[1]) else Pair("[]", "[]")
         }
-        c.evaluateJs(
+        val script =
             "window.playerUpdate&&window.playerUpdate({duration:%.3f,position:%.3f,paused:%s,loading:%s,audioTracks:%s,subtitleTracks:%s})"
-                .format(duration, position, paused, loading, audio, subs.removeSuffix(",")),
-        )
+                .format(java.util.Locale.ROOT, duration, position, paused, loading, audio, subs.removeSuffix(","))
+        if (updatePushes++ % 10 == 0L &&
+            System.getProperty("nuvio.wayland.videoLog")?.toBoolean() == true
+        ) {
+            println("[wpe] playerUpdate #$updatePushes: ${script.take(140)}")
+        }
+        c.evaluateJs(script)
     }
 
     private fun tracksJson(type: String): String = buildString {
@@ -400,9 +418,15 @@ class WaylandVideoHost(
     }
 
     /**
-     * mpv's track list, read property-by-property (`track-list/N/...`) rather
-     * than parsing the JSON blob. Track ids are mpv ids, which is what the
-     * aid/sid selectors above expect back.
+     * mpv's track list, parsed from the OBSERVED "track-list" JSON in the
+     * property cache. The old shape -- 4-5 getProperty core calls per track,
+     * re-run every 3 seconds on the UI thread -- was a burst of synchronous
+     * core polls during playback, and core polls contend with the pacing
+     * render (the measured 66ms-present-gap trap). A many-track remux made
+     * that burst 50+ calls: a visible playback hitch every 3 seconds, in
+     * every chrome architecture, which is exactly why no amount of chrome
+     * rework ever fixed "the video is laggy". This path costs zero core
+     * calls. Track ids are mpv ids, which is what aid/sid expect back.
      */
     private data class MpvTrack(
         val id: Int,
@@ -413,20 +437,110 @@ class WaylandVideoHost(
     )
 
     private fun tracks(type: String): List<MpvTrack> {
-        val count = mpv.getProperty("track-list/count")?.toIntOrNull() ?: 0
+        val json = mpv.cachedString("track-list") ?: return emptyList()
         val out = ArrayList<MpvTrack>()
-        for (i in 0 until count) {
-            if (mpv.getProperty("track-list/$i/type") != type) continue
-            val id = mpv.getProperty("track-list/$i/id")?.toIntOrNull() ?: continue
+        for (obj in topLevelObjects(json)) {
+            if (jsonField(obj, "type") != type) continue
+            val id = jsonField(obj, "id")?.toIntOrNull() ?: continue
             out += MpvTrack(
                 id = id,
-                title = mpv.getProperty("track-list/$i/title"),
-                language = mpv.getProperty("track-list/$i/lang"),
-                selected = mpv.getProperty("track-list/$i/selected") == "yes",
-                forced = mpv.getProperty("track-list/$i/forced") == "yes",
+                title = jsonField(obj, "title"),
+                language = jsonField(obj, "lang"),
+                selected = jsonField(obj, "selected") == "true",
+                forced = jsonField(obj, "forced") == "true",
             )
         }
         return out
+    }
+
+    /** Split a JSON array into its top-level object substrings. */
+    private fun topLevelObjects(json: String): List<String> {
+        val out = ArrayList<String>()
+        var depth = 0
+        var start = -1
+        var inStr = false
+        var esc = false
+        for (i in json.indices) {
+            val c = json[i]
+            if (inStr) {
+                when {
+                    esc -> esc = false
+                    c == '\\' -> esc = true
+                    c == '"' -> inStr = false
+                }
+                continue
+            }
+            when (c) {
+                '"' -> inStr = true
+                '{' -> { if (depth == 0) start = i; depth++ }
+                '}' -> { depth--; if (depth == 0 && start >= 0) { out.add(json.substring(start, i + 1)); start = -1 } }
+            }
+        }
+        return out
+    }
+
+    /**
+     * A field's value from a flat JSON object: strings unescaped, other
+     * scalars verbatim ("true"/"false"/numbers). Null when absent.
+     */
+    private fun jsonField(obj: String, key: String): String? {
+        val needle = "\"$key\":"
+        var i = -1
+        // Find the needle OUTSIDE of any string value.
+        var inStr = false
+        var esc = false
+        var j = 0
+        while (j < obj.length) {
+            val c = obj[j]
+            if (inStr) {
+                when {
+                    esc -> esc = false
+                    c == '\\' -> esc = true
+                    c == '"' -> inStr = false
+                }
+                j++
+                continue
+            }
+            if (c == '"') {
+                if (obj.startsWith(needle, j)) { i = j + needle.length; break }
+                inStr = true
+            }
+            j++
+        }
+        if (i < 0) return null
+        while (i < obj.length && obj[i] == ' ') i++
+        if (i >= obj.length) return null
+        return if (obj[i] == '"') {
+            val sb = StringBuilder()
+            var k = i + 1
+            while (k < obj.length) {
+                val c = obj[k]
+                if (c == '\\' && k + 1 < obj.length) {
+                    val n = obj[k + 1]
+                    sb.append(
+                        when (n) {
+                            'n' -> '\n'; 't' -> '\t'; 'r' -> '\r'
+                            else -> n
+                        },
+                    )
+                    k += 2
+                } else if (c == '"') {
+                    break
+                } else {
+                    sb.append(c)
+                    k++
+                }
+            }
+            sb.toString()
+        } else {
+            val end = obj.indexOfFirst(i) { it == ',' || it == '}' }
+            obj.substring(i, if (end < 0) obj.length else end).trim()
+        }
+    }
+
+    private inline fun String.indexOfFirst(from: Int, pred: (Char) -> Boolean): Int {
+        for (k in from until length) if (pred(this[k])) return k
+        return -1
     }
 
     private fun MpvTrack.label(fallback: String): String =
@@ -508,6 +622,9 @@ class WaylandVideoHost(
             "time-pos", "duration", "demuxer-cache-time", "pause",
             "idle-active", "seeking", "paused-for-cache", "eof-reached",
             "speed", "volume", "mute",
+            // As STRING this arrives as the full JSON blob -- pushed by the
+            // core only when tracks actually change, never polled.
+            "track-list",
         )
     }
 }

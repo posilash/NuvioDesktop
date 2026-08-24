@@ -143,7 +143,7 @@ class InputRouter(
             send(if (entered) PointerEventType.Enter else PointerEventType.Exit)
         }
 
-        glfwSetKeyCallback(window) { _, key, _, action, mods ->
+        glfwSetKeyCallback(window) { _, key, scancode, action, mods ->
             modifiers = mods.toComposeModifiers()
             val type = when (action) {
                 GLFW_PRESS, GLFW_REPEAT -> KeyEventType.KeyDown
@@ -158,7 +158,12 @@ class InputRouter(
                     if (mods and GLFW_MOD_SHIFT != 0) wm = wm or 2
                     if (mods and GLFW_MOD_ALT != 0) wm = wm or 4
                     if (mods and GLFW_MOD_SUPER != 0) wm = wm or 8
-                    c.dispatchKey(keysym, key, action != GLFW_RELEASE, wm)
+                    // hardware_key_code is what WebKit turns into DOM
+                    // event.code ("Space", "ArrowLeft"...), and it must be an
+                    // XKB keycode = evdev scancode + 8. Passing the GLFW key
+                    // enum here left event.code garbage, which silently
+                    // killed every code-based shortcut in controls.js.
+                    c.dispatchKey(keysym, scancode + 8, action != GLFW_RELEASE, wm)
                 }
             }
             val vk = key.toAwtVirtualKey() ?: return@glfwSetKeyCallback

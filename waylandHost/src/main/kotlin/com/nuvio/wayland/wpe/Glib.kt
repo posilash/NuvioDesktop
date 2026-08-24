@@ -35,6 +35,7 @@ object Glib {
     private val gMainLoopRun by lazy { fn("g_main_loop_run", FunctionDescriptor.ofVoid(ADDRESS)) }
     private val gMainLoopQuit by lazy { fn("g_main_loop_quit", FunctionDescriptor.ofVoid(ADDRESS)) }
     private val gIdleAdd by lazy { fn("g_idle_add", FunctionDescriptor.of(JAVA_INT, ADDRESS, ADDRESS)) }
+    private val gTimeoutAdd by lazy { fn("g_timeout_add", FunctionDescriptor.of(JAVA_INT, JAVA_INT, ADDRESS, ADDRESS)) }
 
     private val queue = ConcurrentLinkedQueue<() -> Unit>()
     private var loop: MemorySegment = MemorySegment.NULL
@@ -48,6 +49,30 @@ object Glib {
             MethodType.methodType(Int::class.java, MemorySegment::class.java),
         )
         linker.upcallStub(target, FunctionDescriptor.of(JAVA_INT, ADDRESS), arena)
+    }
+
+    private val ticks = java.util.concurrent.CopyOnWriteArrayList<() -> Unit>()
+
+    private val tickStub: MemorySegment by lazy {
+        val target = MethodHandles.lookup().findStatic(
+            Glib::class.java, "tick",
+            MethodType.methodType(Int::class.java, MemorySegment::class.java),
+        )
+        linker.upcallStub(target, FunctionDescriptor.of(JAVA_INT, ADDRESS), arena)
+    }
+
+    @JvmStatic
+    fun tick(data: MemorySegment): Int {
+        for (t in ticks) runCatching { t() }.onFailure { it.printStackTrace() }
+        return 1 // G_SOURCE_CONTINUE
+    }
+
+    /** Run [task] on the GLib thread every [intervalMs]. */
+    fun addTick(intervalMs: Int, task: () -> Unit) {
+        ensureStarted()
+        val first = ticks.isEmpty()
+        ticks.add(task)
+        if (first) post { gTimeoutAdd.invokeExact(intervalMs, tickStub, MemorySegment.NULL) as Int; Unit }
     }
 
     @JvmStatic
@@ -70,6 +95,28 @@ object Glib {
                 gMainLoopRun.invokeExact(loop)
             }, "wpe-glib").apply { isDaemon = true; start() }
         }
+    }
+
+    private val delayedQueue = ConcurrentLinkedQueue<() -> Unit>()
+
+    private val delayedStub: MemorySegment by lazy {
+        val target = MethodHandles.lookup().findStatic(
+            Glib::class.java, "runDelayed",
+            MethodType.methodType(Int::class.java, MemorySegment::class.java),
+        )
+        linker.upcallStub(target, FunctionDescriptor.of(JAVA_INT, ADDRESS), arena)
+    }
+
+    @JvmStatic
+    fun runDelayed(data: MemorySegment): Int {
+        delayedQueue.poll()?.let { runCatching(it).onFailure { e -> e.printStackTrace() } }
+        return 0 // one-shot
+    }
+
+    /** Run [task] on the GLib thread after [ms] milliseconds. */
+    fun postDelayed(ms: Int, task: () -> Unit) {
+        delayedQueue.add(task)
+        gTimeoutAdd.invokeExact(ms, delayedStub, MemorySegment.NULL) as Int
     }
 
     /** Run [task] on the GLib thread. */

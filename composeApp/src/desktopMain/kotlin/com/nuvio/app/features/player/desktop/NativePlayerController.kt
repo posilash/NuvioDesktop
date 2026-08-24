@@ -1095,7 +1095,7 @@ private fun List<String>.toHeaderMap(): Map<String, String> =
         line.substring(0, separator).trim() to line.substring(separator + 1).trim()
     }.toMap()
 
-private fun String.toPlayerControlsAction(): PlayerControlsAction? =
+internal fun String.toPlayerControlsAction(): PlayerControlsAction? =
     when (this) {
         "toggleChrome" -> PlayerControlsAction.ToggleChrome
         "back" -> PlayerControlsAction.Back
@@ -1459,7 +1459,7 @@ internal fun PlayerControlsState.toControlsJson(isFullscreen: Boolean): String =
         append('}')
     }
 
-private fun PlayerControlsState.nativeControlsStructureKey(): PlayerControlsState =
+internal fun PlayerControlsState.nativeControlsStructureKey(): PlayerControlsState =
     copy(
         isPlaying = false,
         isLoading = false,

@@ -424,10 +424,15 @@ internal fun PlayerScreenRuntime.RenderPlayerRuntimeUi() {
     )
     val gestureCallbacks = rememberSurfaceGestureCallbacks()
 
-    Box(
-        modifier = desktopPlayerInput(Modifier)
-            .fillMaxSize()
-            .onSizeChanged { layoutSize = it }
+    // Touch-style surface gestures belong to the platforms where Compose
+    // owns the player chrome. When the native web chrome draws the controls
+    // it also owns the pointer (on Windows/mac its overlay window swallows
+    // input before Compose ever sees it); a host that forwards input to both
+    // layers must not let a drag on the controls double as a seek gesture.
+    val surfaceGestures = if (usesNativePlayerChrome) {
+        Modifier
+    } else {
+        Modifier
             .playerSurfaceTapGestures(
                 layoutSize = layoutSize,
                 playerControlsLockedState = gestureCallbacks.playerControlsLocked,
@@ -453,7 +458,13 @@ internal fun PlayerScreenRuntime.RenderPlayerRuntimeUi() {
                 clearLiveGestureFeedbackState = gestureCallbacks.clearLiveGestureFeedback,
                 revealLockedOverlayState = gestureCallbacks.revealLockedOverlay,
                 commitHorizontalSeekState = gestureCallbacks.commitHorizontalSeek,
-            ),
+            )
+    }
+    Box(
+        modifier = desktopPlayerInput(Modifier)
+            .fillMaxSize()
+            .onSizeChanged { layoutSize = it }
+            .then(surfaceGestures),
     ) {
         effectivePlayerSurfaceSource?.let { surfaceSource ->
             PlatformPlayerSurface(

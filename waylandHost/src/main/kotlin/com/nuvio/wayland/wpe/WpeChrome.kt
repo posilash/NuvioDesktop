@@ -12,27 +12,25 @@ import java.lang.foreign.ValueLayout.JAVA_INT
 import java.lang.foreign.ValueLayout.JAVA_LONG
 import java.lang.invoke.MethodHandles
 import java.lang.invoke.MethodType
-import java.util.concurrent.atomic.AtomicReference
 
 /**
- * Upstream's desktop player chrome (player-ui/controls.html), hosted the way
- * Stremio hosts its web UI: an offscreen web engine composited as a layer in
- * the same window and GPU scene as the mpv render-API video. Stremio uses
- * QtWebEngine for the offscreen half; the native-Wayland equivalent is WPE
- * WebKit, whose fdo backend exports each rendered frame as an EGLImage.
+ * Upstream's desktop player chrome (player-ui/controls.html) as WPE WebKit,
+ * hosted the way Stremio hosts its web UI: composited INTO the same scene
+ * and present stream as the video, one window surface, one swapchain. (A
+ * wl_subsurface variant -- a second commit stream -- made the chrome and the
+ * video visibly fight whenever both were animating.)
  *
- * Threading: all WebKit calls happen on the GLib thread ([Glib.post]).
- * Exported frames are handed off through [takeImage] to whichever GL thread
- * composites; script messages arrive on the GLib thread and are forwarded
- * verbatim to [onMessage].
+ * WPE runs in pure-SHM mode (wpe_fdo_initialize_shm) with the web process
+ * pinned to Mesa llvmpipe: it never touches the GPU (NVIDIA garbles its
+ * GL->SHM alpha readback, and GPU work there contends with mpv). Exports are
+ * copied out on the GLib thread and handed to the EDT as [ShmFrame]s; the
+ * frame-complete ack fires when the EDT consumes one, so the page naturally
+ * paces to the window's present rate.
  *
- * Every signature below is taken from the installed headers, not memory --
- * including the detail that export_fdo_egl_image is slot ONE of the client
- * struct (slot zero is the deprecated raw-EGLImage variant; filling the wrong
- * slot yields a silent black view).
+ * Threading: all WebKit calls happen on the GLib thread ([Glib.post]);
+ * script messages arrive there and are forwarded verbatim to [onMessage].
  */
 class WpeChrome(
-    private val eglDisplay: Long,
     private val width: Int,
     private val height: Int,
     private val onMessage: (String) -> Unit,
@@ -47,11 +45,12 @@ class WpeChrome(
     private fun fn(l: SymbolLookup, name: String, desc: FunctionDescriptor) =
         linker.downcallHandle(l.find(name).orElseThrow { UnsatisfiedLinkError(name) }, desc)
 
+    /** Whether the host is compositing the chrome right now (EDT writes). */
+    @Volatile var visible: Boolean = true
+
+
     private var exportable: MemorySegment = MemorySegment.NULL
     private var webView: MemorySegment = MemorySegment.NULL
-
-    /** Latest exported frame awaiting import; consumer takes, then [frameDone]. */
-    private val pendingImage = AtomicReference<MemorySegment?>(null)
 
     @Volatile var framesExported = 0L
         private set
@@ -77,21 +76,19 @@ class WpeChrome(
         fn(wpe, "wpe_loader_init", FunctionDescriptor.of(JAVA_BOOLEAN, ADDRESS))
             .invokeExact(arena.allocateFrom("libWPEBackend-fdo-1.0.so.1")) as Boolean
 
-        val ok = fn(fdo, "wpe_fdo_initialize_for_egl_display",
-            FunctionDescriptor.of(JAVA_BOOLEAN, ADDRESS))
-            .invokeExact(MemorySegment.ofAddress(eglDisplay)) as Boolean
-        check(ok) { "wpe_fdo_initialize_for_egl_display failed" }
+        // Pure software WPE: the nested compositor offers only wl_shm and the
+        // WEBKIT_DISABLE_* env keeps the web process off GL entirely. This is
+        // EXACTLY what upstream's linux branch ships -- its player_bridge.cpp
+        // documents the same NVIDIA failure ("DMABUF renderer yields controls
+        // snapshots with degraded alpha ... fully opaque") and forces the
+        // software path for the same reason. The cost is controlled by the
+        // host's activity gate, not here: "normal watching pays nothing".
+        fn(fdo, "wpe_fdo_initialize_shm", FunctionDescriptor.of(JAVA_BOOLEAN))
+            .invokeExact() as Boolean
 
         // struct wpe_view_backend_exportable_fdo_egl_client:
         //   [0] export_egl_image (legacy)  [1] export_fdo_egl_image  [2] shm  [3,4] reserved
         val client = arena.allocate(MemoryLayout.sequenceLayout(5, ADDRESS))
-        val exportStub = linker.upcallStub(
-            MethodHandles.lookup().findStatic(
-                WpeCallbacks::class.java, "exportImage",
-                MethodType.methodType(Void.TYPE, MemorySegment::class.java, MemorySegment::class.java),
-            ),
-            FunctionDescriptor.ofVoid(ADDRESS, ADDRESS), arena,
-        )
         val shmStub = linker.upcallStub(
             MethodHandles.lookup().findStatic(
                 WpeCallbacks::class.java, "exportShmBuffer",
@@ -101,7 +98,7 @@ class WpeChrome(
         )
         WpeCallbacks.owner = this
         client.setAtIndex(ADDRESS, 0, MemorySegment.NULL)
-        client.setAtIndex(ADDRESS, 1, exportStub)
+        client.setAtIndex(ADDRESS, 1, MemorySegment.NULL)
         client.setAtIndex(ADDRESS, 2, shmStub)
         client.setAtIndex(ADDRESS, 3, MemorySegment.NULL)
         client.setAtIndex(ADDRESS, 4, MemorySegment.NULL)
@@ -112,6 +109,30 @@ class WpeChrome(
         viewBackend = fn(fdo, "wpe_view_backend_exportable_fdo_get_view_backend",
             FunctionDescriptor.of(ADDRESS, ADDRESS))
             .invokeExact(exportable) as MemorySegment
+
+        // The web process must never touch the NVIDIA driver: its GL->SHM
+        // readback garbles the alpha channel there (chrome became an opaque
+        // black sheet), and any GPU work it does contends with mpv's render
+        // thread. Compositing stays ON (that is what sizes buffers at
+        // logical*scale, the crisp path); it just runs on Mesa's software
+        // rasterizer. Set here -- after every NVIDIA context this process
+        // needs already exists, before the web process is spawned; children
+        // inherit the environment at fork.
+        if (System.getProperty("nuvio.wayland.chromeSoftware")?.toBoolean() == true) run {
+            val setenv = linker.downcallHandle(
+                linker.defaultLookup().find("setenv").orElseThrow(),
+                FunctionDescriptor.of(JAVA_INT, ADDRESS, ADDRESS, JAVA_INT),
+            )
+            fun env(k: String, v: String) {
+                Arena.ofConfined().use { a ->
+                    setenv.invokeExact(a.allocateFrom(k), a.allocateFrom(v), 1) as Int
+                    Unit
+                }
+            }
+            env("LIBGL_ALWAYS_SOFTWARE", "1")
+            env("GALLIUM_DRIVER", "llvmpipe")
+            env("__EGL_VENDOR_LIBRARY_FILENAMES", "/usr/share/glvnd/egl_vendor.d/50_mesa.json")
+        }
 
         // WebKit only after the backend exists; its libraries pull in the
         // loader state established above.
@@ -178,15 +199,24 @@ class WpeChrome(
 
     // ---- GLib-thread callbacks ----
 
-    /** A copied SHM frame: BGRA8888 pixels, ready for glTexImage2D. */
+    private val wlServer by lazy { SymbolLookup.libraryLookup("libwayland-server.so.0", arena) }
+
+    /** A copied chrome frame: tightly packed BGRA (wl ARGB8888) pixels. */
     class ShmFrame(val width: Int, val height: Int, val pixels: java.nio.ByteBuffer)
 
-    private val pendingShm = AtomicReference<ShmFrame?>(null)
-    private val wlServer by lazy { SymbolLookup.libraryLookup("libwayland-server.so.0", arena) }
+    private val pendingShm = java.util.concurrent.atomic.AtomicReference<ShmFrame?>(null)
+
+    // Ack conservation: dispatch_frame_complete is only ever valid as the
+    // answer to one export. Un-paired acks sent WPE into a render storm --
+    // one logged burst re-rendered the page 133k times in seconds.
+    private val ackOwed = java.util.concurrent.atomic.AtomicBoolean(false)
 
     internal fun handleShmExport(buffer: MemorySegment) {
         framesExported++
+        ackOwed.set(true)
+        var handedOff = false
         runCatching {
+            if (!visible) return@runCatching // skip the copy entirely
             val shm = fn(fdo, "wpe_fdo_shm_exported_buffer_get_shm_buffer",
                 FunctionDescriptor.of(ADDRESS, ADDRESS)).invokeExact(buffer) as MemorySegment
             if (!shm.equals(MemorySegment.NULL)) {
@@ -201,16 +231,21 @@ class WpeChrome(
                 val h = fn(wlServer, "wl_shm_buffer_get_height",
                     FunctionDescriptor.of(JAVA_INT, ADDRESS)).invokeExact(shm) as Int
                 if (!data.equals(MemorySegment.NULL) && w > 0 && h > 0) {
-                    // Copy out (tightly, dropping any stride padding) so the
-                    // wl buffer can go straight back to the web process.
                     val out = java.nio.ByteBuffer.allocateDirect(w * h * 4)
+                    val outSeg = MemorySegment.ofBuffer(out)
                     val src = data.reinterpret(stride.toLong() * h)
-                    for (row in 0 until h) {
-                        val rowSeg = src.asSlice(row.toLong() * stride, (w * 4).toLong())
-                        out.put(rowSeg.toArray(java.lang.foreign.ValueLayout.JAVA_BYTE))
+                    if (stride == w * 4) {
+                        MemorySegment.copy(src, 0, outSeg, 0, w.toLong() * h * 4)
+                    } else {
+                        for (row in 0 until h) {
+                            MemorySegment.copy(
+                                src, row.toLong() * stride,
+                                outSeg, row.toLong() * w * 4, w.toLong() * 4,
+                            )
+                        }
                     }
-                    out.flip()
                     pendingShm.set(ShmFrame(w, h, out))
+                    handedOff = true
                 }
                 fn(wlServer, "wl_shm_buffer_end_access", FunctionDescriptor.ofVoid(ADDRESS))
                     .invokeExact(shm)
@@ -219,16 +254,22 @@ class WpeChrome(
         fn(fdo, "wpe_view_backend_exportable_fdo_dispatch_release_shm_exported_buffer",
             FunctionDescriptor.ofVoid(ADDRESS, ADDRESS))
             .invokeExact(exportable, buffer)
+        if (handedOff) {
+            // The ack comes when the EDT consumes the frame: the page paces
+            // itself to the window's actual present rate.
+            org.lwjgl.glfw.GLFW.glfwPostEmptyEvent()
+        } else {
+            // Hidden or inactive: a slow trickle, never instant -- an
+            // instant ack re-ran the renderer flat out (~90fps of CPU
+            // raster). 5fps keeps the page's rAF-driven logic alive so it
+            // can still react (reveal chrome, run its fade) at ~zero cost.
+            Glib.postDelayed(200) { dispatchFrameComplete() }
+        }
     }
 
-    /** Newest SHM frame, or null. Ack with [ackFrame] after upload. */
+    /** Newest chrome frame for the EDT; caller must [ackFrame] after use. */
     fun takeShmFrame(): ShmFrame? = pendingShm.getAndSet(null)
 
-    internal fun handleExport(image: MemorySegment) {
-        framesExported++
-        // Newest wins; an unconsumed predecessor goes straight back to WPE.
-        pendingImage.getAndSet(image)?.let { stale -> releaseImage(stale) }
-    }
 
     internal fun handleMessage(jscValue: MemorySegment) {
         val json = fn(webkit, "jsc_value_to_json",
@@ -239,38 +280,22 @@ class WpeChrome(
         }
     }
 
-    // ---- consumer side ----
-
-    /** Newest exported frame, or null. Caller imports, then calls [frameDone]. */
-    fun takeImage(): MemorySegment? = pendingImage.getAndSet(null)
-
-    /** EGLImageKHR handle inside [image]; valid until the image is released. */
-    fun eglImageOf(image: MemorySegment): MemorySegment =
-        fn(fdo, "wpe_fdo_egl_exported_image_get_egl_image",
-            FunctionDescriptor.of(ADDRESS, ADDRESS))
-            .invokeExact(image) as MemorySegment
-
     /**
-     * Acknowledge the current frame so WPE renders the next one. Distinct
-     * from releasing: complete means "send more", release means "this buffer
-     * is free". Conflating them deadlocks after the first frame -- WPE waits
-     * for the ack, the consumer waits for a successor that can never come.
+     * Acknowledge the current frame so WPE renders the next one. The EDT
+     * calls this after consuming a frame; it is also the kick after
+     * unhiding, and any other stall recovery.
      */
     fun ackFrame() {
         Glib.post { dispatchFrameComplete() }
     }
 
-    fun frameDone(image: MemorySegment) {
-        Glib.post { releaseImage(image) }
-    }
-
-    private fun releaseImage(image: MemorySegment) {
-        fn(fdo, "wpe_view_backend_exportable_fdo_egl_dispatch_release_exported_image",
-            FunctionDescriptor.ofVoid(ADDRESS, ADDRESS))
-            .invokeExact(exportable, image)
+    /** Ack after a delay: the page cannot render faster than 1000/ms fps. */
+    fun ackFrameAfter(ms: Int) {
+        Glib.postDelayed(ms) { dispatchFrameComplete() }
     }
 
     private fun dispatchFrameComplete() {
+        if (!ackOwed.getAndSet(false)) return
         fn(fdo, "wpe_view_backend_exportable_fdo_dispatch_frame_complete",
             FunctionDescriptor.ofVoid(ADDRESS))
             .invokeExact(exportable)
@@ -356,6 +381,20 @@ class WpeChrome(
         }
     }
 
+    /**
+     * Device pixels per CSS pixel. With this set the page keeps its logical
+     * size and coordinates but rasters (and exports) at physical resolution
+     * -- the difference between soft and crisp chrome on a scaled output.
+     */
+    fun dispatchScale(scale: Float) {
+        Glib.post {
+            val backend = viewBackendOrNull() ?: return@post
+            fn(wpe, "wpe_view_backend_dispatch_set_device_scale_factor",
+                FunctionDescriptor.ofVoid(ADDRESS, java.lang.foreign.ValueLayout.JAVA_FLOAT))
+                .invokeExact(backend, scale)
+        }
+    }
+
     private var viewBackend: MemorySegment = MemorySegment.NULL
     private fun viewBackendOrNull(): MemorySegment? =
         viewBackend.takeIf { !it.equals(MemorySegment.NULL) }
@@ -379,127 +418,10 @@ class WpeChrome(
     }
 }
 
-/**
- * Consumer half: turns exported EGLImages into a GL texture on the caller's
- * context and keeps the image alive exactly as long as the texture samples
- * it (an EGLImage released back to WPE while still bound is undefined).
- */
-class WpeChromeLayer(private val chrome: WpeChrome) {
-    private val linker = Linker.nativeLinker()
-    private val arena = Arena.ofShared()
-    private val egl = SymbolLookup.libraryLookup("libEGL.so.1", arena)
-
-    // glEGLImageTargetTexture2DOES is an extension entry point; per EGL spec
-    // it must come from eglGetProcAddress, not dlsym.
-    private val imageTargetTexture by lazy {
-        val getProc = linker.downcallHandle(
-            egl.find("eglGetProcAddress").orElseThrow(),
-            FunctionDescriptor.of(ADDRESS, ADDRESS),
-        )
-        val addr = Arena.ofConfined().use { a ->
-            getProc.invokeExact(a.allocateFrom("glEGLImageTargetTexture2DOES")) as MemorySegment
-        }
-        check(!addr.equals(MemorySegment.NULL)) { "glEGLImageTargetTexture2DOES unavailable" }
-        linker.downcallHandle(addr, FunctionDescriptor.ofVoid(JAVA_INT, ADDRESS))
-    }
-
-    var texture = 0
-        private set
-    var imageWidth = 0
-        private set
-    var imageHeight = 0
-        private set
-    private var displayedImage: MemorySegment? = null
-    @Volatile var framesImported = 0L
-        private set
-
-    private val imageWidthFn by lazy {
-        linker.downcallHandle(
-            SymbolLookup.libraryLookup("libWPEBackend-fdo-1.0.so.1", arena)
-                .find("wpe_fdo_egl_exported_image_get_width").orElseThrow(),
-            FunctionDescriptor.of(JAVA_INT, ADDRESS),
-        )
-    }
-    private val imageHeightFn by lazy {
-        linker.downcallHandle(
-            SymbolLookup.libraryLookup("libWPEBackend-fdo-1.0.so.1", arena)
-                .find("wpe_fdo_egl_exported_image_get_height").orElseThrow(),
-            FunctionDescriptor.of(JAVA_INT, ADDRESS),
-        )
-    }
-
-    /**
-     * Import the newest exported frame into [texture], on the current GL
-     * context. Returns true when the texture changed. The previously
-     * displayed image is only released once its successor is bound.
-     */
-    fun importLatest(): Boolean {
-        chrome.takeShmFrame()?.let { frame ->
-            if (texture == 0) texture = org.lwjgl.opengl.GL11.glGenTextures()
-            org.lwjgl.opengl.GL11.glBindTexture(org.lwjgl.opengl.GL11.GL_TEXTURE_2D, texture)
-            // wl_shm ARGB8888 little-endian == GL_BGRA bytes.
-            org.lwjgl.opengl.GL11.glTexImage2D(
-                org.lwjgl.opengl.GL11.GL_TEXTURE_2D, 0,
-                org.lwjgl.opengl.GL11.GL_RGBA8, frame.width, frame.height, 0,
-                org.lwjgl.opengl.GL12.GL_BGRA,
-                org.lwjgl.opengl.GL11.GL_UNSIGNED_BYTE, frame.pixels,
-            )
-            org.lwjgl.opengl.GL11.glTexParameteri(
-                org.lwjgl.opengl.GL11.GL_TEXTURE_2D,
-                org.lwjgl.opengl.GL11.GL_TEXTURE_MIN_FILTER, org.lwjgl.opengl.GL11.GL_LINEAR,
-            )
-            org.lwjgl.opengl.GL11.glTexParameteri(
-                org.lwjgl.opengl.GL11.GL_TEXTURE_2D,
-                org.lwjgl.opengl.GL11.GL_TEXTURE_MAG_FILTER, org.lwjgl.opengl.GL11.GL_LINEAR,
-            )
-            org.lwjgl.opengl.GL11.glBindTexture(org.lwjgl.opengl.GL11.GL_TEXTURE_2D, 0)
-            imageWidth = frame.width
-            imageHeight = frame.height
-            framesImported++
-            chrome.ackFrame()
-            return true
-        }
-        val image = chrome.takeImage() ?: return false
-        if (texture == 0) {
-            texture = org.lwjgl.opengl.GL11.glGenTextures()
-        }
-        org.lwjgl.opengl.GL11.glBindTexture(org.lwjgl.opengl.GL11.GL_TEXTURE_2D, texture)
-        val eglImage = chrome.eglImageOf(image)
-        imageTargetTexture.invokeExact(
-            org.lwjgl.opengl.GL11.GL_TEXTURE_2D, eglImage,
-        )
-        val err = org.lwjgl.opengl.GL11.glGetError()
-        if (err != 0 || eglImage.equals(MemorySegment.NULL)) {
-            println("[wpe] EGLImage bind: image=$eglImage glError=0x${err.toString(16)}")
-        }
-        org.lwjgl.opengl.GL11.glTexParameteri(
-            org.lwjgl.opengl.GL11.GL_TEXTURE_2D,
-            org.lwjgl.opengl.GL11.GL_TEXTURE_MIN_FILTER, org.lwjgl.opengl.GL11.GL_LINEAR,
-        )
-        org.lwjgl.opengl.GL11.glTexParameteri(
-            org.lwjgl.opengl.GL11.GL_TEXTURE_2D,
-            org.lwjgl.opengl.GL11.GL_TEXTURE_MAG_FILTER, org.lwjgl.opengl.GL11.GL_LINEAR,
-        )
-        org.lwjgl.opengl.GL11.glBindTexture(org.lwjgl.opengl.GL11.GL_TEXTURE_2D, 0)
-        imageWidth = imageWidthFn.invokeExact(image) as Int
-        imageHeight = imageHeightFn.invokeExact(image) as Int
-        displayedImage?.let { chrome.frameDone(it) }
-        displayedImage = image
-        framesImported++
-        chrome.ackFrame()
-        return true
-    }
-}
-
 /** FFM upcalls must target static methods. */
 internal object WpeCallbacks {
     @JvmStatic
     var owner: WpeChrome? = null
-
-    @JvmStatic
-    fun exportImage(data: MemorySegment, image: MemorySegment) {
-        owner?.handleExport(image)
-    }
 
     @JvmStatic
     fun playerMessage(ucm: MemorySegment, jscValue: MemorySegment, data: MemorySegment) {
