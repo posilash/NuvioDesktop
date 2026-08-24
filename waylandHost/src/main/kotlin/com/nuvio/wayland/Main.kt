@@ -912,14 +912,30 @@ fun main() {
                 if (!wantChrome) {
                     chromeImage?.close()
                     chromeImage = null
-                    // The layer's own teardown must happen on its thread.
-                    chromeLayer?.let { l -> uiPipeline?.post { l.clear() } }
-                    uiPipeline?.requestOverlayFrame()
+                    // The layer's own teardown must happen on its thread, and
+                    // the repaint has to be requested AFTER the clear has
+                    // run -- asking from here raced it, so the repaint still
+                    // contained the chrome and nothing asked for another.
+                    val ui = uiPipeline
+                    chromeLayer?.let { l ->
+                        ui?.post {
+                            l.clear()
+                            ui.requestOverlayFrame()
+                        }
+                    } ?: ui?.requestOverlayFrame()
                     chromeChanged = true
                 } else {
                     // On show, WPE may be idle waiting on an ack a hidden
                     // frame swallowed; kick it so the page exports again.
                     chrome.ackFrame()
+                    // An ack alone only grants permission -- an idle page
+                    // (nothing changed while hidden, e.g. paused) still
+                    // paints nothing, and since hiding clears the layer
+                    // there would be NO chrome at all until something
+                    // happened to change the DOM. playerUpdate always ends
+                    // in renderChrome(), so pushing state now guarantees the
+                    // frame this reveal needs.
+                    videoHost?.pushPlaybackUpdate()
                 }
             }
             // Chrome frames ride this scene, Stremio-style: ONE surface,

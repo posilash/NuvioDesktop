@@ -206,6 +206,38 @@ class ChromeLayer(private val chrome: WpeChrome) {
      * something new to publish even though Compose itself is idle.
      */
     fun update(): Boolean {
+        // A clear IS a change: the chrome is composited into the UI texture,
+        // so dropping it has to produce one more frame without it. Reporting
+        // "nothing changed" here made UiPipeline skip the re-render and left
+        // the chrome on screen after playback ended.
+        //
+        // It must not SHORT-CIRCUIT the update, though: returning early here
+        // skipped adopting the waiting frame and, with it, the ack that is
+        // the page's permission to render the next one -- after the first
+        // hide the chrome could never come back.
+        val cleared = clearedSincePublish
+        clearedSincePublish = false
+        if (!chrome.visible) {
+            // Hidden: never adopt. WpeChrome drops exports while hidden, but
+            // one queued microseconds before the flag flipped is still
+            // waiting here -- adopting it puts the chrome straight back on
+            // screen after the clear, which is exactly why leaving a stream
+            // sometimes left the chrome up and sometimes did not. Drain it.
+            //
+            // Draining is not enough: that frame was exported while still
+            // visible, so WpeChrome took its visible branch and scheduled no
+            // ack for it. WPE renders the next frame only once acked, so
+            // dropping this one silently froze the page FOREVER -- its frame
+            // counter stopped, the reveal gate (framesExported past a mark)
+            // could never be met again, and every stream after the first had
+            // no chrome at all. Ack it on the same slow trickle WpeChrome
+            // uses while hidden: the page keeps breathing at ~5fps, which
+            // costs nothing and keeps it revealable.
+            var drained = chrome.takeEglImage()?.let { chrome.releaseImageAsync(it); true } ?: false
+            if (chrome.takeShmFrame() != null) drained = true
+            if (drained) chrome.ackFrameAfter(HIDDEN_ACK_MS)
+            return cleared
+        }
         val start = System.nanoTime()
         val changed = if (chrome.gpuActive) updateFromEglImage() else updateFromShm()
         if (changed) {
@@ -221,7 +253,7 @@ class ChromeLayer(private val chrome: WpeChrome) {
                 probeOrientation()
             }
         }
-        return changed
+        return changed || cleared
     }
 
     private fun updateFromEglImage(): Boolean {
@@ -248,6 +280,10 @@ class ChromeLayer(private val chrome: WpeChrome) {
                 )
             }
             chrome.releaseImageAsync(image)
+            // Still ack: an export that goes unanswered stops the page
+            // rendering for good, which would turn a recoverable import
+            // failure into a permanently dead chrome.
+            chrome.ackFrameAfter(ackDelayMs)
             return false
         }
 
@@ -314,7 +350,16 @@ class ChromeLayer(private val chrome: WpeChrome) {
      * the viewport sits at the origin, with no offset.
      */
     fun draw(targetWidth: Int, targetHeight: Int) {
-        if (!haveContent || texture == 0 || texW <= 0 || texH <= 0) return
+        if (!haveContent || texture == 0 || texW <= 0 || texH <= 0) {
+            if (drawsLogged < 3 &&
+                System.getProperty("nuvio.wayland.videoLog")?.toBoolean() == true
+            ) {
+                drawsLogged++
+                println("[chrome-layer] draw skipped (haveContent=$haveContent tex=$texture)")
+            }
+            return
+        }
+        drawsLogged = 0
         val t = System.nanoTime()
         ensureProgram()
 
@@ -400,9 +445,23 @@ class ChromeLayer(private val chrome: WpeChrome) {
      * quad, and no WPE buffer pinned by us.
      */
     fun clear() {
+        if (System.getProperty("nuvio.wayland.videoLog")?.toBoolean() == true) {
+            println("[chrome-layer] clear(haveContent=$haveContent)")
+        }
+        // Only worth a repaint if something was actually on screen.
+        if (haveContent) clearedSincePublish = true
         haveContent = false
         displayedImage?.let { chrome.releaseImageAsync(it) }
         displayedImage = null
+    }
+
+    /** Set by [clear], consumed by [update]: forces one frame without us. */
+    private var clearedSincePublish = false
+    private var drawsLogged = 0
+
+    private companion object {
+        /** Hidden-page ack pacing, matching WpeChrome's own hidden trickle. */
+        const val HIDDEN_ACK_MS = 200
     }
 
     /** Per-second telemetry. This is where chrome cost is paid and reported. */
