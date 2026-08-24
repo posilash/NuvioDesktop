@@ -213,8 +213,15 @@ class InputRouter(
     // shows -- it exists only to satisfy the constructor.
     private val awtEventSource = java.awt.Container()
 
-    /** Compose state must only be touched from the thread that renders it. */
-    private fun onUiThread(block: () -> Unit) = java.awt.EventQueue.invokeLater(block)
+    /**
+     * How to reach the thread that owns the scene. Compose state must only be
+     * touched from the thread that renders it, and which thread that is depends
+     * on the host's configuration: the EDT on the legacy in-loop path, the
+     * dedicated UI thread when [UiPipeline] is driving. Main sets this.
+     */
+    var dispatch: ((() -> Unit) -> Unit) = { block -> java.awt.EventQueue.invokeLater(block) }
+
+    private fun onUiThread(block: () -> Unit) = dispatch(block)
 
     private fun send(
         type: PointerEventType,

@@ -114,6 +114,17 @@ fun main() {
         error("glfwCreateWindow (video context) failed")
     }
 
+    // Third invisible window, same share group: the Compose scene's home. It
+    // exists for the same reason videoWindow does -- a GL context can only be
+    // current on one thread, and the scene now rasterizes on its own. Created
+    // here, before any context goes current elsewhere, because GLFW requires
+    // the share context not be current on another thread during creation.
+    val uiWindow = glfwCreateWindow(64, 64, "nuvio-ui", NULL, window)
+    if (uiWindow == NULL) {
+        glfwTerminate()
+        error("glfwCreateWindow (ui context) failed")
+    }
+
     // Compose's lifecycle insists on the AWT event queue being "the main
     // thread" (LifecycleRegistry enforces it), while GLFW insists on owning the
     // real main thread for event polling. Both can be satisfied: GLFW allows a
@@ -302,12 +313,17 @@ fun main() {
     var height = INITIAL_HEIGHT
     var renderTarget: BackendRenderTarget? = null
     var surface: Surface? = null
-    // The UI's own layer. The scene rasterizes here, only when it has
-    // something new -- never on account of a video frame. Presenting is then
-    // two cheap draws (video texture, UI texture) regardless of how expensive
-    // the scene is, which is what keeps a 24fps stream smooth under an 18ms
-    // UI. Transparent where the player surface punched its hole.
+    // The UI's own layer, legacy path only. The scene rasterizes here, only
+    // when it has something new -- never on account of a video frame. With
+    // threaded rasterization the equivalent layer is a texture published by
+    // UiPipeline, so this surface is not allocated at all.
     var uiSurface: Surface? = null
+
+    // Threaded UI rasterization: the scene gets its own thread, GL context and
+    // Skia context, and publishes finished textures (see UiPipeline). The
+    // presenting thread then only ever draws. -Pnuvio.wayland.uiThread=false
+    // restores the in-loop rasterization this replaced, for A/B.
+    val uiThreadEnabled = System.getProperty("nuvio.wayland.uiThread")?.toBoolean() ?: true
 
     fun recreateSurface() {
         surface?.close()
@@ -322,10 +338,14 @@ fun main() {
             context, renderTarget!!, SurfaceOrigin.BOTTOM_LEFT,
             SurfaceColorFormat.RGBA_8888, ColorSpace.sRGB,
         ) ?: error("Surface.makeFromBackendRenderTarget returned null")
-        uiSurface = Surface.makeRenderTarget(
-            context, false,
-            org.jetbrains.skia.ImageInfo.makeN32Premul(width, height),
-        ) ?: error("Surface.makeRenderTarget (UI layer) returned null")
+        uiSurface = if (uiThreadEnabled) {
+            null
+        } else {
+            Surface.makeRenderTarget(
+                context, false,
+                org.jetbrains.skia.ImageInfo.makeN32Premul(width, height),
+            ) ?: error("Surface.makeRenderTarget (UI layer) returned null")
+        }
     }
     java.awt.EventQueue.invokeAndWait { recreateSurface() }
 
@@ -358,17 +378,63 @@ fun main() {
         return override ?: scale
     }
 
-    val scene: ComposeScene = CanvasLayersComposeScene(
-        density = Density(currentScale()),
-        size = androidx.compose.ui.unit.IntSize(width, height),
-        coroutineContext = MainUIDispatcher,
-    )
+    val initialScale = currentScale()
+    var uiPipeline: UiPipeline? = null
+    var uiLayer: UiLayer? = null
+    // Set by the UI thread on publish; the analogue of videoFrameReady.
+    val uiFrameReady = java.util.concurrent.atomic.AtomicBoolean(false)
+
+    val scene: ComposeScene
+    if (uiThreadEnabled) {
+        val p = UiPipeline(uiWindow)
+        p.onFrame = {
+            uiFrameReady.set(true)
+            // Wake the host loop even if it is idle in glfwWaitEventsTimeout.
+            glfwPostEmptyEvent()
+        }
+        // The scene is CONSTRUCTED on the UI thread, with a dispatcher that
+        // posts back to it: everything Compose launches -- effects, animations,
+        // recomposition -- then runs on the one thread that is allowed to touch
+        // the scene. MainUIDispatcher/the EDT is out of the picture entirely.
+        p.start(width, height, initialScale) {
+            CanvasLayersComposeScene(
+                density = Density(initialScale),
+                size = androidx.compose.ui.unit.IntSize(width, height),
+                coroutineContext = p.dispatcher,
+                invalidate = { p.requestFrame() },
+            )
+        }
+        p.awaitReady()
+        uiPipeline = p
+        uiLayer = UiLayer(context)
+        scene = p.scene
+        println("ui: threaded rasterization (nuvio-ui thread, shared GL context + own DirectContext)")
+    } else {
+        scene = CanvasLayersComposeScene(
+            density = Density(initialScale),
+            size = androidx.compose.ui.unit.IntSize(width, height),
+            coroutineContext = MainUIDispatcher,
+        )
+        println("ui: in-loop rasterization on the EDT (legacy path, -Pnuvio.wayland.uiThread=false)")
+    }
+
+    // Every scene touch goes through these, so the owning thread is decided in
+    // exactly one place.
+    fun onSceneThread(block: () -> Unit) {
+        val p = uiPipeline
+        if (p != null) p.post(block) else java.awt.EventQueue.invokeLater(block)
+    }
+    fun onSceneThreadAndWait(block: () -> Unit) {
+        val p = uiPipeline
+        if (p != null) p.invokeAndWait(block) else java.awt.EventQueue.invokeAndWait(block)
+    }
+
     val runRealApp = System.getProperty("nuvio.wayland.realApp")?.toBoolean() ?: false
     // Drives the app's own player surface directly, so playback can be
     // exercised without clicking through the UI. Mirrors Main.kt's
     // smokePlayerUrl harness.
     val smokePlayerUrl = System.getProperty("nuvio.wayland.smokePlayer")
-    java.awt.EventQueue.invokeAndWait {
+    onSceneThreadAndWait {
     if (runRealApp) {
         // Same preamble Main.kt runs before showing its window. initGtkEarly is
         // deliberately not called: it pins GDK to X11 for the WebKitGTK control
@@ -556,6 +622,9 @@ fun main() {
     }
 
     val input = InputRouter(window, scene)
+    // GLFW callbacks still fire on the main thread; they must hand off to
+    // whichever thread owns the scene, which is no longer necessarily the EDT.
+    uiPipeline?.let { p -> input.dispatch = { block -> p.post(block) } }
     input.install()
     wpeChrome?.let { c ->
         input.chrome = c
@@ -572,11 +641,11 @@ fun main() {
     // when it gains it; with a bare scene nothing does, so every key event is
     // delivered and then dropped by the focus system. Mirror what a window
     // does: take focus now, and follow the compositor's focus from then on.
-    java.awt.EventQueue.invokeLater {
+    onSceneThread {
         scene.focusManager.takeFocus(androidx.compose.ui.focus.FocusDirection.Next)
     }
     glfwSetWindowFocusCallback(window) { _, focused ->
-        java.awt.EventQueue.invokeLater {
+        onSceneThread {
             if (focused) {
                 scene.focusManager.takeFocus(androidx.compose.ui.focus.FocusDirection.Next)
             } else {
@@ -587,6 +656,7 @@ fun main() {
 
     var exitCode = 0
     var lastChromeTickNs = 0L
+    var lastUiReportNs = System.nanoTime()
     // Diagnostic lever: how long scene rasters are held during playback.
     val sceneHoldNs = (System.getProperty("nuvio.wayland.sceneHoldMs")?.toLongOrNull() ?: 250L) * 1_000_000L
     val timings = FrameTimings()
@@ -646,14 +716,22 @@ fun main() {
             if (width > 0 && height > 0) {
                 recreateSurface()
                 forceRepaint = true
-                scene.size = androidx.compose.ui.unit.IntSize(width, height)
                 // Pointer positions arrive in window coordinates but the
                 // scene works in framebuffer pixels; on a fractionally
                 // scaled output those differ. The same ratio is the UI
                 // density, which can change when the window moves outputs.
                 val scale = currentScale()
                 input.scale = scale
-                if (scene.density.density != scale) scene.density = Density(scale)
+                val p = uiPipeline
+                if (p != null) {
+                    // Size and density are scene state, so they are applied on
+                    // the scene's own thread; the pipeline reallocates its
+                    // textures to match on the next frame.
+                    p.resize(width, height, scale)
+                } else {
+                    scene.size = androidx.compose.ui.unit.IntSize(width, height)
+                    if (scene.density.density != scale) scene.density = Density(scale)
+                }
                 val logicalW = Math.round(width / scale)
                 val logicalH = Math.round(height / scale)
                 if (videoLog) {
@@ -669,7 +747,10 @@ fun main() {
         }
 
         val s = surface ?: return false
-        val ui = uiSurface ?: return false
+        // Legacy path only: with threaded rasterization the UI layer is a
+        // published texture, not a surface this thread draws into.
+        val ui = uiSurface
+        if (ui == null && uiPipeline == null) return false
 
         if (videoLog) {
             wpeChrome?.let { chrome ->
@@ -679,6 +760,15 @@ fun main() {
             }
             videoHost?.report(System.nanoTime())?.let {
                 println("[wayland-video] $it rss=${rssMb()}MB heap=${Runtime.getRuntime().let { r -> (r.totalMemory() - r.freeMemory()) / 1_048_576 }}MB")
+            }
+            // Scene cost is reported from the thread that pays it; it no
+            // longer appears anywhere on this present path.
+            uiPipeline?.let { p ->
+                if (System.nanoTime() - lastUiReportNs > 1_000_000_000L) {
+                    val elapsed = (System.nanoTime() - lastUiReportNs) / 1e9
+                    lastUiReportNs = System.nanoTime()
+                    println("[wayland-video] ${p.report(elapsed)}")
+                }
             }
             input.report(System.nanoTime())?.let { println("[wayland-video] $it") }
             timings.report(System.nanoTime())?.let { println("[wayland-video] $it") }
@@ -745,7 +835,15 @@ fun main() {
                 chrome.ackFrameAfter(33)
             }
         }
-        val sceneDirty = forceRepaint || scene.hasInvalidations()
+        // With threaded rasterization this thread never asks the scene
+        // anything -- hasInvalidations() would be a cross-thread read of
+        // Compose internals. The UI thread's publish is the signal instead.
+        val uiChanged = uiFrameReady.getAndSet(false)
+        val sceneDirty = if (uiPipeline != null) {
+            forceRepaint || uiChanged
+        } else {
+            forceRepaint || scene.hasInvalidations()
+        }
         // Stremio's presentation model, completed: while video plays, present
         // EVERY iteration -- vsync-paced by the swap -- and sample mpv's
         // latest frame. Present-on-arrival exposed the core's frame-delivery
@@ -773,9 +871,14 @@ fun main() {
         // web engine's raster work lives out of process). Throttling rasters
         // to 4/s keeps the sampling grid steady; anything Compose needs to
         // show still appears within 250ms.
-        val rasterThrottled = videoRolling &&
+        // The hold is a property of in-loop rasterization: it exists to stop a
+        // scene render from landing on top of a video frame. With the scene on
+        // its own thread there is no such collision to throttle, so the lever
+        // is bypassed entirely rather than tuned (it stays live on the legacy
+        // path for A/B).
+        val rasterThrottled = uiPipeline == null && videoRolling &&
             (t - lastSceneRenderNs) < sceneHoldNs
-        if (sceneDirty && !videoChanged && !rasterThrottled) {
+        if (ui != null && sceneDirty && !videoChanged && !rasterThrottled) {
             val videoLive = videoHost?.hasFile == true &&
                 lastVideoPresentNs != 0L && (t - lastVideoPresentNs) < 500_000_000L
             // When the scene costs more than a whole frame interval the defer
@@ -816,7 +919,15 @@ fun main() {
         // scene render pay a full-resolution copy-on-write of the UI texture
         // (14MB at 2560x1440), which is what inflated scene costs to tens of
         // milliseconds and dragged the whole chrome down.
-        ui.draw(s.canvas, 0, 0, null)
+        if (ui != null) {
+            ui.draw(s.canvas, 0, 0, null)
+        } else {
+            // Threaded path: draw whatever the UI thread published last. This
+            // is the entire UI cost of a present -- one textured quad, the same
+            // shape as the video composite above, and it does not vary with
+            // how expensive the scene happens to be.
+            uiPipeline?.acquireFrame()?.let { f -> uiLayer?.draw(s.canvas, f) }
+        }
         // Chrome above everything: a raster image draw, which Skia
         // composites with proper premultiplied alpha (its opaque-surface
         // rule only applies to wrapped render targets). The buffer is
@@ -908,7 +1019,7 @@ fun main() {
             // ahead. Deferring it to the next loop iteration burned 4-12ms
             // of that margin and let 20ms scenes collide with the next
             // frame -- the residual 11-vsync gaps.
-            if (scene.hasInvalidations() &&
+            if (ui != null && scene.hasInvalidations() &&
                 sceneCostEmaMs < (pipeline?.publishIntervalMs ?: 41.7) - 8.0
             ) {
                 val ts = System.nanoTime()
@@ -991,7 +1102,12 @@ fun main() {
         val teardownDone = java.util.concurrent.CountDownLatch(1)
         Thread({
             runCatching {
-                java.awt.EventQueue.invokeAndWait { scene.close() }
+                // The scene and its Skia context are owned by whichever thread
+                // rasterized them and must die there. Ordering is unchanged:
+                // scene first (its disposals stop playback through a live mpv),
+                // then the core, then the video pipeline.
+                val p = uiPipeline
+                if (p != null) p.stop() else java.awt.EventQueue.invokeAndWait { scene.close() }
                 mpv?.quitAndAwaitShutdown()
                 if (pipeline is EdtSampledPipeline) {
                     java.awt.EventQueue.invokeAndWait { pipeline?.stop() }
@@ -1000,6 +1116,9 @@ fun main() {
                 }
                 mpv?.close()
                 java.awt.EventQueue.invokeAndWait {
+                    // uiLayer's wrappers live in the window context, so they
+                    // go here, not with the UI thread's own objects.
+                    uiLayer?.close()
                     surface?.close()
                     renderTarget?.close()
                     uiSurface?.close()
@@ -1012,6 +1131,7 @@ fun main() {
             glfwPollEvents()
         }
         chromeImage?.close()
+        glfwDestroyWindow(uiWindow)
         glfwDestroyWindow(videoWindow)
         glfwDestroyWindow(window)
         glfwTerminate()
