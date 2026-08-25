@@ -41,6 +41,9 @@ private val IsWindowsDesktop: Boolean =
         ?.startsWith("Windows", ignoreCase = true)
         ?: false
 
+private val IsWaylandHost: Boolean
+    get() = com.nuvio.app.features.player.desktop.WaylandVideoBridge.isAvailable
+
 @Composable
 internal actual fun NuvioAsyncImage(
     model: Any?,
@@ -62,7 +65,11 @@ internal actual fun NuvioAsyncImage(
 ) {
     val context = LocalPlatformContext.current
     val effectiveDesktopImageScaling = remember(desktopImageScaling) {
-        if (IsWindowsDesktop) desktopImageScaling else NuvioDesktopImageScaling.Disabled
+        if (IsWindowsDesktop || IsWaylandHost) {
+            desktopImageScaling
+        } else {
+            NuvioDesktopImageScaling.Disabled
+        }
     }
     val requestModel = remember(context, model, effectiveDesktopImageScaling) {
         if (effectiveDesktopImageScaling == NuvioDesktopImageScaling.Disabled) {
