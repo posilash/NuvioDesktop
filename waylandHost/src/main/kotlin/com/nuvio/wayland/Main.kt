@@ -236,9 +236,43 @@ fun main(args: Array<String>) {
                 // lined up against the host's [session] traces.
                 setOption("msg-time", "yes")
             }
-            userMpvConfPath()?.let {
-                val ok = loadConfigFile(it)
-                println("mpv config: $it ${if (ok) "loaded" else "FAILED"}")
+            val userConf = userMpvConfPath()
+            if (userConf != null) {
+                val ok = loadConfigFile(userConf)
+                println("mpv config: $userConf ${if (ok) "loaded" else "FAILED"}")
+            } else {
+                // NuvioLinux's built-in defaults, which it applies for exactly
+                // this case: a user config is taken wholesale, and without one
+                // the player would otherwise run on stock mpv defaults. Its
+                // terminal and msg-level are left out -- this host logs through
+                // them, and videoLog already decides how loud that is.
+                println("mpv config: none found, applying built-in defaults")
+                // Preferences, not invariants: an option this mpv does not
+                // have is skipped rather than fatal. NuvioLinux also sets
+                // vd-queue-min-bytes, which no mpv has -- the real queue
+                // options are enable/max-secs/max-bytes/max-samples -- and
+                // never notices because it ignores the return.
+                for ((name, value) in listOf(
+                    "cache" to "yes",
+                    "cache-secs" to "300",
+                    "demuxer-max-bytes" to "500M",
+                    "demuxer-max-back-bytes" to "100M",
+                    "keep-open" to "no",
+                    "audio-file-auto" to "no",
+                    "sub-auto" to "no",
+                    "osd-level" to "0",
+                    "input-default-bindings" to "no",
+                    "input-vo-keyboard" to "no",
+                    "video-sync" to "display-resample",
+                    "video-sync-max-video-change" to "5",
+                    // Frame queue: smooths out decode bursts.
+                    "vd-queue-enable" to "yes",
+                    "vd-queue-max-bytes" to "50000000",
+                    "vd-queue-max-samples" to "30",
+                )) {
+                    runCatching { setOption(name, value) }
+                        .onFailure { println("mpv default $name skipped: ${it.message}") }
+                }
             }
             // Embedding invariants, applied after the user config so no
             // config can break the player (same set NuvioLinux enforces):
