@@ -236,6 +236,25 @@ private fun configureDesktopChrome() {
     }
 }
 
+/**
+ * The startup [main] runs before its window, for hosts that bring their own.
+ *
+ * Everything here is private or internal to this module, so the Wayland host
+ * cannot call it piecemeal -- without this its plugins have no QuickJS library
+ * path, deep links passed on the command line are dropped, and nuvio:// URIs
+ * go unhandled. Left out on purpose: initGtkEarly (pins GDK to X11 for an
+ * overlay this host does not use), the renderer preference and the native
+ * player preload (both for the AWT player it replaces), and the AWT window
+ * icon.
+ */
+fun startDesktopRuntimeWithoutWindow(args: Array<String>) {
+    configureDesktopQuickJsLibrary()
+    installDesktopOpenUriHandler()
+    handleDesktopLaunchArgs(args)
+    ProfileRepository.loadCachedProfiles()
+    DiscordPresenceManager.start()
+}
+
 private fun installDesktopOpenUriHandler() {
     if (!Desktop.isDesktopSupported()) return
     val desktop = runCatching { Desktop.getDesktop() }.getOrNull() ?: return

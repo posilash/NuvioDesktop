@@ -92,6 +92,9 @@ private fun sampleFramebuffer(width: Int, height: Int): String {
     return out.toString()
 }
 
+/** Command line, for the deep links the app's own startup would handle. */
+private var launchArgs: Array<String> = emptyArray()
+
 /** Resident set size in MB, for the SIGKILL investigation: evidence, not theory. */
 private fun rssMb(): Long = runCatching {
     java.io.File("/proc/self/status").useLines { lines ->
@@ -101,7 +104,8 @@ private fun rssMb(): Long = runCatching {
 }.getOrDefault(-1)
 
 @OptIn(ExperimentalComposeUiApi::class)
-fun main() {
+fun main(args: Array<String>) {
+    launchArgs = args
     // LWJGL's per-thread MemoryStack default (64KB) is captured when the
     // class first loads -- which happens at glfwInit, so raising it later
     // (as the Vulkan pipeline needs: VkInstance enumerates ~230 device
@@ -476,12 +480,10 @@ fun main() {
     val smokePlayerUrl = System.getProperty("nuvio.wayland.smokePlayer")
     onSceneThreadAndWait {
     if (runRealApp) {
-        // Same preamble Main.kt runs before showing its window. initGtkEarly is
-        // deliberately not called: it pins GDK to X11 for the WebKitGTK control
-        // overlay, which this host does not use.
-        com.nuvio.app.features.profiles.ProfileRepository.loadCachedProfiles()
-        // AppIconRepository is skipped: it only feeds the AWT window icon, and
-        // GLFW sets ours.
+        // The preamble Main.kt runs before showing its window: QuickJS for
+        // plugins, the URI handler, launch args, cached profiles, Discord.
+        // What it leaves out, and why, is documented there.
+        com.nuvio.app.startDesktopRuntimeWithoutWindow(launchArgs)
         if (smokePlayerUrl != null) {
             scene.setContent {
                 com.nuvio.app.core.ui.NuvioTheme {
