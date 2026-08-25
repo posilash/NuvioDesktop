@@ -839,6 +839,16 @@ fun main(args: Array<String>) {
     // whichever thread owns the scene, which is no longer necessarily the EDT.
     uiPipeline?.let { p -> input.dispatch = { block -> p.post(block) } }
     input.install()
+    // Only while something is playing: off the player these are plain Back and
+    // Forward, and MainAppContent already pops the back stack on one of them.
+    input.onThumbButton = { type ->
+        if (videoHost?.hasFile == true) {
+            java.awt.EventQueue.invokeLater {
+                com.nuvio.app.features.player.desktop.WaylandVideoBridge
+                    .onChromeEvent?.invoke(type, 0.0)
+            }
+        }
+    }
     wpeChrome?.let { c ->
         input.chrome = c
         // Long enough for the page's 1400ms toast and its fade. Compositing a

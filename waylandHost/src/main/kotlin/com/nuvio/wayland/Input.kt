@@ -52,6 +52,13 @@ class InputRouter(
      * raised over hidden controls asks for no frames and nothing composites it.
      */
     var onChromeInput: (() -> Unit)? = null
+
+    /**
+     * Thumb button pressed, as the chrome event name the page would have sent.
+     * Upstream's Linux bridge synthesises the same two from GTK so both
+     * platforms end up in one Kotlin handler; the host is that bridge here.
+     */
+    var onThumbButton: ((String) -> Unit)? = null
     var chromeScaleX: Float = 1f
     var chromeScaleY: Float = 1f
     private var chromeButtons = 0
@@ -99,7 +106,19 @@ class InputRouter(
                 GLFW_MOUSE_BUTTON_LEFT -> PointerButton.Primary
                 GLFW_MOUSE_BUTTON_RIGHT -> PointerButton.Secondary
                 GLFW_MOUSE_BUTTON_MIDDLE -> PointerButton.Tertiary
+                // Dropping these is why the thumb buttons did nothing here.
+                // X11 numbers them 8 and 9 and upstream has to re-post them for
+                // AWT, which reads them as 6 and 7; GLFW hands them over
+                // already separated, so they only need naming.
+                GLFW_MOUSE_BUTTON_4 -> PointerButton.Back
+                GLFW_MOUSE_BUTTON_5 -> PointerButton.Forward
                 else -> return@glfwSetMouseButtonCallback
+            }
+            if (action == GLFW_PRESS && composeButton != PointerButton.Primary) {
+                when (button) {
+                    GLFW_MOUSE_BUTTON_4 -> onThumbButton?.invoke("seekBack")
+                    GLFW_MOUSE_BUTTON_5 -> onThumbButton?.invoke("seekForward")
+                }
             }
             // Compose expects the button mask to already reflect the new state
             // when the press arrives, and to have it cleared before the release.
