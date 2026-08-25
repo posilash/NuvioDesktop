@@ -140,15 +140,38 @@ fun main(args: Array<String>) {
     }
     println("GLFW platform: $platformName")
 
+    // A Vulkan surface needs the window to have no client API: one wl_surface
+    // has one buffer producer, and GLFW's EGL surface would be it. The scene
+    // still renders with GL, from a context of its own -- see glOwner below.
+    val vkSwapchain = System.getProperty("nuvio.wayland.vkSwapchain")?.toBoolean() == true
+
     glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 3)
     glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 3)
     glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_CORE_PROFILE)
     glfwWindowHint(GLFW_VISIBLE, GLFW_TRUE)
+    if (vkSwapchain) glfwWindowHint(GLFW_CLIENT_API, GLFW_NO_API)
 
     val window = glfwCreateWindow(INITIAL_WIDTH, INITIAL_HEIGHT, "Nuvio Wayland host", NULL, NULL)
     if (window == NULL) {
         glfwTerminate()
         error("glfwCreateWindow failed")
+    }
+
+    // Who owns the GL context the presenting thread renders with. Normally the
+    // visible window; under a Vulkan swapchain it has no context to own, so an
+    // invisible one stands in and every share group hangs off it instead.
+    val glOwner: Long
+    if (vkSwapchain) {
+        glfwWindowHint(GLFW_CLIENT_API, GLFW_OPENGL_API)
+        glfwWindowHint(GLFW_VISIBLE, GLFW_FALSE)
+        glOwner = glfwCreateWindow(64, 64, "nuvio-gl", NULL, NULL)
+        if (glOwner == NULL) {
+            glfwTerminate()
+            error("glfwCreateWindow (gl owner) failed")
+        }
+        glfwWindowHint(GLFW_VISIBLE, GLFW_TRUE)
+    } else {
+        glOwner = window
     }
 
     // Second, invisible window whose context shares objects with the first:
@@ -157,7 +180,7 @@ fun main(args: Array<String>) {
     // elsewhere during creation. Textures made in one are usable in the other;
     // that sharing is what makes the video path zero-copy end to end.
     glfwWindowHint(GLFW_VISIBLE, GLFW_FALSE)
-    val videoWindow = glfwCreateWindow(64, 64, "nuvio-video", NULL, window)
+    val videoWindow = glfwCreateWindow(64, 64, "nuvio-video", NULL, glOwner)
     if (videoWindow == NULL) {
         glfwTerminate()
         error("glfwCreateWindow (video context) failed")
@@ -168,7 +191,7 @@ fun main(args: Array<String>) {
     // current on one thread, and the scene now rasterizes on its own. Created
     // here, before any context goes current elsewhere, because GLFW requires
     // the share context not be current on another thread during creation.
-    val uiWindow = glfwCreateWindow(64, 64, "nuvio-ui", NULL, window)
+    val uiWindow = glfwCreateWindow(64, 64, "nuvio-ui", NULL, glOwner)
     if (uiWindow == NULL) {
         glfwTerminate()
         error("glfwCreateWindow (ui context) failed")
@@ -202,7 +225,7 @@ fun main(args: Array<String>) {
     println("pace: vsyncMode=$vsyncMode vblank=${"%.2f".format(vblankNs / 1e6)}ms")
 
     java.awt.EventQueue.invokeAndWait {
-        glfwMakeContextCurrent(window)
+        glfwMakeContextCurrent(glOwner)
         glfwSwapInterval(if (vsyncMode == 1) 1 else 0)
         GL.createCapabilities()
         println("GL_RENDERER: " + GL11.glGetString(GL11.GL_RENDERER))
@@ -212,6 +235,19 @@ fun main(args: Array<String>) {
         // touches GLX or X11 here. This is the whole reason the AWT-free path
         // works on Wayland while the AWT one cannot.
         context = DirectContext.makeGL()
+    }
+
+    // Owns the window's surface when there is no GL one. Bound before the Skia
+    // surface is built: recreateSurface() wraps whatever framebuffer is current,
+    // so binding here is what points the whole scene at the exported image.
+    val presenter: VkPresenter? = if (vkSwapchain) VkPresenter(window) else null
+    if (presenter != null) {
+        java.awt.EventQueue.invokeAndWait {
+            val fw = IntArray(1); val fh = IntArray(1)
+            glfwGetFramebufferSize(window, fw, fh)
+            presenter.init(maxOf(fw[0], 1), maxOf(fh[0], 1))
+            GL30.glBindFramebuffer(GL30.GL_FRAMEBUFFER, presenter.fbo)
+        }
     }
 
     // Optional video layer. mpv renders on its own thread, into textures the
@@ -459,6 +495,9 @@ fun main(args: Array<String>) {
         surface?.close()
         renderTarget?.close()
         uiSurface?.close()
+        // Explicit, not ambient: this wraps whatever framebuffer is bound, and
+        // between the presenter's setup and here half the host's GL work runs.
+        presenter?.let { GL30.glBindFramebuffer(GL30.GL_FRAMEBUFFER, it.fbo) }
         renderTarget = BackendRenderTarget.makeGL(
             width, height, 0, 8,
             GL30.glGetInteger(GL30.GL_FRAMEBUFFER_BINDING),
@@ -934,13 +973,23 @@ fun main(args: Array<String>) {
     // surface is new and holds nothing, so "nothing changed" would leave the
     // window blank.
     var forceRepaint = true
+    // Which target image the Skia surface was built against.
+    var presenterGeneration = 0
 
     /** Returns true if this iteration actually presented a frame. */
     fun renderOneFrame(): Boolean {
 
         val w = IntArray(1); val h = IntArray(1)
-        glfwGetFramebufferSize(window, w, h)
-        if (w[0] != width || h[0] != height) {
+        // With a Vulkan swapchain the window has no framebuffer to measure;
+        // the surface's extent is the size, and the presenter reports it.
+        if (presenter != null) {
+            w[0] = presenter.width; h[0] = presenter.height
+        } else {
+            glfwGetFramebufferSize(window, w, h)
+        }
+        val targetChanged = presenter != null && presenter.generation != presenterGeneration
+        if (w[0] != width || h[0] != height || targetChanged) {
+            presenterGeneration = presenter?.generation ?: 0
             width = w[0]; height = h[0]
             if (width > 0 && height > 0) {
                 recreateSurface()
@@ -1251,7 +1300,7 @@ fun main(args: Array<String>) {
         // controls responsive while Compose is busy.
         chromeLayer?.let { l ->
             l.update()
-            GL30.glBindFramebuffer(GL30.GL_FRAMEBUFFER, 0)
+            GL30.glBindFramebuffer(GL30.GL_FRAMEBUFFER, presenter?.fbo ?: 0)
             l.draw(width, height, originBottomLeft = true)
             context.resetGLAll()
         }
@@ -1276,7 +1325,7 @@ fun main(args: Array<String>) {
             // Whole-frame scan: distinguishes "not rendered" from "rendered in
             // the wrong place". Reports the y-range of near-white pixels.
             val buf = java.nio.ByteBuffer.allocateDirect(width * height * 4)
-            GL30.glBindFramebuffer(GL30.GL_FRAMEBUFFER, 0)
+            GL30.glBindFramebuffer(GL30.GL_FRAMEBUFFER, presenter?.fbo ?: 0)
             GL11.glReadPixels(0, 0, width, height, GL11.GL_RGBA, GL11.GL_UNSIGNED_BYTE, buf)
             var bright = 0; var minY = -1; var maxY = -1; var minX = -1; var maxX = -1
             for (y in 0 until height step 2) {
@@ -1306,7 +1355,7 @@ fun main(args: Array<String>) {
             }
             if (frames % 30 == 0) {
                 val px = java.nio.ByteBuffer.allocateDirect(4)
-                GL30.glBindFramebuffer(GL30.GL_FRAMEBUFFER, 0)
+                GL30.glBindFramebuffer(GL30.GL_FRAMEBUFFER, presenter?.fbo ?: 0)
                 GL11.glReadPixels(8, height / 2, 1, 1, GL11.GL_RGBA, GL11.GL_UNSIGNED_BYTE, px)
                 val v = (px.get(0).toInt() and 0xFF) + (px.get(1).toInt() and 0xFF) + (px.get(2).toInt() and 0xFF)
                 println("[resize-test] frame=$frames edgeSum=$v (${if (v > 30) "CONTENT" else "bar"})")
@@ -1320,7 +1369,7 @@ fun main(args: Array<String>) {
             // frame from a frozen one -- which is exactly the bug it missed.
             val n = 64
             val buf = java.nio.ByteBuffer.allocateDirect(n * n * 4)
-            GL30.glBindFramebuffer(GL30.GL_FRAMEBUFFER, 0)
+            GL30.glBindFramebuffer(GL30.GL_FRAMEBUFFER, presenter?.fbo ?: 0)
             GL11.glReadPixels(
                 (width - n) / 2, (height - n) / 2, n, n,
                 GL11.GL_RGBA, GL11.GL_UNSIGNED_BYTE, buf,
@@ -1357,7 +1406,7 @@ fun main(args: Array<String>) {
             nextSwapDueNs += vblankNs
         }
         t = System.nanoTime()
-        glfwSwapBuffers(window)
+        if (presenter != null) presenter.present() else glfwSwapBuffers(window)
         timings.add("swap", System.nanoTime() - t)
         // Vsync feedback: with ADVANCED_CONTROL this is the clock mpv times
         // against, and its contract is one call per swap -- what a real VO gets

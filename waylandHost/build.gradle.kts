@@ -126,7 +126,7 @@ compose.desktop.application {
             "chromeAlwaysOn", "chromeScaleMul",
             // Test lever: the window size the host asks for, so chrome cost
             // can be measured against pixel area without touching the compositor.
-            "winW", "winH", "displayFps", "vsync",
+            "winW", "winH", "displayFps", "vsync", "vkSwapchain", "vkProbe",
         )) {
             providers.gradleProperty("nuvio.wayland.$k").orNull
                 ?.let { add("-Dnuvio.wayland.$k=$it") }
