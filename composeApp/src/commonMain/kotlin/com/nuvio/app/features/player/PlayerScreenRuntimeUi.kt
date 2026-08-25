@@ -19,6 +19,7 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.layout.onSizeChanged
 import co.touchlab.kermit.Logger
+import com.nuvio.app.isDesktop
 import com.nuvio.app.core.format.formatReleaseDateForDisplay
 import com.nuvio.app.core.i18n.localizedByteUnit
 import com.nuvio.app.core.ui.AppPresenceState
@@ -166,7 +167,7 @@ internal fun PlayerScreenRuntime.RenderPlayerRuntimeUi() {
     val playerSurfaceSourceUrl = if (isP2pPlaybackActive) p2pResolvedSourceUrl else activeSourceUrl
     val initialPositionRequestKey = currentInitialPositionRequestKey()
     val currentPlayerSurfaceSource = playerSurfaceSourceUrl?.let { sourceUrl ->
-        RetainedPlayerSurfaceSource(
+        PlayerSurfaceSource(
             sourceUrl = sourceUrl,
             sourceAudioUrl = activeSourceAudioUrl,
             sourceHeaders = activeSourceHeaders,
@@ -177,7 +178,12 @@ internal fun PlayerScreenRuntime.RenderPlayerRuntimeUi() {
             initialPositionRequestKey = initialPositionRequestKey,
         )
     }
-    val effectivePlayerSurfaceSource = currentPlayerSurfaceSource ?: retainedPlayerSurfaceSource
+    val renderPlayerSurface = shouldRenderPlayerSurface(
+        hasCurrentSource = currentPlayerSurfaceSource != null,
+        hasLifecycleController = playerLifecycleController != null,
+        releaseInFlight = playerReleaseSurfaceRetention.inFlight,
+        desktop = isDesktop,
+    )
     val openingOverlayWanted = playerSettingsUiState.showLoadingOverlay &&
         !initialLoadCompleted &&
         errorMessage == null
@@ -466,18 +472,21 @@ internal fun PlayerScreenRuntime.RenderPlayerRuntimeUi() {
             .onSizeChanged { layoutSize = it }
             .then(surfaceGestures),
     ) {
-        effectivePlayerSurfaceSource?.let { surfaceSource ->
+        if (renderPlayerSurface) {
+            val surfaceSource = currentPlayerSurfaceSource
+            val sourceAvailable = surfaceSource != null
             PlatformPlayerSurface(
-                sourceUrl = surfaceSource.sourceUrl,
-                sourceAudioUrl = surfaceSource.sourceAudioUrl,
-                sourceHeaders = surfaceSource.sourceHeaders,
-                sourceResponseHeaders = surfaceSource.sourceResponseHeaders,
-                externalSubtitles = surfaceSource.externalSubtitles,
-                streamType = surfaceSource.streamType,
+                sourceUrl = surfaceSource?.sourceUrl.orEmpty(),
+                sourceAvailable = sourceAvailable,
+                sourceAudioUrl = surfaceSource?.sourceAudioUrl,
+                sourceHeaders = surfaceSource?.sourceHeaders.orEmpty(),
+                sourceResponseHeaders = surfaceSource?.sourceResponseHeaders.orEmpty(),
+                externalSubtitles = surfaceSource?.externalSubtitles.orEmpty(),
+                streamType = surfaceSource?.streamType,
                 modifier = Modifier.fillMaxSize(),
-                playWhenReady = shouldPlay && currentPlayerSurfaceSource != null,
-                initialPositionMs = surfaceSource.initialPositionMs,
-                initialPositionRequestKey = surfaceSource.initialPositionRequestKey,
+                playWhenReady = shouldPlay && sourceAvailable,
+                initialPositionMs = surfaceSource?.initialPositionMs,
+                initialPositionRequestKey = surfaceSource?.initialPositionRequestKey,
                 resizeMode = resizeMode,
                 playerControlsState = playerControlsState,
                 onPlayerControlsAction = { action -> handlePlayerControlsAction(action) },
@@ -496,10 +505,9 @@ internal fun PlayerScreenRuntime.RenderPlayerRuntimeUi() {
                     }
                 },
                 onControllerReady = { controller ->
-                    playerController = controller.takeIf { currentPlayerSurfaceSource != null }
+                    playerController = controller.takeIf { sourceAvailable }
                     playerLifecycleController = controller
-                    currentPlayerSurfaceSource?.let { retainedPlayerSurfaceSource = it }
-                    playerControllerSourceUrl = currentPlayerSurfaceSource?.sourceUrl
+                    playerControllerSourceUrl = surfaceSource?.sourceUrl
                 },
                 onSnapshot = { snapshot ->
                     playbackSnapshot = snapshot
@@ -534,7 +542,7 @@ internal fun PlayerScreenRuntime.RenderPlayerRuntimeUi() {
                 seasonNumber = activeSeasonNumber,
                 episodeNumber = activeEpisodeNumber,
                 episodeTitle = activeEpisodeTitle,
-                pauseDescription = pauseDescription ?: activeStreamSubtitle,
+                pauseDescription = activePauseDescription ?: activeStreamSubtitle,
                 providerName = activeProviderName,
                 metrics = metrics,
                 horizontalSafePadding = horizontalSafePadding,
@@ -710,22 +718,34 @@ private fun PlayerScreenRuntime.requestBack() {
     flushWatchProgress()
     val exitingController = playerLifecycleController
     args.onBack { afterRelease, releaseFailed ->
-        releaseRetainedPlayerBeforeNavigation(
-            controller = exitingController,
-            navigateBack = {
-                if (playerLifecycleController === exitingController) {
-                    playerLifecycleController = null
-                }
-                if (playerController === exitingController) {
-                    playerController = null
-                }
-                afterRelease()
-            },
-            onReleaseFailed = { message ->
-                errorMessage = message
-                releaseFailed(message)
-            },
-        )
+        val releaseAttemptId = playerReleaseSurfaceRetention.begin()
+        try {
+            releaseRetainedPlayerBeforeNavigation(
+                controller = exitingController,
+                navigateBack = {
+                    if (!playerReleaseSurfaceRetention.finish(releaseAttemptId)) {
+                        return@releaseRetainedPlayerBeforeNavigation
+                    }
+                    if (playerLifecycleController === exitingController) {
+                        playerLifecycleController = null
+                    }
+                    if (playerController === exitingController) {
+                        playerController = null
+                    }
+                    afterRelease()
+                },
+                onReleaseFailed = { message ->
+                    if (!playerReleaseSurfaceRetention.finish(releaseAttemptId)) {
+                        return@releaseRetainedPlayerBeforeNavigation
+                    }
+                    errorMessage = message
+                    releaseFailed(message)
+                },
+            )
+        } catch (failure: Throwable) {
+            playerReleaseSurfaceRetention.finish(releaseAttemptId)
+            throw failure
+        }
     }
 }
 
@@ -1617,6 +1637,7 @@ private fun BoxScope.RenderPlaybackOverlays(
             nextEpisodeAutoPlaySearching = nextEpisodeAutoPlaySearching,
             nextEpisodeAutoPlaySourceName = nextEpisodeAutoPlaySourceName,
             nextEpisodeAutoPlayCountdown = nextEpisodeAutoPlayCountdown,
+            blurUnwatchedEpisodes = metaScreenSettingsUiState.blurUnwatchedEpisodes,
             onPlayNextEpisode = {
                 nextEpisodeAutoPlayJob?.cancel()
                 playNextEpisode()

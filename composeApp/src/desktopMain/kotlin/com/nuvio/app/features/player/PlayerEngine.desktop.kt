@@ -54,6 +54,7 @@ actual fun PlatformPlayerSurface(
     onControllerReady: (PlayerEngineController) -> Unit,
     onSnapshot: (PlayerPlaybackSnapshot) -> Unit,
     onError: (String?) -> Unit,
+    sourceAvailable: Boolean,
 ) {
     // An AWT-free host renders video itself, into the same GL context Compose
     // draws into, so there is no component to embed and SwingPanel -- which
@@ -89,6 +90,7 @@ actual fun PlatformPlayerSurface(
     ) {
         NativePlayerSurface(
             sourceUrl = sourceUrl,
+            sourceAvailable = sourceAvailable,
             sourceHeaders = sourceHeaders,
             modifier = modifier,
             playWhenReady = playWhenReady,
@@ -120,6 +122,7 @@ actual fun PlatformPlayerSurface(
 @Composable
 private fun NativePlayerSurface(
     sourceUrl: String,
+    sourceAvailable: Boolean,
     sourceHeaders: Map<String, String>,
     modifier: Modifier,
     playWhenReady: Boolean,
@@ -185,7 +188,7 @@ private fun NativePlayerSurface(
         )
     }
 
-    DisposableEffect(controller, sourceUrl, playbackHeaders) {
+    DisposableEffect(controller, sourceAvailable, sourceUrl, playbackHeaders) {
         onDispose { controller.dispose() }
     }
 
@@ -208,6 +211,7 @@ private fun NativePlayerSurface(
 
     LaunchedEffect(
         controller,
+        sourceAvailable,
         sourceUrl,
         playbackHeaders,
         decoderPriority,
@@ -216,7 +220,7 @@ private fun NativePlayerSurface(
         initialPositionMs,
         initialPositionRequestKey,
     ) {
-        if (!hostFirstFullSizePaintComplete.value) {
+        if (!sourceAvailable || !hostFirstFullSizePaintComplete.value) {
             return@LaunchedEffect
         }
         delay(16L)
@@ -235,7 +239,8 @@ private fun NativePlayerSurface(
         onControllerReady(controller)
     }
 
-    LaunchedEffect(controller, playWhenReady) {
+    LaunchedEffect(controller, sourceAvailable, playWhenReady) {
+        if (!sourceAvailable) return@LaunchedEffect
         if (playWhenReady) {
             controller.play()
         } else {

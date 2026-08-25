@@ -34,13 +34,27 @@ import java.util.concurrent.CountDownLatch
 import javax.swing.SwingUtilities
 import kotlin.concurrent.Volatile
 
+internal typealias NativePlayerCreate = (
+    Long,
+    String,
+    Array<String>,
+    Boolean,
+    Long,
+    String,
+    Int,
+    Boolean,
+    NativePlayerEventSink,
+) -> Long
+
 internal class NativePlayerController(
     private val host: NativePlayerHost,
+    private val nativeCreate: NativePlayerCreate = NativePlayerBridge::create,
     private val nativeDispose: (Long) -> Unit = NativePlayerBridge::dispose,
     private val isHostDisplayable: () -> Boolean = { host.isDisplayable },
     private val resolveHostView: () -> Long = { AwtNativeViewResolver.resolveNativeViewPointer(host) },
     private val createWaitTimeoutMs: Long = 5_000L,
     private val releaseTimeoutMs: Long = 10_000L,
+    private val onCreateWaitCompleted: () -> Unit = {},
 ) : PlayerEngineController {
     private companion object {
         val json = Json { ignoreUnknownKeys = true }
@@ -216,6 +230,7 @@ internal class NativePlayerController(
             synchronized(lifecycleLock) {
                 if (createWaitInFlight === Thread.currentThread()) createWaitInFlight = null
             }
+            runCatching { onCreateWaitCompleted() }
             SwingUtilities.invokeLater {
                 if (releaseRequested || !runCatching { isHostDisplayable() }.getOrDefault(false)) {
                     return@invokeLater
@@ -272,16 +287,16 @@ internal class NativePlayerController(
         val createWorker = Thread({
             try {
                 runCatching {
-                    NativePlayerBridge.create(
-                        hostViewPtr = hostViewPtr,
-                        sourceUrl = resolvedSource,
-                        headerLines = pending.headerLines.toTypedArray(),
-                        playWhenReady = pending.playWhenReady,
-                        initialPositionMs = pending.initialPositionMs,
-                        controlsPageUrl = NativePlayerBridge.controlsPageUrl,
-                        decoderPriority = pending.decoderPriority,
-                        nvidiaRtxSuperResolutionEnabled = pending.nvidiaRtxSuperResolutionEnabled,
-                        eventSink = eventSink,
+                    nativeCreate(
+                        hostViewPtr,
+                        resolvedSource,
+                        pending.headerLines.toTypedArray(),
+                        pending.playWhenReady,
+                        pending.initialPositionMs,
+                        NativePlayerBridge.controlsPageUrl,
+                        pending.decoderPriority,
+                        pending.nvidiaRtxSuperResolutionEnabled,
+                        eventSink,
                     ).also { if (it == 0L) error("Native player did not return a handle.") }
                 }.onSuccess { created ->
                     val accepted = synchronized(lifecycleLock) {

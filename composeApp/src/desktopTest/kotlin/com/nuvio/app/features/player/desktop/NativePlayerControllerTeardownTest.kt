@@ -14,6 +14,10 @@ import kotlin.test.assertNotNull
 import kotlin.test.assertNull
 import kotlin.test.assertTrue
 
+private val failNativeCreate: NativePlayerCreate = { _, _, _, _, _, _, _, _, _ ->
+    error("native create must not run in lifecycle unit tests")
+}
+
 class NativePlayerControllerTeardownTest {
     @Test
     fun completesNavigationOnlyAfterNativeHandleIsDisposed() {
@@ -22,6 +26,7 @@ class NativePlayerControllerTeardownTest {
         val host = NativePlayerHost()
         val controller = NativePlayerController(
             host = host,
+            nativeCreate = failNativeCreate,
             nativeDispose = { handle -> events += "disposed-$handle" },
         )
         controller.setNativeHandleForTest(42L)
@@ -38,7 +43,7 @@ class NativePlayerControllerTeardownTest {
     @Test
     fun releaseInvalidatesPendingAttachBeforeItsNativeCreateCanPublish() {
         val host = NativePlayerHost()
-        val controller = NativePlayerController(host = host)
+        val controller = NativePlayerController(host = host, nativeCreate = failNativeCreate, nativeDispose = {})
 
         controller.attach(
             sourceUrl = "https://example.invalid/video.mp4",
@@ -60,19 +65,101 @@ class NativePlayerControllerTeardownTest {
     }
 
     @Test
+    fun sourceGapsDisposeSuccessfulSupersededCreatesBeforeReplacementPublication() {
+        val sourceA = "https://example.invalid/a.mp4"
+        val sourceB = "https://example.invalid/b.mp4"
+        val createAStarted = CountDownLatch(1)
+        val allowCreateA = CountDownLatch(1)
+        val createBStarted = CountDownLatch(1)
+        val allowCreateB = CountDownLatch(1)
+        val disposedA = CountDownLatch(1)
+        val disposedB = CountDownLatch(1)
+        val createdSources = Collections.synchronizedList(mutableListOf<String>())
+        val disposedHandles = Collections.synchronizedList(mutableListOf<Long>())
+        val controller = NativePlayerController(
+            host = NativePlayerHost(),
+            nativeCreate = { _, source, _, _, _, _, _, _, _ ->
+                createdSources += source
+                when (source) {
+                    sourceA -> {
+                        createAStarted.countDown()
+                        allowCreateA.await()
+                        41L
+                    }
+                    sourceB -> {
+                        createBStarted.countDown()
+                        allowCreateB.await()
+                        42L
+                    }
+                    else -> error("unexpected source: $source")
+                }
+            },
+            nativeDispose = { handle ->
+                disposedHandles += handle
+                when (handle) {
+                    41L -> disposedA.countDown()
+                    42L -> disposedB.countDown()
+                    else -> error("unexpected handle: $handle")
+                }
+            },
+            isHostDisplayable = { true },
+            resolveHostView = { 1L },
+        )
+
+        controller.attach(
+            sourceUrl = sourceA,
+            sourceHeaders = emptyMap(),
+            playWhenReady = true,
+            initialPositionMs = 0L,
+            decoderPriority = 0,
+            nvidiaRtxSuperResolutionEnabled = false,
+            onError = {},
+        )
+        assertTrue(createAStarted.await(2, TimeUnit.SECONDS))
+
+        controller.dispose()
+        controller.attach(
+            sourceUrl = sourceB,
+            sourceHeaders = emptyMap(),
+            playWhenReady = true,
+            initialPositionMs = 0L,
+            decoderPriority = 0,
+            nvidiaRtxSuperResolutionEnabled = false,
+            onError = {},
+        )
+
+        allowCreateA.countDown()
+        assertTrue(disposedA.await(2, TimeUnit.SECONDS))
+        assertTrue(createBStarted.await(2, TimeUnit.SECONDS))
+
+        controller.dispose()
+        allowCreateB.countDown()
+        assertTrue(disposedB.await(2, TimeUnit.SECONDS))
+        SwingUtilities.invokeAndWait {}
+
+        assertEquals(listOf(sourceA, sourceB), createdSources.toList())
+        assertEquals(listOf(41L, 42L), disposedHandles.toList())
+        assertNull(controller.pendingSourceForTest())
+    }
+
+    @Test
     fun timedOutCreateWaitCannotReportAfterCapturedWorkerFinishesAndNewCreateStarts() {
         val oldCreateStarted = CountDownLatch(1)
         val allowOldCreate = CountDownLatch(1)
         val blockEdt = CountDownLatch(1)
         val allowEdt = CountDownLatch(1)
+        val createWaitCompleted = CountDownLatch(1)
         val newCreateStarted = CountDownLatch(1)
         val allowNewCreate = CountDownLatch(1)
         val errors = AtomicInteger()
         val controller = NativePlayerController(
             host = NativePlayerHost(),
+            nativeCreate = failNativeCreate,
+            nativeDispose = {},
             isHostDisplayable = { true },
             resolveHostView = { error("host resolution must remain deferred") },
             createWaitTimeoutMs = 50L,
+            onCreateWaitCompleted = { createWaitCompleted.countDown() },
         )
         val oldCreate = thread(isDaemon = true, name = "test-old-native-create") {
             oldCreateStarted.countDown()
@@ -96,7 +183,7 @@ class NativePlayerControllerTeardownTest {
             allowEdt.await()
         }
         assertTrue(blockEdt.await(2, TimeUnit.SECONDS))
-        Thread.sleep(150L)
+        assertTrue(createWaitCompleted.await(2, TimeUnit.SECONDS))
         allowOldCreate.countDown()
         oldCreate.join(2_000L)
         assertFalse(oldCreate.isAlive)
@@ -122,12 +209,16 @@ class NativePlayerControllerTeardownTest {
         val allowCreate = CountDownLatch(1)
         val blockEdt = CountDownLatch(1)
         val allowEdt = CountDownLatch(1)
+        val createWaitCompleted = CountDownLatch(1)
         val replacementErrors = AtomicInteger()
         val controller = NativePlayerController(
             host = NativePlayerHost(),
+            nativeCreate = failNativeCreate,
+            nativeDispose = {},
             isHostDisplayable = { true },
             resolveHostView = { error("host resolution must remain deferred") },
             createWaitTimeoutMs = 50L,
+            onCreateWaitCompleted = { createWaitCompleted.countDown() },
         )
         val create = Thread {
             createStarted.countDown()
@@ -151,7 +242,7 @@ class NativePlayerControllerTeardownTest {
             allowEdt.await()
         }
         assertTrue(blockEdt.await(2, TimeUnit.SECONDS))
-        Thread.sleep(150L)
+        assertTrue(createWaitCompleted.await(2, TimeUnit.SECONDS))
 
         controller.attach(
             sourceUrl = "https://example.invalid/replacement.mp4",
@@ -180,6 +271,8 @@ class NativePlayerControllerTeardownTest {
         val errors = AtomicInteger()
         val controller = NativePlayerController(
             host = NativePlayerHost(),
+            nativeCreate = failNativeCreate,
+            nativeDispose = {},
             isHostDisplayable = { true },
             resolveHostView = {
                 resolvedHosts.incrementAndGet()
@@ -225,6 +318,8 @@ class NativePlayerControllerTeardownTest {
         assertTrue(edtBlocked.await(2, TimeUnit.SECONDS))
         val controller = NativePlayerController(
             host = NativePlayerHost(),
+            nativeCreate = failNativeCreate,
+            nativeDispose = {},
             isHostDisplayable = { true },
             resolveHostView = { resolvedHosts.incrementAndGet().toLong() },
         )
@@ -249,7 +344,7 @@ class NativePlayerControllerTeardownTest {
     @Test
     fun attachIsRejectedAfterNavigationReleaseStarts() {
         val host = NativePlayerHost()
-        val controller = NativePlayerController(host = host)
+        val controller = NativePlayerController(host = host, nativeCreate = failNativeCreate, nativeDispose = {})
         val releaseCompleted = CountDownLatch(1)
 
         controller.releaseBeforeNavigation { releaseCompleted.countDown() }
@@ -271,7 +366,7 @@ class NativePlayerControllerTeardownTest {
     @Test
     fun sourceReplacementDisposePreservesControlCallbacks() {
         val host = NativePlayerHost()
-        val controller = NativePlayerController(host = host)
+        val controller = NativePlayerController(host = host, nativeCreate = failNativeCreate, nativeDispose = {})
         controller.setControlCallbacks(
             onAction = { true },
             onEvent = { _, _ -> true },
@@ -292,6 +387,7 @@ class NativePlayerControllerTeardownTest {
         val released = CountDownLatch(1)
         val controller = NativePlayerController(
             host = NativePlayerHost(),
+            nativeCreate = failNativeCreate,
             nativeDispose = {
                 disposeStarted.countDown()
                 allowDispose.await()
@@ -314,6 +410,7 @@ class NativePlayerControllerTeardownTest {
         val retryError = CountDownLatch(1)
         val controller = NativePlayerController(
             host = NativePlayerHost(),
+            nativeCreate = failNativeCreate,
             nativeDispose = { error("dispose failed") },
             isHostDisplayable = { displayable.get() },
             resolveHostView = {
@@ -349,6 +446,7 @@ class NativePlayerControllerTeardownTest {
         val replacementError = CountDownLatch(1)
         val controller = NativePlayerController(
             host = NativePlayerHost(),
+            nativeCreate = failNativeCreate,
             nativeDispose = {
                 disposeStarted.countDown()
                 allowDisposeFailure.await()
@@ -388,6 +486,7 @@ class NativePlayerControllerTeardownTest {
         val failed = CountDownLatch(1)
         val controller = NativePlayerController(
             host = NativePlayerHost(),
+            nativeCreate = failNativeCreate,
             nativeDispose = {
                 disposeAttempted.countDown()
                 error("dispose failed")
@@ -414,6 +513,7 @@ class NativePlayerControllerTeardownTest {
         val retryFailure = CountDownLatch(1)
         val controller = NativePlayerController(
             host = NativePlayerHost(),
+            nativeCreate = failNativeCreate,
             nativeDispose = { error("dispose failed") },
         )
         controller.setNativeHandleForTest(42L)
@@ -445,6 +545,7 @@ class NativePlayerControllerTeardownTest {
         val released = CountDownLatch(1)
         val controller = NativePlayerController(
             host = NativePlayerHost(),
+            nativeCreate = failNativeCreate,
             nativeDispose = {
                 disposeStarted.countDown()
                 allowDispose.await()
@@ -469,6 +570,7 @@ class NativePlayerControllerTeardownTest {
         val completed = AtomicInteger()
         val controller = NativePlayerController(
             host = NativePlayerHost(),
+            nativeCreate = failNativeCreate,
             nativeDispose = {
                 disposeStarted.countDown()
                 allowDispose.await()
@@ -503,6 +605,8 @@ class NativePlayerControllerTeardownTest {
         val completed = AtomicInteger()
         val controller = NativePlayerController(
             host = NativePlayerHost(),
+            nativeCreate = failNativeCreate,
+            nativeDispose = {},
             releaseTimeoutMs = 50L,
         )
         val create = Thread {
@@ -537,6 +641,7 @@ class NativePlayerControllerTeardownTest {
         val calls = AtomicInteger()
         val controller = NativePlayerController(
             host = NativePlayerHost(),
+            nativeCreate = failNativeCreate,
             nativeDispose = {
                 started.countDown()
                 unblock.await()
@@ -562,7 +667,7 @@ class NativePlayerControllerTeardownTest {
         val teardownStarted = CountDownLatch(1)
         val allowTeardown = CountDownLatch(1)
         val releaseCompleted = CountDownLatch(1)
-        val controller = NativePlayerController(host = NativePlayerHost())
+        val controller = NativePlayerController(host = NativePlayerHost(), nativeCreate = failNativeCreate, nativeDispose = {})
         val teardown = thread(isDaemon = true, name = "test-native-teardown") {
             teardownStarted.countDown()
             allowTeardown.await()
@@ -584,6 +689,7 @@ class NativePlayerControllerTeardownTest {
         val releaseCompleted = CountDownLatch(1)
         val controller = NativePlayerController(
             host = NativePlayerHost(),
+            nativeCreate = failNativeCreate,
             nativeDispose = {
                 disposeStarted.countDown()
                 allowDispose.await()
@@ -610,7 +716,7 @@ class NativePlayerControllerTeardownTest {
     @Test
     fun releaseCompletionWaitsForInFlightNativeCreate() {
         val host = NativePlayerHost()
-        val controller = NativePlayerController(host = host)
+        val controller = NativePlayerController(host = host, nativeCreate = failNativeCreate, nativeDispose = {})
         val createStarted = CountDownLatch(1)
         val allowCreate = CountDownLatch(1)
         val releaseCompleted = CountDownLatch(1)
@@ -639,6 +745,7 @@ class NativePlayerControllerTeardownTest {
         val releaseCompleted = CountDownLatch(1)
         val controller = NativePlayerController(
             host = NativePlayerHost(),
+            nativeCreate = failNativeCreate,
             nativeDispose = {
                 disposeStarted.countDown()
                 allowDispose.await()
@@ -684,6 +791,7 @@ class NativePlayerControllerTeardownTest {
         val completions = AtomicInteger()
         val controller = NativePlayerController(
             host = NativePlayerHost(),
+            nativeCreate = failNativeCreate,
             nativeDispose = {
                 disposeStarted.countDown()
                 allowDispose.await()

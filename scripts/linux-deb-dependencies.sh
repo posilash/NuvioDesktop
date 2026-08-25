@@ -7,6 +7,9 @@ readonly -a NUVIO_LINUX_DEB_RUNTIME_DEPENDENCIES=(
     libwebkit2gtk-4.1-0
     libxcomposite1
     libxext6
+    gstreamer1.0-plugins-good
+    gstreamer1.0-libav
+    glib-networking
 )
 
 deb_relationship_package_count() {
