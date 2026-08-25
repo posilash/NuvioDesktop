@@ -184,14 +184,14 @@ fun main(args: Array<String>) {
     // JAWT, nothing that would drag us back onto X11.
     lateinit var context: DirectContext
 
-    // How the loop is paced. 1 is the swap interval, which on this compositor
+    // How the loop is paced. 2, the default, sets the swap interval to 0 and
+    // holds the commit to the refresh grid itself, which is the shape mpv uses
+    // (context_wayland.c). 1 is the swap interval, and on this compositor that
     // costs exactly half the refresh: Mesa blocks inside eglSwapBuffers and we
-    // present at 82.5 of 165, as does weston-simple-egl. mpv sets the interval
-    // to 0 and paces itself against the vblank instead (context_wayland.c) and
-    // does hit 165, so 2 is that shape -- swap returns immediately and the
-    // commit is held to the refresh grid before it. 0 leaves it uncapped, which
-    // is how the loop's own cost was measured: 443fps, 2.2ms of work.
-    val vsyncMode = System.getProperty("nuvio.wayland.vsync")?.toIntOrNull() ?: 1
+    // present at 82.5 of 165, as does weston-simple-egl, while mpv measures
+    // 164.3 on the same output. 0 leaves it uncapped, which is how the loop's
+    // own cost was measured: 443fps, 2.2ms of work.
+    val vsyncMode = System.getProperty("nuvio.wayland.vsync")?.toIntOrNull() ?: 2
     val vblankNs = run {
         val mon = glfwGetPrimaryMonitor()
         val hz = if (mon != NULL) glfwGetVideoMode(mon)?.refreshRate() ?: 0 else 0
@@ -1376,9 +1376,10 @@ fun main(args: Array<String>) {
             // Input callbacks fire from here, on the main thread, and are
             // forwarded to the EDT by InputRouter.
             val beforePoll = System.nanoTime()
-            // When the last iteration presented, the vsync-blocking swap paces
-            // us. When it did not, there is nothing to block on, so wait for
-            // input with a short timeout instead of spinning -- Compose's own
+            // When the last iteration presented, the swap paces us -- on the
+            // grid in mode 2, blocking in mode 1. When it did not, there is
+            // nothing to wait on, so wait for input with a short timeout
+            // instead of spinning -- Compose's own
             // invalidations do not wake GLFW, hence the timeout rather than an
             // indefinite wait.
             if (presented) glfwPollEvents() else glfwWaitEventsTimeout(0.004)
