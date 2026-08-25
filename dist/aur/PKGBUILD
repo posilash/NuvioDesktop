@@ -4,21 +4,21 @@ pkgname=nuvio-desktop
 _pkgname=nuvio
 pkgver=0.1.20_alpha.r2412.g4652268d
 pkgrel=1
-pkgdesc="A modern media hub desktop application, native Wayland host (git)"
+pkgdesc="A modern media hub desktop application (git)"
 arch=('x86_64')
 url="https://github.com/posilash/NuvioDesktop"
 license=('GPL-3.0-or-later')
-# No Java dependency: the host ships as a jlink image with its own runtime.
-# mpv is here for libmpv's dependencies -- the bundled libmpv.so.2 is built
-# against the same system libraries. The WPE stack backs the player chrome;
-# libglvnd and wayland are what the GLFW window and the isolated fdo display
-# use.
+# No Java dependency: the Compose distributable bundles its own jlink runtime.
+# mpv is here for the bundled libmpv's own dependencies; the WPE stack backs
+# the player chrome where the AWT build uses webkit2gtk; wayland and libglvnd
+# are what the GLFW window and the isolated fdo display use. Xi, Xrender and
+# Xtst stay: the host still runs AWT's event queue, which loads the X11
+# toolkit.
 depends=('mpv' 'libwpe' 'wpebackend-fdo' 'wpewebkit' 'wayland' 'libglvnd'
-         'gcc-libs')
+         'gcc-libs' 'libx11' 'libxext' 'libxi' 'libxrender' 'libxtst')
 makedepends=('git' 'java-environment>=17' 'gcc' 'meson' 'ninja' 'pkgconf'
              'vulkan-headers')
 provides=("${pkgname}")
-conflicts=("${pkgname}")
 # The fork carries the render API this host is written against: a gpu-next
 # backend ("opengl-next"), a Vulkan backend, and a render() that does not block
 # without advanced control. Stock libmpv answers NOT_IMPLEMENTED, and the host
@@ -101,13 +101,15 @@ package() {
 	install -Dm755 "${srcdir}/libglxshim.so" \
 		"${pkgdir}/opt/${_pkgname}/lib/libglxshim.so"
 
-	# The wrapper exists for LD_PRELOAD alone: everything else the host needs
-	# is baked into the image's own launcher. The controls page ships inside
-	# the app jar and is unpacked on first run, so nothing is installed for it.
+	# Wrapper rather than a symlink: the launcher resolves the bundled runtime
+	# and the player bridge relative to the application image. LD_PRELOAD is
+	# the one thing this build adds, and the one thing no jpackage java-option
+	# can express -- it has to be set before the JVM starts.
 	install -Dm755 /dev/stdin "${pkgdir}/usr/bin/${_pkgname}" <<'EOF'
 #!/bin/sh
+export LD_LIBRARY_PATH="/opt/nuvio/lib:/opt/nuvio/lib/runtime/lib:${LD_LIBRARY_PATH}"
 export LD_PRELOAD="/opt/nuvio/lib/libglxshim.so${LD_PRELOAD:+:${LD_PRELOAD}}"
-exec /opt/nuvio/bin/Nuvio "$@"
+exec "/opt/nuvio/bin/Nuvio" "$@"
 EOF
 
 	install -Dm644 dist/desktop/nuvio.desktop \

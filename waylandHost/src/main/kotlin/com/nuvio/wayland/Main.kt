@@ -105,36 +105,6 @@ private fun runRealApp(): Boolean {
     return System.getProperty("nuvio.wayland.realApp")?.toBoolean() ?: true
 }
 
-/**
- * The controls page from the classpath, unpacked so WebKit can open it.
- *
- * An installed build has no source tree, and the page ships inside the app's
- * jar (player-ui/), where WPE cannot reach it: it wants a URI it can load, and
- * jar: is not one. Unpacking beside the rest of the cache costs three files
- * once per version.
- */
-private fun extractedChromePage(): String? = runCatching {
-    val names = listOf("controls.html", "controls.css", "controls.js")
-    val loader = object {}.javaClass.classLoader
-    val dir = java.nio.file.Path.of(
-        System.getProperty("user.home"), ".cache", "nuvio", "player-ui",
-    )
-    java.nio.file.Files.createDirectories(dir)
-    for (name in names) {
-        val bytes = loader.getResourceAsStream("player-ui/$name")?.use { it.readBytes() }
-            ?: return@runCatching null
-        val target = dir.resolve(name)
-        // Rewritten when it differs, so an upgraded package is not left
-        // serving the previous version's page.
-        if (!java.nio.file.Files.exists(target) ||
-            !java.nio.file.Files.readAllBytes(target).contentEquals(bytes)
-        ) {
-            java.nio.file.Files.write(target, bytes)
-        }
-    }
-    "file://" + dir.resolve("controls.html").toAbsolutePath()
-}.getOrNull()
-
 /** Command line, for the deep links the app's own startup would handle. */
 private var launchArgs: Array<String> = emptyArray()
 
@@ -692,13 +662,13 @@ fun main(args: Array<String>) {
         // An installed build has no repo, so the override is checked first --
         // looking for the source tree and failing before reading it left the
         // packaged host dead on arrival.
+        // The app's own exporter: it unpacks the page to a versioned cache with
+        // the @font-face rules and the JetBrains Sans faces substituted in.
+        // Reading controls.css off the source tree instead left the
+        // __NUVIO_PLAYER_FONT_FACES__ placeholder unreplaced, so the chrome
+        // rendered in fallback fonts.
         val pageUri = System.getProperty("nuvio.wayland.chromePage")
-            ?: sequenceOf(
-                java.io.File("composeApp/src/desktopMain/resources/player-ui/controls.html"),
-                java.io.File("../composeApp/src/desktopMain/resources/player-ui/controls.html"),
-            ).map { it.absoluteFile.normalize() }.firstOrNull { it.isFile }?.let { "file://" + it.path }
-            ?: extractedChromePage()
-            ?: error("controls.html not found from ${java.io.File(".").absolutePath}")
+            ?: com.nuvio.app.desktopControlsPageUrl()
         wpeChrome = com.nuvio.wayland.wpe.WpeChrome(
             width = INITIAL_WIDTH,
             height = INITIAL_HEIGHT,

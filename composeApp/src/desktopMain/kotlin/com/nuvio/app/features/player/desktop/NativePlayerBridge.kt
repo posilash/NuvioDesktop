@@ -268,6 +268,9 @@ internal object NativePlayerBridge {
             DesktopHostOs.UNKNOWN -> "player_bridge"
         }
 
+    /** The controls page URL, for a host that loads the page itself. */
+    fun controlsPageUrl(): String = exportControlsPageAssets().url
+
     private fun exportControlsPageAssets(): ControlsPageAssets {
         val files = linkedMapOf(
             "controls.html" to readResourceBytes("/player-ui/controls.html"),

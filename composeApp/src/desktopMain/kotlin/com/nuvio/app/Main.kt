@@ -247,6 +247,9 @@ private fun configureDesktopChrome() {
  * player preload (both for the AWT player it replaces), and the AWT window
  * icon.
  */
+/** The player chrome page, unpacked with its fonts exactly as the app does. */
+fun desktopControlsPageUrl(): String = NativePlayerBridge.controlsPageUrl()
+
 fun startDesktopRuntimeWithoutWindow(args: Array<String>) {
     configureDesktopQuickJsLibrary()
     installDesktopOpenUriHandler()
