@@ -1253,6 +1253,21 @@ internal fun MainAppContent(
                     LocalUseNativeNavigation provides useNativeNavigation,
                     LocalNativeNavigationBarHidden provides (currentRoute?.hidesNavigationBar == true),
                 ) {
+                // NavDisplay's onBack is raised by the platform's own back --
+                // the system button on Android, nothing at all on desktop,
+                // where only the tabs screen registers and it unregisters as
+                // soon as you navigate off it. Desktop-only, so the platforms
+                // that already deliver a back keep delivering exactly one.
+                com.nuvio.app.core.ui.PlatformBackHandler(enabled = isDesktop) {
+                    val routeAtRequest = navController.currentRoute
+                    dispatchNavigationBack(
+                        isPlayerRoute = routeAtRequest is PlayerRoute,
+                        playerBack = registeredPlayerSystemBack
+                            ?.takeIf { (route, _) -> route == routeAtRequest }
+                            ?.second,
+                        pop = { navController.popBackStack() },
+                    )
+                }
                 NavDisplay(
                     backStack = navBackStack,
                     modifier = Modifier.fillMaxSize(),

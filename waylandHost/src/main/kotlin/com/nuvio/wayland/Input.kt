@@ -182,9 +182,15 @@ class InputRouter(
             keys++
             onUiThread {
                 delivered++
-                scene.sendKeyEvent(
+                val consumed = scene.sendKeyEvent(
                     KeyEvent(InternalKeyEvent(Key(vk), type, 0, mods, null)),
                 )
+                // Back, but only for a backspace nothing else wanted: a text
+                // field editing its own content consumes it, so typing in the
+                // search box never navigates.
+                if (!consumed && type == KeyEventType.KeyDown && vk == AwtKeyEvent.VK_BACK_SPACE) {
+                    com.nuvio.app.core.ui.DesktopBackDispatcher.back()
+                }
             }
         }
 
