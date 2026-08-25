@@ -183,11 +183,27 @@ fun main(args: Array<String>) {
     // Note this is AWT the event loop, not AWT the window system: no Canvas, no
     // JAWT, nothing that would drag us back onto X11.
     lateinit var context: DirectContext
+
+    // How the loop is paced. 1 is the swap interval, which on this compositor
+    // costs exactly half the refresh: Mesa blocks inside eglSwapBuffers and we
+    // present at 82.5 of 165, as does weston-simple-egl. mpv sets the interval
+    // to 0 and paces itself against the vblank instead (context_wayland.c) and
+    // does hit 165, so 2 is that shape -- swap returns immediately and the
+    // commit is held to the refresh grid before it. 0 leaves it uncapped, which
+    // is how the loop's own cost was measured: 443fps, 2.2ms of work.
+    val vsyncMode = System.getProperty("nuvio.wayland.vsync")?.toIntOrNull() ?: 1
+    val vblankNs = run {
+        val mon = glfwGetPrimaryMonitor()
+        val hz = if (mon != NULL) glfwGetVideoMode(mon)?.refreshRate() ?: 0 else 0
+        if (hz > 0) 1_000_000_000L / hz else 1_000_000_000L / 60
+    }
+    // The grid the next commit is due on; 0 until the first frame anchors it.
+    var nextSwapDueNs = 0L
+    println("pace: vsyncMode=$vsyncMode vblank=${"%.2f".format(vblankNs / 1e6)}ms")
+
     java.awt.EventQueue.invokeAndWait {
         glfwMakeContextCurrent(window)
-        // Diagnostic lever: 0 unblocks the swap so the loop's own cost can be
-        // measured apart from whatever the compositor paces us at.
-        glfwSwapInterval(System.getProperty("nuvio.wayland.vsync")?.toIntOrNull() ?: 1)
+        glfwSwapInterval(if (vsyncMode == 1) 1 else 0)
         GL.createCapabilities()
         println("GL_RENDERER: " + GL11.glGetString(GL11.GL_RENDERER))
         println("GL_VERSION:  " + GL11.glGetString(GL11.GL_VERSION))
@@ -1274,6 +1290,26 @@ fun main(args: Array<String>) {
                 if (r + g + b > 12) nonBlack++
             }
             println("probe: frame=$frames hash=$hash nonBlackPixels=$nonBlack/${n * n}")
+        }
+        // Hold the commit to the refresh grid before swapping, not after: the
+        // deadline is when the buffer must be on the compositor's queue, so
+        // waiting here lands every commit on the grid whatever the frame cost.
+        if (vsyncMode == 2) {
+            val now = System.nanoTime()
+            // A stall longer than a frame means the grid is stale; re-anchor
+            // rather than burning a burst of catch-up commits.
+            if (nextSwapDueNs == 0L || now > nextSwapDueNs + vblankNs) {
+                nextSwapDueNs = now
+            } else {
+                val remain = nextSwapDueNs - now
+                // parkNanos overshoots by about a millisecond, which is a sixth
+                // of the interval here, so it only covers the bulk of the wait.
+                if (remain > 300_000L) {
+                    java.util.concurrent.locks.LockSupport.parkNanos(remain - 300_000L)
+                }
+                while (System.nanoTime() < nextSwapDueNs) Thread.onSpinWait()
+            }
+            nextSwapDueNs += vblankNs
         }
         t = System.nanoTime()
         glfwSwapBuffers(window)
