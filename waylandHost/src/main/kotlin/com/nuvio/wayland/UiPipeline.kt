@@ -376,6 +376,7 @@ class UiPipeline(
                 frontFence = fence
             }
             lastGeneration = buf.generation
+            StartupTrace.publish(overlay?.isComposited == true, buf.generation)
             onFrame?.invoke()
 
             // Animations and pending effects keep the scene dirty; ask for the

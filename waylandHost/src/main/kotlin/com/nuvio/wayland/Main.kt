@@ -64,6 +64,34 @@ private fun userMpvConfPath(): String? {
     return candidates.firstOrNull { java.io.File(it).isFile }
 }
 
+/**
+ * Three pixels down the middle of the frame about to be shown, as hex.
+ *
+ * The startup trace can say a present carried no video and no chrome, but not
+ * what the user was therefore looking at. These say it outright: the host's
+ * clear colour means nothing at all was drawn over it, anything else means
+ * something was -- which is the whole question when a flash is "still there".
+ *
+ * Diagnostic only, inside the startup window: glReadPixels stalls the pipe.
+ */
+private fun sampleFramebuffer(width: Int, height: Int): String {
+    if (width <= 0 || height <= 0) return "?"
+    val px = java.nio.ByteBuffer.allocateDirect(4)
+    val out = StringBuilder()
+    for ((i, fraction) in listOf(0.25f, 0.5f, 0.85f).withIndex()) {
+        px.clear()
+        GL11.glReadPixels(
+            width / 2, (height * fraction).toInt().coerceIn(0, height - 1), 1, 1,
+            GL11.GL_RGBA, GL11.GL_UNSIGNED_BYTE, px,
+        )
+        val v = (px.get(0).toInt() and 0xFF shl 16) or
+            (px.get(1).toInt() and 0xFF shl 8) or (px.get(2).toInt() and 0xFF)
+        if (i > 0) out.append('/')
+        out.append("%06x".format(v))
+    }
+    return out.toString()
+}
+
 /** Resident set size in MB, for the SIGKILL investigation: evidence, not theory. */
 private fun rssMb(): Long = runCatching {
     java.io.File("/proc/self/status").useLines { lines ->
@@ -904,6 +932,10 @@ fun main() {
                         "(hasFile=${videoHost?.hasFile} active=$active " +
                         "drawn=$chromeDrawn taken=${chrome.framesTaken})",
                 )
+                StartupTrace.mark(
+                    "chrome ${if (wantChrome) "SHOW" else "hide"} " +
+                        "(layerHasContent=${chromeLayer?.hasContent})",
+                )
             }
             if (wantChrome != chromeShown) {
                 chromeShown = wantChrome
@@ -1069,6 +1101,8 @@ fun main() {
         // scene render pay a full-resolution copy-on-write of the UI texture
         // (14MB at 2560x1440), which is what inflated scene costs to tens of
         // milliseconds and dragged the whole chrome down.
+        var uiGen = -1
+        var uiFresh = false
         if (ui != null) {
             ui.draw(s.canvas, 0, 0, null)
         } else {
@@ -1076,8 +1110,14 @@ fun main() {
             // is the entire UI cost of a present -- one textured quad, the same
             // shape as the video composite above, and it does not vary with
             // how expensive the scene happens to be.
-            uiPipeline?.acquireFrame()?.let { f -> uiLayer?.draw(s.canvas, f) }
+            uiPipeline?.acquireFrame()?.let { f ->
+                uiGen = f.generation
+                uiFresh = f.fresh
+                uiLayer?.draw(s.canvas, f)
+            }
         }
+        // What this present actually put on screen. A run of these with no
+        // video and no chrome IS the flash, counted in frames.
         // Chrome above everything: a raster image draw, which Skia
         // composites with proper premultiplied alpha (its opaque-surface
         // rule only applies to wrapped render targets). The buffer is
@@ -1094,6 +1134,20 @@ fun main() {
         t = System.nanoTime()
         context.flush()
         timings.add("flush", System.nanoTime() - t)
+
+        // What this present actually put on screen, read back from the frame
+        // itself. A run of these with no video and no chrome is the flash --
+        // and the pixels say what colour it is, which is the difference
+        // between "nothing was drawn" (the host's clear colour) and "Compose
+        // drew a screen we did not expect". Only inside the startup window,
+        // and a stall of a few pixels at that.
+        if (StartupTrace.active) {
+            StartupTrace.present(
+                "video=${if (videoHost?.drewVideo == true) "yes" else "no "} " +
+                    "chrome=${if (chromeLayer?.isComposited == true) "on " else "off"} " +
+                    "uiGen=$uiGen px=${sampleFramebuffer(width, height)}",
+            )
+        }
 
         // Throwaway subtitle harness: white text in the bottom third means
         // subs render; zero bright pixels means they are lost in the pipeline.

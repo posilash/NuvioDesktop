@@ -104,7 +104,15 @@ class WaylandVideoHost(
     @Volatile private var awaitingFirstFrame = false
     @Volatile private var restartSeen = false
 
+    /**
+     * Whether the last [compositeVideo] actually put a frame on the canvas.
+     * Read by the startup trace, which needs to say what a present contained.
+     */
+    @Volatile var drewVideo = false
+        private set
+
     fun compositeVideo(canvas: Canvas) {
+        drewVideo = false
         if (!hasFile) return
         if (rectWidth <= 0f || rectHeight <= 0f) return
         val frame = pipeline.acquireFrame() ?: return
@@ -118,6 +126,10 @@ class WaylandVideoHost(
             if (!restartSeen || !frame.fresh) return
             awaitingFirstFrame = false
             traceSession("first frame on screen")
+            StartupTrace.mark("first video frame on screen")
+            // A few more frames of evidence that playback is continuous, then
+            // this stops being a startup.
+            StartupTrace.endAfter(400)
         }
         lastCompositeNs = System.nanoTime()
 
@@ -204,6 +216,7 @@ class WaylandVideoHost(
             snapshot.close()
         }
         composites++
+        drewVideo = true
     }
 
     private fun evictStaleWrappers(keep: Int) {
@@ -249,6 +262,7 @@ class WaylandVideoHost(
         if (hasFile) {
             c.armReveal()
             traceSession("controls push")
+            StartupTrace.mark("controls push ${openingDigest(json)}")
         }
         // Stock's flush script verbatim: probes window.playerControls so a
         // too-early push is detected; controlsReady re-pushes (see onMessage
@@ -258,6 +272,26 @@ class WaylandVideoHost(
                 "window.playerControls(JSON.parse(" + jsLiteral(json) + "));" +
                 "return 'ok';})()",
         )
+    }
+
+    /**
+     * What a controls payload would actually put on the opening overlay.
+     *
+     * A push is not a push: the app sends several as a session starts, and if
+     * the early ones carry no title and no artwork then revealing on the frame
+     * painted from one of them shows an empty overlay -- which is a flash in
+     * its own right, before the real loading screen arrives. This says which
+     * push is which, in the trace, without dumping a kilobyte of JSON.
+     */
+    private fun openingDigest(json: String): String {
+        fun has(field: String): Boolean =
+            Regex("\"$field\"\\s*:\\s*\"([^\"]*)\"").find(json)?.groupValues?.get(1)
+                ?.isNotBlank() == true
+        val overlay = Regex("\"showOpeningOverlay\"\\s*:\\s*(true|false)")
+            .find(json)?.groupValues?.get(1) ?: "?"
+        return "overlay=$overlay title=${has("openingTitle")} " +
+            "artwork=${has("openingArtwork")} logo=${has("openingLogo")} " +
+            "bytes=${json.length}"
     }
 
     /** Re-deliver pending state; called when the page reports controlsReady. */
@@ -422,6 +456,7 @@ class WaylandVideoHost(
             mpv.command("change-list", "audio-files", "clr", "")
         }
         sessionStartNs = System.nanoTime()
+        StartupTrace.begin()
         traceSession("open(playWhenReady=$playWhenReady)")
         // Shut the reveal gate before anything can look at hasFile, or the
         // gate left open by the last session shows the chrome the instant
@@ -708,6 +743,7 @@ class WaylandVideoHost(
         }
 
     override fun stop() {
+        StartupTrace.mark("stop()")
         hasFile = false
         chrome?.priming = false
         mpv.command("stop")

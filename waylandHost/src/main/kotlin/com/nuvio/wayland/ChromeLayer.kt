@@ -83,7 +83,7 @@ class ChromeLayer(private val chrome: WpeChrome) {
     private var displayedImage: MemorySegment? = null
 
     /** False until a frame has actually landed; nothing is drawn before that. */
-    private var haveContent = false
+    @Volatile private var haveContent = false
 
     // ---- telemetry (read by report()) ----
     @Volatile private var updates = 0L
@@ -253,6 +253,10 @@ class ChromeLayer(private val chrome: WpeChrome) {
             // black. The window is a handful of frames long, so the storm the
             // pacing exists to prevent cannot get going.
             if (composited) chrome.ackFrameAfter(ackDelayMs) else chrome.ackFrame()
+            StartupTrace.mark(
+                "layer took chrome frame taken=${chrome.framesTaken} " +
+                    "${texW}x$texH composited=$composited",
+            )
             if (probesLeft > 0) {
                 probesLeft--
                 probeOrientation()
@@ -272,7 +276,11 @@ class ChromeLayer(private val chrome: WpeChrome) {
      * overlay and the reveal is a draw rather than a wait. That wait was the
      * black flash between clicking a stream and the loading page.
      */
-    private var composited = false
+    @Volatile private var composited = false
+
+    /** For the startup trace: read from the presenting and UI threads. */
+    val isComposited: Boolean get() = composited
+    val hasContent: Boolean get() = haveContent
 
     /**
      * Start or stop drawing what the layer already holds.
