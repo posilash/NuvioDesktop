@@ -83,6 +83,12 @@ dependencies {
     // at init with "A required function is missing".
 }
 
+// Two Compose artifacts ship the same lifecycle-runtime jar, which is fatal to
+// distTar/installDist but harmless on a classpath.
+tasks.withType<AbstractCopyTask>().configureEach {
+    duplicatesStrategy = DuplicatesStrategy.EXCLUDE
+}
+
 application {
     mainClass = "com.nuvio.wayland.MainKt"
     applicationDefaultJvmArgs = buildList {
@@ -91,7 +97,7 @@ application {
         // libmpv is bound through FFM rather than JNI, so no native build.
         add("--enable-native-access=ALL-UNNAMED")
         for (k in listOf(
-            "media", "libmpv", "hwdec", "realApp", "probe", "videoLog",
+            "media", "libmpv", "hwdec", "realApp", "harness", "probe", "videoLog",
             "smokePlayer", "demoFrames", "uiScale", "resizeTest", "subTest", "mpvExtra", "webChrome", "chromePage", "chromeProbe", "chromeBgRed", "chromeNoBlit", "chromeInitOnly", "vk", "paced", "sceneHoldMs", "noPlayerUi", "sampled", "uiThread", "uiFps",
             // Zero-copy GPU chrome and its levers.
             "chromeGpu", "chromeFps", "chromeSoftware", "chromeFlipGpu", "chromeFlipShm",

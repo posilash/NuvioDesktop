@@ -48,6 +48,7 @@ class Mpv private constructor(private val handle: MemorySegment, private val are
         const val MPV_RENDER_FRAME_INFO_PRESENT = 1L shl 0
 
         const val MPV_RENDER_API_TYPE_OPENGL = "opengl"
+        const val MPV_ERROR_NOT_IMPLEMENTED = -19
         const val MPV_RENDER_API_TYPE_OPENGL_NEXT = "opengl-next"
         const val MPV_RENDER_API_TYPE_VULKAN = "vulkan"
 
@@ -187,15 +188,33 @@ class Mpv private constructor(private val handle: MemorySegment, private val are
         }
 
         /** Load libmpv. Pass an explicit path to use a build other than the system one. */
-        fun load(path: String?): Boolean = runCatching {
+        /**
+         * [path] wins; otherwise the system library, by soname first.
+         *
+         * "mpv" alone resolves to libmpv.so, which only a distribution's
+         * development package ships -- an installed build that depends on the
+         * runtime package alone would not find it.
+         */
+        fun load(path: String?): Boolean {
             val arena = Arena.global()
-            lookup = if (path != null) {
-                SymbolLookup.libraryLookup(java.nio.file.Path.of(path), arena)
-            } else {
-                SymbolLookup.libraryLookup("mpv", arena)
+            val candidates = if (path != null) listOf(path) else listOf("libmpv.so.2", "libmpv.so")
+            for (candidate in candidates) {
+                val result = runCatching {
+                    lookup = if (candidate.contains('/')) {
+                        SymbolLookup.libraryLookup(java.nio.file.Path.of(candidate), arena)
+                    } else {
+                        SymbolLookup.libraryLookup(candidate, arena)
+                    }
+                }
+                if (result.isSuccess) return true
+                lastLoadError = "$candidate: ${result.exceptionOrNull()?.message}"
             }
-            true
-        }.getOrElse { false }
+            return false
+        }
+
+        /** Why [load] failed, for the message the host prints before exiting. */
+        @Volatile var lastLoadError: String? = null
+            private set
 
         // glibc LC_NUMERIC. mpv_create() returns NULL unless LC_NUMERIC is "C",
         // and the JVM sets a locale from the environment, so this has to be
@@ -310,7 +329,19 @@ class Mpv private constructor(private val handle: MemorySegment, private val are
         put(3, MPV_RENDER_PARAM_INVALID, MemorySegment.NULL)
 
         val out = arena.allocate(ADDRESS)
-        val r = mpvRenderContextCreate.invokeExact(out, handle, params) as Int
+        var r = mpvRenderContextCreate.invokeExact(out, handle, params) as Int
+        // "opengl-next" is fork-only (see the class comment). A distribution's
+        // libmpv answers NOT_IMPLEMENTED, and the legacy GL renderer still
+        // plays -- without libplacebo, so without gpu-next quality.
+        if (r == MPV_ERROR_NOT_IMPLEMENTED && apiType == MPV_RENDER_API_TYPE_OPENGL_NEXT) {
+            System.err.println(
+                "[mpv] this libmpv has no $MPV_RENDER_API_TYPE_OPENGL_NEXT backend; " +
+                    "falling back to $MPV_RENDER_API_TYPE_OPENGL. Build the vk-hwdec " +
+                    "fork for the gpu-next renderer.",
+            )
+            put(0, MPV_RENDER_PARAM_API_TYPE, arena.allocateFrom(MPV_RENDER_API_TYPE_OPENGL))
+            r = mpvRenderContextCreate.invokeExact(out, handle, params) as Int
+        }
         check(r >= 0) { "mpv_render_context_create($apiType) -> $r" }
         renderCtx = out.get(ADDRESS, 0)
     }

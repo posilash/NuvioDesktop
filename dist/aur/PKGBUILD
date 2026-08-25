@@ -4,19 +4,29 @@ pkgname=nuvio-desktop
 _pkgname=nuvio
 pkgver=0.1.20_alpha.r2412.g4652268d
 pkgrel=1
-pkgdesc="A modern media hub desktop application (git)"
+pkgdesc="A modern media hub desktop application, native Wayland host (git)"
 arch=('x86_64')
 url="https://github.com/posilash/NuvioDesktop"
 license=('GPL-3.0-or-later')
-# No Java dependency: the Compose distributable bundles its own jlink runtime.
-# mpv/webkit2gtk/gtk3 back the player bridge; Xi, Xrender and Xtst are what the
-# bundled runtime's AWT toolkit loads.
-depends=('mpv' 'webkit2gtk-4.1' 'gtk3' 'gcc-libs' 'libx11' 'libxext' 'libxcomposite'
-         'libxi' 'libxrender' 'libxtst')
-makedepends=('git' 'java-environment>=17' 'pkgconf')
+# The host is a plain application distribution, not a jlink image, so it needs
+# a JRE. mpv is here for libmpv's own runtime dependencies -- the bundled
+# libmpv.so.2 is built against the same system libraries. The WPE stack backs
+# the player chrome; libglvnd and wayland are what the GLFW window and the
+# isolated fdo display use.
+depends=('java-runtime>=17' 'mpv' 'libwpe' 'wpebackend-fdo' 'wpewebkit'
+         'wayland' 'libglvnd' 'gcc-libs')
+makedepends=('git' 'java-environment>=17' 'gcc' 'meson' 'ninja' 'pkgconf'
+             'vulkan-headers')
 provides=("${pkgname}")
-source=("${pkgname}::git+${url}.git#branch=linux")
-sha256sums=('SKIP')
+conflicts=("${pkgname}")
+# The fork carries the render API this host is written against: a gpu-next
+# backend ("opengl-next"), a Vulkan backend, and a render() that does not block
+# without advanced control. Stock libmpv answers NOT_IMPLEMENTED and the host
+# falls back to the legacy GL renderer, which is not what this is for.
+source=("${pkgname}::git+${url}.git#branch=render-api-wayland"
+        "mpv::git+https://github.com/posilash/mpv.git#branch=vk-hwdec")
+sha256sums=('SKIP'
+            'SKIP')
 
 # Backend client config. Anon credentials, compiled into the binary as Kotlin
 # constants, so they are the same in every build; sign-in fails when unset.
@@ -42,27 +52,60 @@ NUVIO_SUPABASE_FALLBACK_URL=${_supabase_fallback_url}
 TRAKT_CLIENT_ID=
 TRAKT_CLIENT_SECRET=
 EOF
+
+	# Skia's GrGLMakeNativeInterface() on Linux is GLX-based and returns null
+	# when glXGetCurrentContext() does, which under Wayland is always: the
+	# context is EGL. The host then dies at DirectContext.makeGL before showing
+	# a window. The entry points are fine -- libglvnd's glXGetProcAddress
+	# returns dispatch stubs that route to whatever context is current -- so
+	# only the guard is wrong.
+	cat >"${srcdir}/glxshim.c" <<'EOF'
+void *glXGetCurrentContext(void) { return (void *) 1; }
+EOF
 }
 
 build() {
-	cd "${srcdir}/${pkgname}"
+	gcc -shared -fPIC -o "${srcdir}/libglxshim.so" "${srcdir}/glxshim.c"
 
-	./gradlew --no-daemon :composeApp:createReleaseDistributable --no-configuration-cache
+	# libmpv only: the player binary, its scripting and its own windowing are
+	# all dead weight here.
+	cd "${srcdir}/mpv"
+	meson setup build \
+		--prefix=/usr \
+		--buildtype=release \
+		--wrap-mode=nodownload \
+		-Dlibmpv=true \
+		-Dcplayer=false \
+		-Dmanpage-build=disabled \
+		-Dlua=disabled \
+		-Djavascript=disabled
+	meson compile -C build
+
+	cd "${srcdir}/${pkgname}"
+	# installDist refuses a target that is neither empty nor a previous
+	# installation, which a rebuilt package directory always is.
+	rm -rf waylandHost/build/install
+	./gradlew --no-daemon :waylandHost:installDist --no-configuration-cache
 }
 
 package() {
 	cd "${srcdir}/${pkgname}"
 
 	install -d "${pkgdir}/opt/${_pkgname}"
-	cp -Rp "composeApp/build/compose/binaries/main-release/app/Nuvio/." \
-		"${pkgdir}/opt/${_pkgname}/"
+	cp -Rp "waylandHost/build/install/waylandHost/." "${pkgdir}/opt/${_pkgname}/"
 
-	# Wrapper rather than a symlink: the launcher resolves the bundled runtime
-	# and the player bridge relative to the application image.
+	install -Dm755 "${srcdir}/libglxshim.so" "${pkgdir}/opt/${_pkgname}/lib/libglxshim.so"
+	install -Dm755 "${srcdir}/mpv/build/libmpv.so.2" \
+		"${pkgdir}/opt/${_pkgname}/lib/libmpv.so.2"
+
+	# The controls page ships inside the app jar and is unpacked to the user's
+	# cache on first run, so nothing needs installing for it.
 	install -Dm755 /dev/stdin "${pkgdir}/usr/bin/${_pkgname}" <<'EOF'
 #!/bin/sh
-export LD_LIBRARY_PATH="/opt/nuvio/lib:/opt/nuvio/lib/runtime/lib:${LD_LIBRARY_PATH}"
-exec "/opt/nuvio/bin/Nuvio" "$@"
+export LD_PRELOAD="/opt/nuvio/lib/libglxshim.so${LD_PRELOAD:+:${LD_PRELOAD}}"
+JAVA_OPTS="-Dnuvio.wayland.libmpv=/opt/nuvio/lib/libmpv.so.2 ${JAVA_OPTS}"
+export JAVA_OPTS
+exec /opt/nuvio/bin/waylandHost "$@"
 EOF
 
 	install -Dm644 dist/desktop/nuvio.desktop \

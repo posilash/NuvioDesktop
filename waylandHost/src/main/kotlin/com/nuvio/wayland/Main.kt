@@ -92,6 +92,49 @@ private fun sampleFramebuffer(width: Int, height: Int): String {
     return out.toString()
 }
 
+/**
+ * Whether to compose the app rather than the input-echo harness.
+ *
+ * The app is the default: an installed launcher should not have to pass a flag
+ * to get normal behaviour. -Dnuvio.wayland.harness=true selects the diagnostic
+ * scene, and -Dnuvio.wayland.realApp=false still does too, since every script
+ * and note from this port passes realApp explicitly.
+ */
+private fun runRealApp(): Boolean {
+    if (System.getProperty("nuvio.wayland.harness")?.toBoolean() == true) return false
+    return System.getProperty("nuvio.wayland.realApp")?.toBoolean() ?: true
+}
+
+/**
+ * The controls page from the classpath, unpacked so WebKit can open it.
+ *
+ * An installed build has no source tree, and the page ships inside the app's
+ * jar (player-ui/), where WPE cannot reach it: it wants a URI it can load, and
+ * jar: is not one. Unpacking beside the rest of the cache costs three files
+ * once per version.
+ */
+private fun extractedChromePage(): String? = runCatching {
+    val names = listOf("controls.html", "controls.css", "controls.js")
+    val loader = object {}.javaClass.classLoader
+    val dir = java.nio.file.Path.of(
+        System.getProperty("user.home"), ".cache", "nuvio", "player-ui",
+    )
+    java.nio.file.Files.createDirectories(dir)
+    for (name in names) {
+        val bytes = loader.getResourceAsStream("player-ui/$name")?.use { it.readBytes() }
+            ?: return@runCatching null
+        val target = dir.resolve(name)
+        // Rewritten when it differs, so an upgraded package is not left
+        // serving the previous version's page.
+        if (!java.nio.file.Files.exists(target) ||
+            !java.nio.file.Files.readAllBytes(target).contentEquals(bytes)
+        ) {
+            java.nio.file.Files.write(target, bytes)
+        }
+    }
+    "file://" + dir.resolve("controls.html").toAbsolutePath()
+}.getOrNull()
+
 /** Command line, for the deep links the app's own startup would handle. */
 private var launchArgs: Array<String> = emptyArray()
 
@@ -190,14 +233,17 @@ fun main(args: Array<String>) {
     // dropping to the legacy one.
     val mediaUrl = System.getProperty("nuvio.wayland.media")
     val mpvPath = System.getProperty("nuvio.wayland.libmpv")
-    val runRealAppEarly = System.getProperty("nuvio.wayland.realApp")?.toBoolean() ?: false
+    val runRealAppEarly = runRealApp()
     var mpv: Mpv? = null
     var pipeline: DisplayPipeline? = null
     var videoHost: WaylandVideoHost? = null
     val videoFrameReady = java.util.concurrent.atomic.AtomicBoolean(false)
     if (mediaUrl != null || runRealAppEarly) {
         if (!Mpv.load(mpvPath)) {
-            System.err.println("FAIL: could not load libmpv (nuvio.wayland.libmpv=$mpvPath)")
+            System.err.println(
+                "FAIL: could not load libmpv (nuvio.wayland.libmpv=$mpvPath) " +
+                    "-- ${Mpv.lastLoadError}",
+            )
             exitProcess(1)
         }
         mpv = Mpv.create().apply {
@@ -473,7 +519,7 @@ fun main(args: Array<String>) {
         if (p != null) p.invokeAndWait(block) else java.awt.EventQueue.invokeAndWait(block)
     }
 
-    val runRealApp = System.getProperty("nuvio.wayland.realApp")?.toBoolean() ?: false
+    val runRealApp = runRealApp()
     // Drives the app's own player surface directly, so playback can be
     // exercised without clicking through the UI. Mirrors Main.kt's
     // smokePlayerUrl harness.
@@ -643,12 +689,16 @@ fun main(args: Array<String>) {
     // back to Compose-drawn controls.
     if (System.getProperty("nuvio.wayland.webChrome")?.toBoolean() != false) {
         // Resolve the page against the repo root regardless of working dir.
-        val page = sequenceOf(
-            java.io.File("composeApp/src/desktopMain/resources/player-ui/controls.html"),
-            java.io.File("../composeApp/src/desktopMain/resources/player-ui/controls.html"),
-        ).map { it.absoluteFile.normalize() }.firstOrNull { it.isFile }
+        // An installed build has no repo, so the override is checked first --
+        // looking for the source tree and failing before reading it left the
+        // packaged host dead on arrival.
+        val pageUri = System.getProperty("nuvio.wayland.chromePage")
+            ?: sequenceOf(
+                java.io.File("composeApp/src/desktopMain/resources/player-ui/controls.html"),
+                java.io.File("../composeApp/src/desktopMain/resources/player-ui/controls.html"),
+            ).map { it.absoluteFile.normalize() }.firstOrNull { it.isFile }?.let { "file://" + it.path }
+            ?: extractedChromePage()
             ?: error("controls.html not found from ${java.io.File(".").absolutePath}")
-        val pageOverride = System.getProperty("nuvio.wayland.chromePage")
         wpeChrome = com.nuvio.wayland.wpe.WpeChrome(
             width = INITIAL_WIDTH,
             height = INITIAL_HEIGHT,
@@ -706,7 +756,7 @@ fun main(args: Array<String>) {
                 }
             },
         ).also { chrome ->
-            chrome.start(pageOverride ?: ("file://" + page.path))
+            chrome.start(pageUri)
         }
         videoHost?.chrome = wpeChrome
         // Chrome frames are consumed on the UI thread, where the GL context
