@@ -3188,3 +3188,13 @@ svg {
   fill: currentColor;
   stroke: none;
 }
+
+/* Artwork that reaches the viewBox edge (volume's outer arc, play's tip) is
+   clipped by the svg viewport, which clips by default. */
+.action svg,
+.volume-control svg,
+.play-control svg,
+.side-control svg,
+.header-button svg {
+  overflow: visible;
+}
