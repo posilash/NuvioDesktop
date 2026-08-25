@@ -825,6 +825,12 @@ fun main(args: Array<String>) {
     input.install()
     wpeChrome?.let { c ->
         input.chrome = c
+        // Long enough for the page's 1400ms toast and its fade. Compositing a
+        // page whose controls are hidden draws only the toast, so this shows
+        // no more than upstream does with its always-composited view.
+        input.onChromeInput = {
+            chromeActiveUntilNs.set(System.nanoTime() + 2_000_000_000L)
+        }
         // With a device scale factor the page hit-tests in PHYSICAL pixels
         // (Cog multiplies surface coords by the output scale the same way);
         // InputRouter's cursor is already framebuffer pixels, so 1:1. On a

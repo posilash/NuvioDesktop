@@ -45,6 +45,13 @@ class InputRouter(
      * framebuffer pixels into the chrome's own surface size.
      */
     var chrome: com.nuvio.wayland.wpe.WpeChrome? = null
+
+    /**
+     * Called when input the page may answer with a toast reaches it. The page
+     * only reports activity while its controls are up, so a volume toast
+     * raised over hidden controls asks for no frames and nothing composites it.
+     */
+    var onChromeInput: (() -> Unit)? = null
     var chromeScaleX: Float = 1f
     var chromeScaleY: Float = 1f
     private var chromeButtons = 0
@@ -133,6 +140,8 @@ class InputRouter(
                 // Web wheel steps: ~53px per notch, sign as Wayland's.
                 if (dy != 0.0) c.dispatchAxis(cx, cy, vertical = true, value = (dy * 53).toInt())
                 if (dx != 0.0) c.dispatchAxis(cx, cy, vertical = false, value = (dx * 53).toInt())
+                // The wheel is the page's other volume control.
+                onChromeInput?.invoke()
             }
             // Compose scroll deltas run opposite to GLFW's, and are in
             // "lines"; one notch is one unit.
@@ -164,6 +173,7 @@ class InputRouter(
                     // enum here left event.code garbage, which silently
                     // killed every code-based shortcut in controls.js.
                     c.dispatchKey(keysym, scancode + 8, action != GLFW_RELEASE, wm)
+                    if (action != GLFW_RELEASE) onChromeInput?.invoke()
                 }
             }
             val vk = key.toAwtVirtualKey() ?: return@glfwSetKeyCallback

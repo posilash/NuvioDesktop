@@ -87,7 +87,7 @@ internal fun WaylandPlayerSurface(
         // effect below re-pushes the identical payload a dispatch later,
         // which is a no-op for the page but keeps the dedup honest.
         if (WaylandVideoBridge.webChromeActive) {
-            bridge.pushControlsJson(playerControlsState.toControlsJson(fullscreenNow))
+            bridge.pushControlsJson(playerControlsState.withVolume(bridge).toControlsJson(fullscreenNow))
         }
         // The runtime tracks whether the resume position was actually applied
         // and re-requests it until told. open() passed it to mpv above.
@@ -194,9 +194,15 @@ internal fun WaylandPlayerSurface(
         // through playerUpdate instead. Re-pushing the whole controls JSON on
         // every position tick made the page rebuild its DOM once a second --
         // visible as flicker whenever the sources/episodes panes were open.
-        val structureKey = playerControlsState.nativeControlsStructureKey()
+        // Stock order (NativePlayerController.updateControls): fill the level
+        // first, then key off the filled state. Nothing in common code ever
+        // sets volumeLevel -- it is the platform's to report -- so keying off
+        // the raw state means the key never moves when the volume does, and
+        // the page keeps whatever number it was first told.
+        val stateWithVolume = playerControlsState.withVolume(bridge)
+        val structureKey = stateWithVolume.nativeControlsStructureKey()
         LaunchedEffect(structureKey, isFullscreen) {
-            bridge.pushControlsJson(playerControlsState.toControlsJson(isFullscreen))
+            bridge.pushControlsJson(stateWithVolume.toControlsJson(isFullscreen))
         }
         DisposableEffect(Unit) {
             WaylandVideoBridge.onChromeEvent = { type, value ->
@@ -319,6 +325,16 @@ private class WaylandPlayerController(
     override fun applySubtitleStyle(style: SubtitleStyleState, useLibass: Boolean) {}
     override fun setSubtitleDelayMs(delayMs: Int) = bridge.setSubtitleDelayMs(delayMs)
 }
+
+/** Stock's null-volume fill, against the Wayland bridge instead of the handle. */
+private fun com.nuvio.app.features.player.PlayerControlsState.withVolume(
+    bridge: WaylandVideoBridge.Delegate,
+): com.nuvio.app.features.player.PlayerControlsState =
+    if (volumeLevel == null) {
+        copy(volumeLevel = (bridge.snapshot().volumeLevel ?: 1f).coerceIn(0f, 1f))
+    } else {
+        this
+    }
 
 /**
  * Stock handleFallbackAction, expressed against the Wayland bridge: the

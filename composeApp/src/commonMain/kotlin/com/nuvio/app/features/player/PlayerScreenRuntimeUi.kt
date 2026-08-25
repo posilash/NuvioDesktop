@@ -556,7 +556,7 @@ internal fun PlayerScreenRuntime.RenderPlayerRuntimeUi() {
         RenderPlaybackOverlays(
             runtime = runtime,
             displayedPositionMs = displayedPositionMs,
-            currentGestureFeedback = currentGestureFeedback,
+            currentGestureFeedback = currentGestureFeedback.takeUnless { usesNativePlayerChrome },
             p2pInitialLoadingMessage = p2pInitialLoadingMessage,
             p2pInitialLoadingProgress = p2pInitialLoadingProgress,
             showP2pRebufferStats = showP2pRebufferStats,
