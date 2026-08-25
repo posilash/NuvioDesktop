@@ -1314,12 +1314,15 @@ fun main(args: Array<String>) {
         t = System.nanoTime()
         glfwSwapBuffers(window)
         timings.add("swap", System.nanoTime() - t)
+        // Vsync feedback: with ADVANCED_CONTROL this is the clock mpv times
+        // against, and its contract is one call per swap -- what a real VO gets
+        // from its swapchain. Reporting only when a video frame changed made
+        // the estimate circular: mpv counted our reports as vsyncs, so it
+        // measured the display at the rate it was feeding us. It settled on
+        // 81Hz against a real 165 and mistimed every frame it scheduled.
+        mpv?.reportSwap()
         if (videoChanged) {
             noteVideoPresent(System.nanoTime())
-            // Vsync feedback: with ADVANCED_CONTROL, reported swaps let mpv
-            // align frame target times to the display's actual cadence --
-            // what a real VO gets from its swapchain.
-            mpv?.reportSwap()
             // The safest moment to rasterize the scene is right here, just
             // after a frame was presented: the full frame interval lies
             // ahead. Deferring it to the next loop iteration burned 4-12ms
