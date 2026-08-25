@@ -185,7 +185,9 @@ fun main(args: Array<String>) {
     lateinit var context: DirectContext
     java.awt.EventQueue.invokeAndWait {
         glfwMakeContextCurrent(window)
-        glfwSwapInterval(1)
+        // Diagnostic lever: 0 unblocks the swap so the loop's own cost can be
+        // measured apart from whatever the compositor paces us at.
+        glfwSwapInterval(System.getProperty("nuvio.wayland.vsync")?.toIntOrNull() ?: 1)
         GL.createCapabilities()
         println("GL_RENDERER: " + GL11.glGetString(GL11.GL_RENDERER))
         println("GL_VERSION:  " + GL11.glGetString(GL11.GL_VERSION))
@@ -291,15 +293,20 @@ fun main(args: Array<String>) {
             // estimate stays low; measured as 14fps presents and hundreds of
             // dropped frames whenever startup jitter seeded a low estimate).
             // Tell it the real refresh rate instead.
-            if (Mpv.pacedMode) run {
-                // Only the paced model wants a display-rate hint; in free-run
-                // the core times frames on its own clock, hint-free, exactly
-                // like Stremio's embedding.
+            // Free-run does not need the hint, but without it mpv has no
+            // display clock at all: no "Refresh Rate (specified)" in its
+            // stats, video-sync stuck on audio, and A-V reported as residual
+            // drift rather than driven to zero. GLFW reads the mode from the
+            // system, so this is the monitor's real rate, not a guess.
+            // -Pnuvio.wayland.displayFps=0 turns it off again.
+            run {
                 val mon = glfwGetPrimaryMonitor()
-                val hz = if (mon != NULL) glfwGetVideoMode(mon)?.refreshRate() ?: 0 else 0
+                val detected =
+                    if (mon != NULL) glfwGetVideoMode(mon)?.refreshRate() ?: 0 else 0
+                val hz = System.getProperty("nuvio.wayland.displayFps")?.toIntOrNull() ?: detected
                 if (hz > 0) {
                     setOption("display-fps-override", hz.toString())
-                    println("mpv display-fps-override=$hz")
+                    println("mpv display-fps-override=$hz (monitor reports $detected)")
                 }
             }
             System.getProperty("nuvio.wayland.hwdec")?.let { setOption("hwdec", it) }
