@@ -6,7 +6,6 @@ plugins {
     kotlin("jvm")
     alias(libs.plugins.composeMultiplatform)
     alias(libs.plugins.composeCompiler)
-    application
 }
 
 // A Compose host that does not go through AWT.
@@ -89,9 +88,32 @@ tasks.withType<AbstractCopyTask>().configureEach {
     duplicatesStrategy = DuplicatesStrategy.EXCLUDE
 }
 
-application {
+// Compose's own application DSL, not Gradle's `application` plugin: the two
+// both register `run`, and this one also builds the jlink image the package
+// installs, so an installed build needs no JRE.
+compose.desktop.application {
     mainClass = "com.nuvio.wayland.MainKt"
-    applicationDefaultJvmArgs = buildList {
+    nativeDistributions {
+        // The launcher, and so /opt/nuvio/bin, is named for the app.
+        packageName = "Nuvio"
+        packageVersion = "1.0.0"
+        // The same set composeApp links, plus what this host adds: LWJGL
+        // reaches for sun.misc.Unsafe, which lives in jdk.unsupported, and a
+        // runtime without it dies at startup with NoClassDefFoundError.
+        modules(
+            "java.instrument",
+            "java.management",
+            "java.net.http",
+            "jdk.httpserver",
+            "jdk.unsupported",
+        )
+    }
+    // Off for the same reason composeApp has it off: reflection-heavy Compose
+    // and FFM bindings do not survive it.
+    buildTypes.release.proguard {
+        isEnabled.set(false)
+    }
+    jvmArgs += buildList {
         // GLFW on Wayland drives EGL; nothing here touches GLX or X11.
         add("-Dorg.lwjgl.util.Debug=false")
         // libmpv is bound through FFM rather than JNI, so no native build.

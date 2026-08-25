@@ -8,21 +8,23 @@ pkgdesc="A modern media hub desktop application, native Wayland host (git)"
 arch=('x86_64')
 url="https://github.com/posilash/NuvioDesktop"
 license=('GPL-3.0-or-later')
-# The host is a plain application distribution, not a jlink image, so it needs
-# a JRE. mpv is here for libmpv's own runtime dependencies -- the bundled
-# libmpv.so.2 is built against the same system libraries. The WPE stack backs
-# the player chrome; libglvnd and wayland are what the GLFW window and the
-# isolated fdo display use.
-depends=('java-runtime>=17' 'mpv' 'libwpe' 'wpebackend-fdo' 'wpewebkit'
-         'wayland' 'libglvnd' 'gcc-libs')
+# No Java dependency: the host ships as a jlink image with its own runtime.
+# mpv is here for libmpv's dependencies -- the bundled libmpv.so.2 is built
+# against the same system libraries. The WPE stack backs the player chrome;
+# libglvnd and wayland are what the GLFW window and the isolated fdo display
+# use.
+depends=('mpv' 'libwpe' 'wpebackend-fdo' 'wpewebkit' 'wayland' 'libglvnd'
+         'gcc-libs')
 makedepends=('git' 'java-environment>=17' 'gcc' 'meson' 'ninja' 'pkgconf'
              'vulkan-headers')
 provides=("${pkgname}")
 conflicts=("${pkgname}")
 # The fork carries the render API this host is written against: a gpu-next
 # backend ("opengl-next"), a Vulkan backend, and a render() that does not block
-# without advanced control. Stock libmpv answers NOT_IMPLEMENTED and the host
-# falls back to the legacy GL renderer, which is not what this is for.
+# without advanced control. Stock libmpv answers NOT_IMPLEMENTED, and the host
+# falls back to the legacy GL renderer, which is not what this is for. Built
+# and installed here so it is removed with the package rather than left behind
+# as a system mpv nobody remembers replacing.
 source=("${pkgname}::git+${url}.git#branch=render-api-wayland"
         "mpv::git+https://github.com/posilash/mpv.git#branch=vk-hwdec")
 sha256sums=('SKIP'
@@ -82,30 +84,30 @@ build() {
 	meson compile -C build
 
 	cd "${srcdir}/${pkgname}"
-	# installDist refuses a target that is neither empty nor a previous
-	# installation, which a rebuilt package directory always is.
-	rm -rf waylandHost/build/install
-	./gradlew --no-daemon :waylandHost:installDist --no-configuration-cache
+	./gradlew --no-daemon :waylandHost:createReleaseDistributable --no-configuration-cache
 }
 
 package() {
 	cd "${srcdir}/${pkgname}"
 
 	install -d "${pkgdir}/opt/${_pkgname}"
-	cp -Rp "waylandHost/build/install/waylandHost/." "${pkgdir}/opt/${_pkgname}/"
+	cp -Rp "waylandHost/build/compose/binaries/main-release/app/Nuvio/." \
+		"${pkgdir}/opt/${_pkgname}/"
 
-	install -Dm755 "${srcdir}/libglxshim.so" "${pkgdir}/opt/${_pkgname}/lib/libglxshim.so"
+	# Beside the runtime, where the host finds libmpv by walking out of its own
+	# jar rather than being told where it is.
 	install -Dm755 "${srcdir}/mpv/build/libmpv.so.2" \
 		"${pkgdir}/opt/${_pkgname}/lib/libmpv.so.2"
+	install -Dm755 "${srcdir}/libglxshim.so" \
+		"${pkgdir}/opt/${_pkgname}/lib/libglxshim.so"
 
-	# The controls page ships inside the app jar and is unpacked to the user's
-	# cache on first run, so nothing needs installing for it.
+	# The wrapper exists for LD_PRELOAD alone: everything else the host needs
+	# is baked into the image's own launcher. The controls page ships inside
+	# the app jar and is unpacked on first run, so nothing is installed for it.
 	install -Dm755 /dev/stdin "${pkgdir}/usr/bin/${_pkgname}" <<'EOF'
 #!/bin/sh
 export LD_PRELOAD="/opt/nuvio/lib/libglxshim.so${LD_PRELOAD:+:${LD_PRELOAD}}"
-JAVA_OPTS="-Dnuvio.wayland.libmpv=/opt/nuvio/lib/libmpv.so.2 ${JAVA_OPTS}"
-export JAVA_OPTS
-exec /opt/nuvio/bin/waylandHost "$@"
+exec /opt/nuvio/bin/Nuvio "$@"
 EOF
 
 	install -Dm644 dist/desktop/nuvio.desktop \

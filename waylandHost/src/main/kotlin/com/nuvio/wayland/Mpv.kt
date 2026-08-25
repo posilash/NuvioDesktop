@@ -197,7 +197,11 @@ class Mpv private constructor(private val handle: MemorySegment, private val are
          */
         fun load(path: String?): Boolean {
             val arena = Arena.global()
-            val candidates = if (path != null) listOf(path) else listOf("libmpv.so.2", "libmpv.so")
+            val candidates = if (path != null) {
+                listOf(path)
+            } else {
+                listOfNotNull(bundledLibmpv(), "libmpv.so.2", "libmpv.so")
+            }
             for (candidate in candidates) {
                 val result = runCatching {
                     lookup = if (candidate.contains('/')) {
@@ -215,6 +219,25 @@ class Mpv private constructor(private val handle: MemorySegment, private val are
         /** Why [load] failed, for the message the host prints before exiting. */
         @Volatile var lastLoadError: String? = null
             private set
+
+        /**
+         * The libmpv shipped beside this build, if there is one.
+         *
+         * An installed image carries its own: the render API this host is
+         * written against is fork-only, so picking up whatever libmpv.so.2 the
+         * system happens to have would silently drop it to the legacy GL
+         * renderer. Found by walking out of the jar's directory rather than
+         * configured, so nothing has to pass a path.
+         */
+        private fun bundledLibmpv(): String? = runCatching {
+            val source = Mpv::class.java.protectionDomain?.codeSource?.location ?: return null
+            val here = java.nio.file.Path.of(source.toURI())
+            generateSequence(here.parent) { it.parent }
+                .take(3)
+                .map { it.resolve("libmpv.so.2") }
+                .firstOrNull { java.nio.file.Files.isRegularFile(it) }
+                ?.toString()
+        }.getOrNull()
 
         // glibc LC_NUMERIC. mpv_create() returns NULL unless LC_NUMERIC is "C",
         // and the JVM sets a locale from the environment, so this has to be
