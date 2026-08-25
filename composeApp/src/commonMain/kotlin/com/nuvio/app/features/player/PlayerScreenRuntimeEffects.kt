@@ -219,6 +219,38 @@ internal fun PlayerScreenRuntime.BindPlayerRuntimeEffects() {
         }
     }
 
+    // Apply the track preference as soon as the tracks EXIST, rather than
+    // waiting for loading to finish.
+    //
+    // Waiting is not free on a streamed file. An engine only demuxes the
+    // tracks it has selected, so switching to a different audio track after
+    // playback has begun leaves it with no data for that track anywhere
+    // before the demuxer's read head -- and it then plays silence until the
+    // clock reaches where the new stream actually starts. Measured on mpv,
+    // restoring a saved audio preference 140ms after playback began:
+    //
+    //   delaying audio start 1029.376000 vs. 1024.148000, diff=5.228000
+    //
+    // Five seconds of silent video, and the length is just how far the
+    // demuxer had read ahead, which is why it looked like a random delay.
+    // Applied during loading the same switch costs nothing: the engine has
+    // not started reading ahead, so the track is simply the one it opens
+    // with. The engine reports no tracks until it has parsed them, so this
+    // polls, and it stops the moment the preferences have been applied.
+    LaunchedEffect(playerController, activeSourceUrl) {
+        if (playerController == null) return@LaunchedEffect
+        repeat(40) {
+            if (trackPreferenceRestoreApplied &&
+                preferredAudioSelectionApplied &&
+                preferredSubtitleSelectionApplied
+            ) {
+                return@LaunchedEffect
+            }
+            refreshTracks()
+            delay(100)
+        }
+    }
+
     LaunchedEffect(
         playerController,
         playbackSnapshot.isLoading,

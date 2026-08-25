@@ -128,6 +128,57 @@ class WpeChrome(
     /** Called when state is pushed into the page: it is no longer pristine. */
     fun markPageUsed() { pageFresh = false }
 
+    // ---- reveal gate -------------------------------------------------------
+    //
+    // A session must go from click straight to the opening overlay, with
+    // nothing in between. Three things used to appear there, all the same
+    // mistake in different clothes: showing the chrome before the page had
+    // painted THIS session's state. Too early by a page load and it is the
+    // bootstrap spinner; too early by a state push and it is last session's
+    // controls; too early by a frame and it is black, because the layer
+    // dropped its texture when it was hidden.
+    //
+    // So the gate counts frames the CONSUMER has taken, not frames the page
+    // exported: taken means the texture actually holds it, which is the only
+    // version of "painted" a reveal can draw.
+
+    /** Frames handed to the consumer; the unit the reveal gate counts in. */
+    @Volatile var framesTaken: Long = 0L
+        private set
+
+    private val revealAfterTaken = java.util.concurrent.atomic.AtomicLong(Long.MAX_VALUE)
+
+    /** True once the page has painted -- and the layer holds -- what it was armed for. */
+    val revealReady: Boolean get() = framesTaken >= revealAfterTaken.get()
+
+    /** Shut the gate: nothing painted so far may be shown. */
+    fun closeReveal() { revealAfterTaken.set(Long.MAX_VALUE) }
+
+    /**
+     * Open the gate three frames from now -- once the page has painted what
+     * was just pushed into it.
+     *
+     * Three, not one: at the moment of a push one frame can be parked waiting
+     * to be taken and another can already be rendering, and both of those
+     * predate the push. The third cannot.
+     *
+     * Arms only from closed. Re-arming an open gate would hide chrome that is
+     * already on screen, which is a flash of its own.
+     */
+    fun armReveal() {
+        revealAfterTaken.compareAndSet(Long.MAX_VALUE, framesTaken + 3)
+    }
+
+    /**
+     * Park exports for the consumer even while hidden, so a reveal has
+     * something to draw the instant it happens.
+     *
+     * Set for the session-start window only. Outside it a hidden page's
+     * frames are worthless -- they are the previous session's -- and dropping
+     * them is what keeps a hidden chrome free.
+     */
+    @Volatile var priming: Boolean = false
+
     fun start(pageUri: String) {
         this.pageUri = pageUri
         pageFresh = true
@@ -407,7 +458,7 @@ class WpeChrome(
     internal fun handleEglExport(image: MemorySegment) {
         framesExported++
         ackOwed.set(true)
-        if (!visible) {
+        if (!visible && !priming) {
             // Nothing will ever bind it, so it goes straight back. The slow
             // trickle keeps the page's rAF logic alive at ~zero cost; an
             // instant ack re-ran the renderer flat out.
@@ -424,7 +475,8 @@ class WpeChrome(
     }
 
     /** Newest exported image for the consumer; caller must [releaseImageAsync] it. */
-    fun takeEglImage(): MemorySegment? = pendingImage.getAndSet(null)
+    fun takeEglImage(): MemorySegment? =
+        pendingImage.getAndSet(null)?.also { framesTaken++ }
 
     /** EGLImageKHR handle inside [image]; valid until the image is released. */
     fun eglImageOf(image: MemorySegment): MemorySegment =
@@ -448,7 +500,7 @@ class WpeChrome(
         ackOwed.set(true)
         var handedOff = false
         runCatching {
-            if (!visible) return@runCatching // skip the copy entirely
+            if (!visible && !priming) return@runCatching // skip the copy entirely
             val shm = fn(fdo, "wpe_fdo_shm_exported_buffer_get_shm_buffer",
                 FunctionDescriptor.of(ADDRESS, ADDRESS)).invokeExact(buffer) as MemorySegment
             if (!shm.equals(MemorySegment.NULL)) {
@@ -500,7 +552,7 @@ class WpeChrome(
     }
 
     /** Newest chrome frame for the EDT; caller must [ackFrame] after use. */
-    fun takeShmFrame(): ShmFrame? = pendingShm.getAndSet(null)
+    fun takeShmFrame(): ShmFrame? = pendingShm.getAndSet(null)?.also { framesTaken++ }
 
 
     internal fun handleMessage(jscValue: MemorySegment) {

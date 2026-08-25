@@ -61,6 +61,10 @@ internal fun WaylandPlayerSurface(
         return
     }
 
+    // Read here, in the composable body, so the commit-phase effect below can
+    // hand the chrome this session's state in the same breath as open().
+    val fullscreenNow = com.nuvio.app.core.ui.isFullscreenActionActive()
+
     DisposableEffect(sourceUrl) {
         WaylandVideoLog.log("surface: open url=$sourceUrl playWhenReady=$playWhenReady pos=$initialPositionMs")
         bridge.open(
@@ -77,6 +81,14 @@ internal fun WaylandPlayerSurface(
                 )
             },
         )
+        // Straight after open, in the same commit: the host's chrome cannot
+        // show anything until it has this session's state, so every hop
+        // between the two is time the player spends black. The structural
+        // effect below re-pushes the identical payload a dispatch later,
+        // which is a no-op for the page but keeps the dedup honest.
+        if (WaylandVideoBridge.webChromeActive) {
+            bridge.pushControlsJson(playerControlsState.toControlsJson(fullscreenNow))
+        }
         // The runtime tracks whether the resume position was actually applied
         // and re-requests it until told. open() passed it to mpv above.
         if (initialPositionRequestKey != null) {

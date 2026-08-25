@@ -184,6 +184,9 @@ fun main() {
             if (!runRealAppEarly) setOption("audio", "no")
             if (System.getProperty("nuvio.wayland.videoLog")?.toBoolean() == true) {
                 setOption("msg-level", "all=v")
+                // Timestamps on mpv's own lines, so its startup phases can be
+                // lined up against the host's [session] traces.
+                setOption("msg-time", "yes")
             }
             userMpvConfPath()?.let {
                 val ok = loadConfigFile(it)
@@ -600,10 +603,9 @@ fun main() {
     // branch's rule, copied: composite only while loading/paused/interacting
     // (plus fade grace) -- "normal watching pays nothing".
     val chromeActiveUntilNs = java.util.concurrent.atomic.AtomicLong(Long.MAX_VALUE)
-    // Frame count after which the chrome may be shown: set when the page
-    // reports controlsReady and we push its first state. Long.MAX_VALUE means
-    // "not ready yet".
-    val chromeRevealAfterFrame = java.util.concurrent.atomic.AtomicLong(Long.MAX_VALUE)
+    // When the chrome may be shown is WpeChrome's own gate now: it is armed
+    // where this session's state is pushed into the page, and opens when the
+    // layer holds a frame painted from it. See WpeChrome's reveal gate.
     var chromeEpochSeen = 0L
     // The stock web chrome is the player UI: it renders on the GPU, costs
     // ~0.09ms a frame regardless of window size, and leaves Compose with
@@ -645,30 +647,27 @@ fun main() {
                             chromeActiveUntilNs.set(System.nanoTime() + 600_000_000L)
                     }
                     if (type == "controlsReady") {
-                        // The page says it has rendered: only now is it safe
-                        // to show. Before this it composites in a partially
-                        // laid-out state, which reads as the chrome flashing
-                        // up half-built.
+                        // A fresh page context. Everything painted before it
+                        // belongs to a page that no longer exists, so the gate
+                        // shuts and is re-armed from here.
+                        wpeChrome?.closeReveal()
                         // Only feed a page that has a session to show. The
                         // controls page starts with isLoading=true and shows
                         // its opening overlay while `!hasReceivedPlayerControls`
                         // -- and receiving ANY controls JSON clears that flag,
                         // so a warm-up push is what makes a fresh page render
                         // controls instead of the overlay.
-                        if (videoHost?.hasFile == true) videoHost?.flushControlsToChrome()
-                        // controlsReady means the page can RECEIVE state, not
-                        // that it has PAINTED any. Guessing a frame margin
-                        // here revealed half-drawn or stale content; ask the
-                        // page instead. Two rAFs guarantee a frame has been
-                        // rendered after the current state, at which point
-                        // the opening overlay is on screen.
-                        // Reveal once the page has exported frames of its
-                        // current state. (A paint report from the page itself
-                        // would be exact, but rAF is throttled while the view
-                        // is hidden, so it never fires -- measured.)
-                        chromeRevealAfterFrame.set(
-                            (wpeChrome?.framesExported ?: 0L) + 2L,
-                        )
+                        if (videoHost?.hasFile == true) {
+                            // Re-arms on the push, so the reveal waits for a
+                            // frame painted from THIS session's state. Covers
+                            // the race where the session's own push landed on
+                            // a page that had not finished loading.
+                            videoHost?.flushControlsToChrome()
+                        } else {
+                            // No session to feed: the page's own paint is all
+                            // there will be (host-only chrome).
+                            wpeChrome?.armReveal()
+                        }
                     }
                     java.awt.EventQueue.invokeLater {
                         com.nuvio.app.features.player.desktop.WaylandVideoBridge
@@ -894,48 +893,63 @@ fun main() {
             // reports ready and has drawn the state we push.
             if (chrome.sessionEpoch != chromeEpochSeen) {
                 chromeEpochSeen = chrome.sessionEpoch
-                chromeRevealAfterFrame.set(Long.MAX_VALUE)
+                chrome.closeReveal()
             }
-            val chromeDrawn = chrome.framesExported >= chromeRevealAfterFrame.get()
+            val chromeDrawn = chrome.revealReady
             val wantChrome = (!runRealApp || videoHost?.hasFile == true) &&
                 active && chromeDrawn
             if (videoLog && wantChrome != chromeShown) {
                 println(
                     "[session] chrome ${if (wantChrome) "SHOW" else "hide"} " +
                         "(hasFile=${videoHost?.hasFile} active=$active " +
-                        "drawn=$chromeDrawn frames=${chrome.framesExported})",
+                        "drawn=$chromeDrawn taken=${chrome.framesTaken})",
                 )
             }
             if (wantChrome != chromeShown) {
                 chromeShown = wantChrome
                 chrome.visible = wantChrome
+                // The session-start window is over either way: shown means the
+                // layer has what it was primed for, hidden means there is
+                // nothing worth keeping.
+                chrome.priming = false
+                val ui = uiPipeline
                 if (!wantChrome) {
                     chromeImage?.close()
                     chromeImage = null
+                    // Two different hides. The inactivity one happens many
+                    // times a session -- the controls fade out, the mouse
+                    // moves, they come back -- and there the last frame is
+                    // the page's own faded-out one, which is exactly what
+                    // the next reveal should draw. Throwing it away made
+                    // every re-show blank until a fresh frame arrived.
+                    // Only the end of a SESSION invalidates the texture,
+                    // because only then does it belong to a stream that is
+                    // no longer playing.
+                    //
                     // The layer's own teardown must happen on its thread, and
-                    // the repaint has to be requested AFTER the clear has
-                    // run -- asking from here raced it, so the repaint still
+                    // the repaint has to be requested AFTER it has run --
+                    // asking from here raced it, so the repaint still
                     // contained the chrome and nothing asked for another.
-                    val ui = uiPipeline
+                    val sessionOver = videoHost?.hasFile != true
                     chromeLayer?.let { l ->
                         ui?.post {
-                            l.clear()
+                            if (sessionOver) l.clear() else l.setComposited(false)
                             ui.requestOverlayFrame()
                         }
                     } ?: ui?.requestOverlayFrame()
                     chromeChanged = true
                 } else {
-                    // On show, WPE may be idle waiting on an ack a hidden
-                    // frame swallowed; kick it so the page exports again.
+                    // Nothing to wait for: priming already put this session's
+                    // opening overlay in the texture, so the reveal is just
+                    // permission to draw it. The ack keeps the page running
+                    // now that its frames are worth having again.
+                    chromeLayer?.let { l ->
+                        ui?.post {
+                            l.setComposited(true)
+                            ui.requestOverlayFrame()
+                        }
+                    } ?: ui?.requestOverlayFrame()
                     chrome.ackFrame()
-                    // An ack alone only grants permission -- an idle page
-                    // (nothing changed while hidden, e.g. paused) still
-                    // paints nothing, and since hiding clears the layer
-                    // there would be NO chrome at all until something
-                    // happened to change the DOM. playerUpdate always ends
-                    // in renderChrome(), so pushing state now guarantees the
-                    // frame this reveal needs.
-                    videoHost?.pushPlaybackUpdate()
                 }
             }
             // Chrome frames ride this scene, Stremio-style: ONE surface,

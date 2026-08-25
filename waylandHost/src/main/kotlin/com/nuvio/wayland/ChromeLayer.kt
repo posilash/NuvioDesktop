@@ -215,9 +215,9 @@ class ChromeLayer(private val chrome: WpeChrome) {
         // skipped adopting the waiting frame and, with it, the ack that is
         // the page's permission to render the next one -- after the first
         // hide the chrome could never come back.
-        val cleared = clearedSincePublish
-        clearedSincePublish = false
-        if (!chrome.visible) {
+        val dirty = dirtySincePublish
+        dirtySincePublish = false
+        if (!chrome.visible && !chrome.priming) {
             // Hidden: never adopt. WpeChrome drops exports while hidden, but
             // one queued microseconds before the flag flipped is still
             // waiting here -- adopting it puts the chrome straight back on
@@ -236,7 +236,7 @@ class ChromeLayer(private val chrome: WpeChrome) {
             var drained = chrome.takeEglImage()?.let { chrome.releaseImageAsync(it); true } ?: false
             if (chrome.takeShmFrame() != null) drained = true
             if (drained) chrome.ackFrameAfter(HIDDEN_ACK_MS)
-            return cleared
+            return dirty
         }
         val start = System.nanoTime()
         val changed = if (chrome.gpuActive) updateFromEglImage() else updateFromShm()
@@ -247,13 +247,45 @@ class ChromeLayer(private val chrome: WpeChrome) {
             if (ns > maxUpdateNanos) maxUpdateNanos = ns
             // The ack is the page's permission to render the next frame, and
             // it is only ever valid once per export -- see WpeChrome.
-            chrome.ackFrameAfter(ackDelayMs)
+            //
+            // Unpaced while priming: those frames are the ones a reveal is
+            // waiting on, and pacing them is time the user spends looking at
+            // black. The window is a handful of frames long, so the storm the
+            // pacing exists to prevent cannot get going.
+            if (composited) chrome.ackFrameAfter(ackDelayMs) else chrome.ackFrame()
             if (probesLeft > 0) {
                 probesLeft--
                 probeOrientation()
             }
         }
-        return changed || cleared
+        // A frame adopted while priming changes the texture but not the
+        // screen, so it is not a reason to publish a UI frame.
+        return (changed && composited) || dirty
+    }
+
+    /**
+     * Whether the adopted frame is drawn at all.
+     *
+     * Separate from having content on purpose: through the session-start
+     * window the layer takes the page's frames without showing them, so that
+     * when the reveal comes the texture already holds this session's opening
+     * overlay and the reveal is a draw rather than a wait. That wait was the
+     * black flash between clicking a stream and the loading page.
+     */
+    private var composited = false
+
+    /**
+     * Start or stop drawing what the layer already holds.
+     *
+     * Either direction changes the composite without a new frame arriving, so
+     * both have to publish one: [UiPipeline] re-renders only when something
+     * says it must, and "the chrome appeared" and "the chrome went away" are
+     * both that something.
+     */
+    fun setComposited(on: Boolean) {
+        if (on == composited) return
+        composited = on
+        if (haveContent) dirtySincePublish = true
     }
 
     private fun updateFromEglImage(): Boolean {
@@ -350,7 +382,7 @@ class ChromeLayer(private val chrome: WpeChrome) {
      * the viewport sits at the origin, with no offset.
      */
     fun draw(targetWidth: Int, targetHeight: Int) {
-        if (!haveContent || texture == 0 || texW <= 0 || texH <= 0) {
+        if (!composited || !haveContent || texture == 0 || texW <= 0 || texH <= 0) {
             if (drawsLogged < 3 &&
                 System.getProperty("nuvio.wayland.videoLog")?.toBoolean() == true
             ) {
@@ -449,14 +481,18 @@ class ChromeLayer(private val chrome: WpeChrome) {
             println("[chrome-layer] clear(haveContent=$haveContent)")
         }
         // Only worth a repaint if something was actually on screen.
-        if (haveContent) clearedSincePublish = true
+        setComposited(false)
         haveContent = false
         displayedImage?.let { chrome.releaseImageAsync(it) }
         displayedImage = null
     }
 
-    /** Set by [clear], consumed by [update]: forces one frame without us. */
-    private var clearedSincePublish = false
+    /**
+     * Set when the composite changed without a frame doing it -- revealed,
+     * hidden, cleared. Consumed by [update], which is where [UiPipeline] asks
+     * whether there is anything new to publish.
+     */
+    private var dirtySincePublish = false
     private var drawsLogged = 0
 
     private companion object {

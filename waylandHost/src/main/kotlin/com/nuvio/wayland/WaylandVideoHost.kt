@@ -117,6 +117,7 @@ class WaylandVideoHost(
         if (awaitingFirstFrame) {
             if (!restartSeen || !frame.fresh) return
             awaitingFirstFrame = false
+            traceSession("first frame on screen")
         }
         lastCompositeNs = System.nanoTime()
 
@@ -239,6 +240,16 @@ class WaylandVideoHost(
     override fun pushControlsJson(json: String) {
         lastControlsJson = json
         val c = chrome ?: return
+        // This is the push that turns a bootstrap page into this session's
+        // opening overlay -- artwork, title, the lot -- so it is what the
+        // reveal waits for. Armed BEFORE the script goes out, so no frame
+        // painted from it can slip past the count. Arming is once per
+        // session; the structural re-pushes during playback leave the gate
+        // alone.
+        if (hasFile) {
+            c.armReveal()
+            traceSession("controls push")
+        }
         // Stock's flush script verbatim: probes window.playerControls so a
         // too-early push is detected; controlsReady re-pushes (see onMessage
         // wiring in Main).
@@ -372,8 +383,17 @@ class WaylandVideoHost(
     fun markLoaded() { hasFile = true }
 
     init {
-        mpv.onStartFile = { awaitingFirstFrame = true; restartSeen = false }
-        mpv.onPlaybackRestart = { restartSeen = true }
+        mpv.onStartFile = {
+            awaitingFirstFrame = true
+            restartSeen = false
+            traceSession("START_FILE")
+        }
+        mpv.onPlaybackRestart = {
+            restartSeen = true
+            // mpv sends this once BOTH audio and video are ready to run, so
+            // it is the reference point for "when should sound start".
+            traceSession("PLAYBACK_RESTART")
+        }
     }
 
 
@@ -403,6 +423,16 @@ class WaylandVideoHost(
         }
         sessionStartNs = System.nanoTime()
         traceSession("open(playWhenReady=$playWhenReady)")
+        // Shut the reveal gate before anything can look at hasFile, or the
+        // gate left open by the last session shows the chrome the instant
+        // this one starts -- which is the flash of stale/empty chrome. From
+        // here until the reveal the layer takes the page's frames without
+        // drawing them, so the overlay is ready the moment it is allowed on
+        // screen.
+        chrome?.let {
+            it.closeReveal()
+            it.priming = true
+        }
         mpv.setProperty("pause", if (playWhenReady) "no" else "yes")
         if (startPositionMs > 0) {
             mpv.setProperty("start", (startPositionMs / 1000.0).toString())
@@ -467,12 +497,34 @@ class WaylandVideoHost(
     // (already resolved from a list position by the controller); negative
     // means off. Position->id resolution lives in the controller, exactly
     // where stock puts it.
+    /**
+     * Selecting a track is never free, and selecting the one that is ALREADY
+     * selected is pure loss: mpv refreshes the demuxer's track, reopens the
+     * decoder and reinitialises the audio output for no change at all.
+     *
+     * Worse, a REAL switch after playback has begun costs seconds of silence,
+     * because an unselected track is never demuxed -- mpv has no packets for
+     * it anywhere before the demuxer's read head and plays silence until the
+     * clock gets there:
+     *
+     *   delaying audio start 1029.376000 vs. 1024.148000, diff=5.228000
+     *
+     * A seek does not rescue that; the demuxer cache holds packets, not bytes,
+     * and the ones for a stream that was not selected were dropped as they
+     * were parsed. The only cure is to choose the track before playback
+     * starts, which is why the app now applies its preference as soon as the
+     * tracks exist rather than when loading ends.
+     */
     override fun selectAudioTrack(id: Int) {
-        mpv.setProperty("aid", if (id < 0) "no" else id.toString())
+        val want = if (id < 0) "no" else id.toString()
+        if (mpv.cachedString("aid") == want) return
+        mpv.setProperty("aid", want)
     }
 
     override fun selectSubtitleTrack(id: Int) {
-        mpv.setProperty("sid", if (id < 0) "no" else id.toString())
+        val want = if (id < 0) "no" else id.toString()
+        if (mpv.cachedString("sid") == want) return
+        mpv.setProperty("sid", want)
     }
 
     override fun setSubtitleDelayMs(delayMs: Int) {
@@ -657,6 +709,7 @@ class WaylandVideoHost(
 
     override fun stop() {
         hasFile = false
+        chrome?.priming = false
         mpv.command("stop")
         // Upstream destroys the player's web view here and builds a new one
         // for the next session; reloading is the same thing for page state,
@@ -702,6 +755,10 @@ class WaylandVideoHost(
             "time-pos", "duration", "demuxer-cache-time", "pause",
             "idle-active", "seeking", "paused-for-cache", "eof-reached",
             "speed", "volume", "mute", "core-idle",
+            // Current track selection. Observed so a re-select of what is
+            // already playing can be recognised and skipped -- see
+            // selectAudioTrack. They change only when a track does.
+            "aid", "sid",
             // As STRING this arrives as the full JSON blob -- pushed by the
             // core only when tracks actually change, never polled.
             "track-list",
