@@ -28,9 +28,29 @@ import java.lang.invoke.MethodType
 class Mpv private constructor(private val handle: MemorySegment, private val arena: Arena) {
 
     companion object {
-        /** Blocking-paced render + swap feedback; default is free-run. */
-        val pacedMode: Boolean =
-            System.getProperty("nuvio.wayland.paced")?.toBoolean() == true
+        /** Explicit override for testing; null leaves the config to decide. */
+        private val pacedOverride: Boolean? =
+            System.getProperty("nuvio.wayland.paced")?.toBoolean()
+
+        /**
+         * Blocking-paced render + swap feedback; default is free-run.
+         *
+         * Display-sync is the only thing that needs it, and mpv cannot do
+         * display-sync without it, so the user's own video-sync decides. That
+         * keeps the two from disagreeing -- advanced control without
+         * display-sync buys nothing but the fatal contract, and display-sync
+         * without advanced control silently falls back to audio -- and it is
+         * the one switch an installed build can reach, since mpv.conf is read
+         * either way and jpackage passes no properties.
+         */
+        @Volatile
+        var pacedMode: Boolean = pacedOverride == true
+            private set
+
+        /** Decide from the initialized core, before any render context exists. */
+        fun resolvePacedMode(videoSync: String?) {
+            pacedMode = pacedOverride ?: (videoSync?.startsWith("display-") == true)
+        }
 
         const val MPV_RENDER_PARAM_INVALID = 0
         const val MPV_RENDER_PARAM_API_TYPE = 1

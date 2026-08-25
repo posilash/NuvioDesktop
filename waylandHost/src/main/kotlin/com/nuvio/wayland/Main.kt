@@ -327,6 +327,19 @@ fun main(args: Array<String>) {
             }
             System.getProperty("nuvio.wayland.hwdec")?.let { setOption("hwdec", it) }
             initialize()
+            // Now the config has been parsed, so video-sync is whatever the
+            // user actually set. Nothing has created a render context yet,
+            // which is the last moment this can be decided.
+            val videoSync = getProperty("video-sync")
+            Mpv.resolvePacedMode(videoSync)
+            println(
+                "mpv render: " + if (Mpv.pacedMode) {
+                    "advanced control (video-sync=$videoSync) -- a stalled " +
+                        "render is fatal here, not a repeated frame"
+                } else {
+                    "free-run (video-sync=$videoSync)"
+                },
+            )
             // Event loop owns the queue; observed properties feed the state
             // cache. Log forwarding rides the same thread under videoLog.
             for (prop in WaylandVideoHost.OBSERVED_PROPERTIES) observeProperty(prop)
