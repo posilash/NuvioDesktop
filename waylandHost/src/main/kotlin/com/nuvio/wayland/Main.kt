@@ -514,6 +514,20 @@ fun main(args: Array<String>) {
     // Set by the UI thread on publish; the analogue of videoFrameReady.
     val uiFrameReady = java.util.concurrent.atomic.AtomicBoolean(false)
 
+    // Popup and dialog layers place themselves against WindowInfo.containerSize,
+    // and the stock context reports zero, so they centre on the origin: the exit
+    // modal measured 700x194 at -350,-97, a quarter of it on screen. Read live,
+    // since a resize relayouts the scene and the layers re-place with it.
+    val scenePlatformContext = object :
+        androidx.compose.ui.platform.PlatformContext by androidx.compose.ui.platform.PlatformContext.Empty() {
+        override val windowInfo = object : androidx.compose.ui.platform.WindowInfo {
+            override val isWindowFocused: Boolean
+                get() = glfwGetWindowAttrib(window, GLFW_FOCUSED) == GLFW_TRUE
+            override val containerSize: androidx.compose.ui.unit.IntSize
+                get() = androidx.compose.ui.unit.IntSize(width, height)
+        }
+    }
+
     val scene: ComposeScene
     if (uiThreadEnabled) {
         val p = UiPipeline(uiWindow)
@@ -530,6 +544,7 @@ fun main(args: Array<String>) {
             CanvasLayersComposeScene(
                 density = Density(initialScale),
                 size = androidx.compose.ui.unit.IntSize(width, height),
+                platformContext = scenePlatformContext,
                 coroutineContext = p.dispatcher,
                 invalidate = { p.requestFrame() },
             )
@@ -543,6 +558,7 @@ fun main(args: Array<String>) {
         scene = CanvasLayersComposeScene(
             density = Density(initialScale),
             size = androidx.compose.ui.unit.IntSize(width, height),
+            platformContext = scenePlatformContext,
             coroutineContext = MainUIDispatcher,
         )
         println("ui: in-loop rasterization on the EDT (legacy path, -Pnuvio.wayland.uiThread=false)")
