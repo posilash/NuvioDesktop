@@ -451,6 +451,7 @@ private fun PlayerScreenRuntime.BindPlayerMetadataAndSkipEffects() {
         activeSkipInterval = null
         skipIntervalDismissed = false
         autoSkippedIntervalKeys.clear()
+        playerNotificationMessage = ""
         showNextEpisodeCard = false
         nextEpisodeAutoPlayJob?.cancel()
         nextEpisodeAutoPlaySearching = false
@@ -511,9 +512,19 @@ private fun PlayerScreenRuntime.BindPlayerMetadataAndSkipEffects() {
                 intervalKey !in autoSkippedIntervalKeys
             ) {
                 autoSkippedIntervalKeys.add(intervalKey)
-                controller.seekTo((current.endTime * 1000).toLong())
+                val seekPositionMs = (current.endTime * 1000).toLong()
+                controller.seekTo(seekPositionMs)
                 scheduleProgressSyncAfterSeek()
                 skipIntervalDismissed = true
+                playerNotificationMessage = getString(
+                    when (segmentType) {
+                        AutoSkipSegmentType.INTRO -> Res.string.player_auto_skip_intro_notification
+                        AutoSkipSegmentType.RECAP -> Res.string.player_auto_skip_recap_notification
+                        AutoSkipSegmentType.OUTRO -> Res.string.player_auto_skip_outro_notification
+                    },
+                    formatPlaybackTime(seekPositionMs),
+                )
+                playerNotificationToken += 1L
             }
         }
     }

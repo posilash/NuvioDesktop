@@ -1064,6 +1064,37 @@ gboolean createWebviewOnGtk(gpointer data) {
                                     gpointer) -> gboolean { return TRUE; }),
                      nullptr);
 
+    // Mouse thumb buttons never reach the controls page on Linux. X11 delivers
+    // them as buttons 8 and 9, but the DOM numbers them 3 and 4, and WebKitGTK
+    // does not translate between the two -- so the page's back/forward seek
+    // handler (which is shared with Windows, where WebView2 does translate)
+    // never fires here. Nothing reports it: the buttons are simply dead.
+    // Emit the same events the page would have sent, so both platforms end up
+    // in the same Kotlin handler.
+    g_signal_connect(wv, "button-press-event",
+                     G_CALLBACK(+[](GtkWidget *, GdkEventButton *ev,
+                                    gpointer data) -> gboolean {
+                         auto *p = static_cast<Player *>(data);
+                         if (!playerAlive(p)) return FALSE;
+                         const char *action = ev->button == 8   ? "seekBack"
+                                              : ev->button == 9 ? "seekForward"
+                                                                : nullptr;
+                         if (!action) return FALSE;
+                         // Consume it either way: letting a half-handled thumb
+                         // button fall through to WebKit gains nothing.
+                         if (!p->eventSink || !p->eventMethod) return TRUE;
+                         JNIEnv *env = attachGtkThread();
+                         if (env) {
+                             jstring jtype = env->NewStringUTF(action);
+                             env->CallVoidMethod(p->eventSink, p->eventMethod,
+                                                 jtype, (jdouble)0.0);
+                             env->DeleteLocalRef(jtype);
+                         }
+                         NUVIO_LOG("thumb button %u -> %s", ev->button, action);
+                         return TRUE;
+                     }),
+                     player);
+
     if (!adopted) gtk_container_add(GTK_CONTAINER(win), GTK_WIDGET(wv));
 
     // Make sure the overlay actually asks the X server for pointer/keyboard
