@@ -40,6 +40,8 @@ class VideoPipeline(
         var height = 0
         /** Identity for consumer-side wrapper caches; bumped on reallocation. */
         var generation = 0
+        /** Signals when the consumer's reads of this buffer have retired. */
+        var releaseFence = 0L
     }
 
     private val lock = Object()
@@ -47,6 +49,7 @@ class VideoPipeline(
     private var front: Buffer? = null      // latest published, not yet taken
     private var displayed: Buffer? = null  // held by the consumer
     private var rendering: Buffer? = null  // owned by the video thread
+    private var retiring: Buffer? = null   // replaced, fence not attached yet
     private var frontFence = 0L
 
     // Requested render size, in framebuffer pixels. Written by the UI side
@@ -232,8 +235,22 @@ class VideoPipeline(
     /** Pick the buffer that is neither published nor being displayed. */
     private fun acquireBuffer(w: Int, h: Int): Buffer? {
         val buf = synchronized(lock) {
-            buffers.firstOrNull { it !== front && it !== displayed }?.also { rendering = it }
+            buffers.firstOrNull {
+                it !== front && it !== displayed &&
+                    // Untouchable until the consumer's release fence exists.
+                    (it !== retiring || it.releaseFence != 0L)
+            }?.also {
+                if (it === retiring) retiring = null
+                rendering = it
+            }
         } ?: return null
+        // Wait out the consumer's last reads before overwriting the texture.
+        // Server-side, so it costs a queue token rather than a stall.
+        val release = synchronized(lock) { buf.releaseFence.also { buf.releaseFence = 0L } }
+        if (release != 0L) {
+            GL32.glWaitSync(release, 0, GL32.GL_TIMEOUT_IGNORED)
+            GL32.glDeleteSync(release)
+        }
         if (buf.texture == 0 || buf.width != w || buf.height != h) {
             releaseBuffer(buf)
             buf.texture = GL11.glGenTextures()
@@ -260,6 +277,7 @@ class VideoPipeline(
     private var generationCounter = 0
 
     private fun releaseBuffer(b: Buffer) {
+        if (b.releaseFence != 0L) { GL32.glDeleteSync(b.releaseFence); b.releaseFence = 0L }
         if (b.fbo != 0) { GL30.glDeleteFramebuffers(b.fbo); b.fbo = 0 }
         if (b.texture != 0) { GL11.glDeleteTextures(b.texture); b.texture = 0 }
         b.width = 0; b.height = 0
@@ -290,10 +308,16 @@ class VideoPipeline(
     fun acquireDisplayFrame(): DisplayFrame? {
         var fence = 0L
         var fresh = false
+        var released: Buffer? = null
         val buf = synchronized(lock) {
             val f = front
             if (f != null) {
                 front = null
+                val prev = displayed
+                if (prev != null && prev !== f) {
+                    retiring = prev
+                    released = prev
+                }
                 displayed = f
                 fence = frontFence
                 frontFence = 0L
@@ -301,6 +325,27 @@ class VideoPipeline(
             }
             displayed
         } ?: return null
+        // The other half of the handoff. Letting go of a buffer here only means
+        // the consumer has issued its last draw from it, not that the GPU has
+        // run it, and the video thread may pick the buffer up the moment it is
+        // no longer `displayed`. At 24 publishes a second the reuse came around
+        // ~125ms later and the reads had long retired; at 165 the cycle is 18ms
+        // and the producer overwrote a texture still being sampled, which is
+        // what flickered.
+        //
+        // The fence can only be made once the lock is dropped, so the buffer
+        // parks in `retiring` until it has one -- otherwise the producer takes
+        // it during the gap and finds no fence to wait on. Same reasoning as
+        // the Vulkan path's retiring slot.
+        released?.let { r ->
+            val rf = GL32.glFenceSync(GL32.GL_SYNC_GPU_COMMANDS_COMPLETE, 0)
+            // Must reach the GPU before the other context waits on it.
+            GL11.glFlush()
+            synchronized(lock) {
+                if (r.releaseFence != 0L) GL32.glDeleteSync(r.releaseFence)
+                r.releaseFence = rf
+            }
+        }
         if (fence != 0L) {
             GL32.glWaitSync(fence, 0, GL32.GL_TIMEOUT_IGNORED)
             GL32.glDeleteSync(fence)
