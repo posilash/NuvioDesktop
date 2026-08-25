@@ -763,24 +763,19 @@ fun main(args: Array<String>) {
             chrome.start(pageUri)
         }
         videoHost?.chrome = wpeChrome
-        // Chrome frames are consumed on the UI thread, where the GL context
-        // that can import them lives. The presenting thread is not involved at
-        // all any more -- it just draws whatever texture the UI thread last
-        // published, at a cost that does not depend on the chrome.
-        uiPipeline?.let { p ->
-            val chrome = wpeChrome!!
-            val layer = ChromeLayer(chrome)
-            chromeLayer = layer
-            // Construction is cheap, but every GL object it makes must be born
-            // on the UI thread with its context current.
-            p.post { p.overlay = layer }
-            chrome.onFrame = { p.requestOverlayFrame() }
-        }
-        if (uiPipeline == null) {
-            // Legacy in-loop path: the present loop still adopts SHM frames
-            // itself, so it has to be woken the old way.
-            wpeChrome!!.onFrame = { glfwPostEmptyEvent() }
-        }
+        // Chrome frames are consumed on the PRESENTING thread, not the UI one.
+        //
+        // The UI thread rasterizes Compose, and a Compose frame is not
+        // bounded: measured at 370ms on a screen with many dated items, all of
+        // it inside scene.render(). Adopting chrome frames there meant the
+        // controls froze for exactly as long, even though the chrome's own
+        // work is 0.09ms. The AWT build never showed this because its chrome
+        // is a separate GTK window that Compose cannot stall.
+        //
+        // The import needs a current GL context, and the window's is in the
+        // same share group, so the presenting thread can do it just as well.
+        chromeLayer = ChromeLayer(wpeChrome!!)
+        wpeChrome!!.onFrame = { glfwPostEmptyEvent() }
         if (runRealAppEarly) {
             com.nuvio.app.features.player.desktop.WaylandVideoBridge.webChromeActive = true
             println("web chrome: ACTIVE (stock controls.html via WPE)")
@@ -1014,29 +1009,19 @@ fun main(args: Array<String>) {
                     // because only then does it belong to a stream that is
                     // no longer playing.
                     //
-                    // The layer's own teardown must happen on its thread, and
-                    // the repaint has to be requested AFTER it has run --
-                    // asking from here raced it, so the repaint still
-                    // contained the chrome and nothing asked for another.
+                    // This thread owns the layer now, so the teardown is a
+                    // plain call: no posting, and none of the racing that
+                    // came with it.
                     val sessionOver = videoHost?.hasFile != true
-                    chromeLayer?.let { l ->
-                        ui?.post {
-                            if (sessionOver) l.clear() else l.setComposited(false)
-                            ui.requestOverlayFrame()
-                        }
-                    } ?: ui?.requestOverlayFrame()
+                    chromeLayer?.let { if (sessionOver) it.clear() else it.setComposited(false) }
                     chromeChanged = true
                 } else {
                     // Nothing to wait for: priming already put this session's
                     // opening overlay in the texture, so the reveal is just
                     // permission to draw it. The ack keeps the page running
                     // now that its frames are worth having again.
-                    chromeLayer?.let { l ->
-                        ui?.post {
-                            l.setComposited(true)
-                            ui.requestOverlayFrame()
-                        }
-                    } ?: ui?.requestOverlayFrame()
+                    chromeLayer?.setComposited(true)
+                    chromeChanged = true
                     chrome.ackFrame()
                 }
             }
@@ -1190,6 +1175,18 @@ fun main(args: Array<String>) {
         t = System.nanoTime()
         context.flush()
         timings.add("flush", System.nanoTime() - t)
+
+        // Chrome last, straight into the window's framebuffer with raw GL --
+        // after Skia's work is submitted, so it lands on top, and with Skia's
+        // cached state invalidated after, since this happens behind its back.
+        // Adopting here rather than on the UI thread is what keeps the
+        // controls responsive while Compose is busy.
+        chromeLayer?.let { l ->
+            l.update()
+            GL30.glBindFramebuffer(GL30.GL_FRAMEBUFFER, 0)
+            l.draw(width, height, originBottomLeft = true)
+            context.resetGLAll()
+        }
 
         // What this present actually put on screen, read back from the frame
         // itself. A run of these with no video and no chrome is the flash --

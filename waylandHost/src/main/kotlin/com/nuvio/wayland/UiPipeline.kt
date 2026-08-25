@@ -99,27 +99,19 @@ class UiPipeline(
     /** Called (from this thread) after each publish; wired to wake the host loop. */
     @Volatile var onFrame: (() -> Unit)? = null
 
-    /**
-     * The web chrome, composited over the scene into the same published
-     * texture. Owned by this thread once set. Keeping it here rather than on
-     * the presenting thread is the point of the GPU chrome path: the present
-     * loop keeps drawing exactly one UI quad no matter what the chrome costs.
-     */
-    @Volatile var overlay: ChromeLayer? = null
-
-    /** Set when WPE has exported a frame; the analogue of [framePending]. */
-    @Volatile private var overlayDirty = false
-
-    /** Wake this thread for a chrome frame (called from the GLib thread). */
-    fun requestOverlayFrame() {
-        overlayDirty = true
-        thread?.let { LockSupport.unpark(it) }
-    }
+    // The chrome used to be composited into this thread's buffer. It is drawn
+    // by the presenting thread now: a Compose frame has no upper bound, and
+    // the controls must not wait on one. See where ChromeLayer is created.
 
     // Telemetry, read by report(). This is where scene cost is now reported --
     // it no longer exists anywhere on the present path.
     @Volatile private var renders = 0L
     @Volatile private var renderNanos = 0L
+    // "The scene is slow" is two problems: Compose recomposing and drawing,
+    // versus this thread blocking in the driver behind everything else on the
+    // GPU. One number cannot tell them apart.
+    @Volatile private var composeNanos = 0L
+    @Volatile private var flushNanos = 0L
     @Volatile private var maxRenderNanos = 0L
     @Volatile private var lastGeneration = 0
     @Volatile private var renderErrors = 0L
@@ -213,13 +205,19 @@ class UiPipeline(
     fun report(elapsedSeconds: Double): String {
         val r = renders; renders = 0
         val ns = renderNanos; renderNanos = 0
+        val cns = composeNanos; composeNanos = 0
+        val fns = flushNanos; flushNanos = 0
         val mx = maxRenderNanos; maxRenderNanos = 0
         val avgMs = if (r > 0) ns / 1e6 / r else 0.0
-        return "ui: scenes/s=%.0f sceneAvg=%.1fms sceneMax=%.1fms size=%dx%d gen=%d errs=%d"
-            .format(
-                r / elapsedSeconds, avgMs, mx / 1e6,
-                targetWidth, targetHeight, lastGeneration, renderErrors,
-            )
+        return (
+            "ui: scenes/s=%.0f sceneAvg=%.1fms compose=%.1fms flush=%.1fms " +
+                "sceneMax=%.1fms size=%dx%d gen=%d errs=%d"
+            ).format(
+            r / elapsedSeconds, avgMs,
+            if (r > 0) cns / 1e6 / r else 0.0,
+            if (r > 0) fns / 1e6 / r else 0.0,
+            mx / 1e6, targetWidth, targetHeight, lastGeneration, renderErrors,
+        )
     }
 
     // ---- the UI thread ----
@@ -255,7 +253,6 @@ class UiPipeline(
         } finally {
             // Everything Skia, Compose and GL owns here must die on this
             // thread, with this context current.
-            runCatching { overlay?.close() }.onFailure { it.printStackTrace() }
             runCatching { scene.close() }.onFailure { it.printStackTrace() }
             synchronized(lock) {
                 if (frontFence != 0L) { GL32.glDeleteSync(frontFence); frontFence = 0L }
@@ -272,7 +269,7 @@ class UiPipeline(
             drainTasks()
             if (!running) return
 
-            if (!framePending && !overlayDirty) {
+            if (!framePending) {
                 // Parked until an invalidation, a chrome frame, a resize or
                 // posted work. The timeout is only a shutdown/robustness
                 // backstop.
@@ -300,15 +297,8 @@ class UiPipeline(
             // exported EGLImage (or a texture upload on the SHM path), so it
             // has to happen here, on the thread that owns the context -- never
             // on the presenting thread, which is the whole point.
-            val overlayChanged = if (overlayDirty) {
-                overlayDirty = false
-                overlay?.update() ?: false
-            } else {
-                false
-            }
-
             // Woken for nothing that changed a pixel.
-            if (!sceneWanted && !overlayChanged && !sizeDirty) continue
+            if (!sceneWanted && !sizeDirty) continue
 
             if (sizeDirty) {
                 sizeDirty = false
@@ -345,27 +335,19 @@ class UiPipeline(
                     t.printStackTrace()
                 }
             }
+            val composeNs = System.nanoTime() - t
             // Submit Skia's recorded work before fencing it.
             context.flush()
 
             val elapsed = System.nanoTime() - t
             renders++
             renderNanos += elapsed
+            composeNanos += composeNs
+            flushNanos += elapsed - composeNs
             if (elapsed > maxRenderNanos) maxRenderNanos = elapsed
 
             // The chrome goes on top, into the same buffer, as one textured
             // quad. Raw GL is deliberate: Skia treats a wrapped render target
-            // as opaque, which would turn the chrome into a black sheet over
-            // the video, and this way the premultiplied source-over blend is
-            // stated outright. Skia's cached GL state is invalidated straight
-            // after, since this all happened behind its back.
-            overlay?.let { o ->
-                GL30.glBindFramebuffer(GL30.GL_FRAMEBUFFER, buf.fbo)
-                o.draw(w, h)
-                GL30.glBindFramebuffer(GL30.GL_FRAMEBUFFER, 0)
-                context.resetGLAll()
-            }
-
             val fence = GL32.glFenceSync(GL32.GL_SYNC_GPU_COMMANDS_COMPLETE, 0)
             // The fence must reach the GPU before another context waits on it.
             GL11.glFlush()
@@ -376,7 +358,7 @@ class UiPipeline(
                 frontFence = fence
             }
             lastGeneration = buf.generation
-            StartupTrace.publish(overlay?.isComposited == true, buf.generation)
+            StartupTrace.publish(false, buf.generation)
             onFrame?.invoke()
 
             // Animations and pending effects keep the scene dirty; ask for the

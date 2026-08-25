@@ -389,7 +389,13 @@ class ChromeLayer(private val chrome: WpeChrome) {
      * texel row 0 is the canvas top, so top-aligned means GL rows 0..texH-1 --
      * the viewport sits at the origin, with no offset.
      */
-    fun draw(targetWidth: Int, targetHeight: Int) {
+    /**
+     * [originBottomLeft] is the destination's convention, not the source's.
+     * A Skia TOP_LEFT surface puts row 0 at the top; the window's default
+     * framebuffer puts it at the bottom, so the same quad drawn into each
+     * comes out the other way up.
+     */
+    fun draw(targetWidth: Int, targetHeight: Int, originBottomLeft: Boolean = false) {
         if (!composited || !haveContent || texture == 0 || texW <= 0 || texH <= 0) {
             if (drawsLogged < 3 &&
                 System.getProperty("nuvio.wayland.videoLog")?.toBoolean() == true
@@ -415,7 +421,8 @@ class ChromeLayer(private val chrome: WpeChrome) {
 
         GL11.glViewport(0, 0, texW, texH)
         GL20.glUseProgram(program)
-        GL20.glUniform1i(uFlipY, if (if (chrome.gpuActive) flipGpu else flipShm) 1 else 0)
+        val sourceFlip = if (chrome.gpuActive) flipGpu else flipShm
+        GL20.glUniform1i(uFlipY, if (sourceFlip != originBottomLeft) 1 else 0)
         GL20.glUniform1i(uTex, 0)
         GL13.glActiveTexture(GL13.GL_TEXTURE0)
         GL11.glBindTexture(GL11.GL_TEXTURE_2D, texture)
