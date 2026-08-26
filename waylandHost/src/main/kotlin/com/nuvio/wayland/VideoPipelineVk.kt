@@ -232,8 +232,17 @@ class VideoPipelineVk(private val mpv: Mpv) {
     private val lock = Object()
     // Diagnostic lever: -Dnuvio.wayland.vkBuffers=1 removes rotation (and
     // therefore every wrap-around hazard) to bisect corruption sources.
+    //
+    // Five, not three. The consumer holds two at all times -- one displayed,
+    // one retiring until its glDone signal lands -- so three left exactly one
+    // for rendering, and mpv does not deliver at a steady 24fps: it publishes
+    // in bursts (measured: 25 back-to-back publishes per 5s). A burst of two
+    // had nowhere to go, so mpv blocked ~117ms waiting for a buffer, fell
+    // further behind, and burst harder to catch up. Frames it could not place
+    // were dropped -- 71 of them in ten seconds of a 1080p stream. Headroom
+    // absorbs the burst instead; at 2560x1440 each buffer is ~14MB.
     private val buffers = Array(
-        System.getProperty("nuvio.wayland.vkBuffers")?.toIntOrNull()?.coerceIn(1, 3) ?: 3,
+        System.getProperty("nuvio.wayland.vkBuffers")?.toIntOrNull()?.coerceIn(1, 8) ?: 5,
     ) { Buffer() }
     private var front: Buffer? = null      // latest published, not yet taken
     private var displayed: Buffer? = null  // held by the consumer
@@ -450,6 +459,7 @@ class VideoPipelineVk(private val mpv: Mpv) {
             synchronized(lock) {
                 // A replaced-but-never-taken front keeps its pending signal;
                 // acquireBuffer() drains it before the buffer renders again.
+                if (front != null) untakenFronts++
                 front = buf
                 rendering = null
             }
@@ -468,6 +478,12 @@ class VideoPipelineVk(private val mpv: Mpv) {
     private var waitedForBufferNs = 0L
     private var waitedForBufferCount = 0L
     private var starvedSinceNs = 0L
+    // A drain is a CPU-blocking fence wait, and it happens when a published
+    // frame was never taken. Counting it separates "the consumer is not
+    // collecting" from every other reason a render could be late.
+    private var drains = 0L
+    private var drainNanos = 0L
+    private var untakenFronts = 0L
 
     private fun notePublish(now: Long) {
         if (lastPublishNs != 0L) {
@@ -482,6 +498,9 @@ class VideoPipelineVk(private val mpv: Mpv) {
                 println(
                     "[wayland-video] publish(vsyncs): $body " +
                         "bufferWaits=$waitedForBufferCount " +
+                        "drains=$drains drainMs=%.0f untaken=$untakenFronts ".format(
+                            drainNanos / 1e6,
+                        ) +
                         "avgWait=%.1fms".format(
                             if (waitedForBufferCount > 0) {
                                 waitedForBufferNs / 1e6 / waitedForBufferCount
@@ -493,6 +512,7 @@ class VideoPipelineVk(private val mpv: Mpv) {
                 publishBuckets.fill(0)
                 waitedForBufferNs = 0
                 waitedForBufferCount = 0
+                drains = 0; drainNanos = 0; untakenFronts = 0
             }
             publishReportNs = now
         }
@@ -909,6 +929,8 @@ class VideoPipelineVk(private val mpv: Mpv) {
      * the render thread, so it cannot race mpv's own submissions.
      */
     private fun drainSemaphore(sem: Long) {
+        val t0 = System.nanoTime()
+        drains++
         stackPush().use { s ->
             val si = VkSubmitInfo.calloc(s)
                 .sType(VK_STRUCTURE_TYPE_SUBMIT_INFO)
@@ -921,6 +943,7 @@ class VideoPipelineVk(private val mpv: Mpv) {
             val r = vkWaitForFences(device, drainFence, true, 1_000_000_000L)
             check(r == VK_SUCCESS) { "semaphore drain did not retire (VkResult $r)" }
             vkResetFences(device, drainFence)
+            drainNanos += System.nanoTime() - t0
         }
     }
 

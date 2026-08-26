@@ -1127,11 +1127,12 @@ class VkPresenter(private val window: Long) {
                 vkDestroyImage(device, vkImage, null)
                 return null
             }
-            if (!loggedChromeImport) {
-                loggedChromeImport = true
+            if (lastChromeSize != (d.width shl 16 or d.height)) {
+                lastChromeSize = d.width shl 16 or d.height
                 println(
-                    "vk-dmabuf: chrome imported zero-copy -- ${d.width}x${d.height} " +
-                        "fourcc=0x${d.fourcc.toString(16)} modifier=0x${d.modifier.toString(16)}",
+                    "vk-dmabuf: chrome ${d.width}x${d.height} -> target ${swapWidth}x$swapHeight" +
+                        (if (d.width != swapWidth || d.height != swapHeight) " (UPSCALED)" else " (1:1)") +
+                        " fourcc=0x${d.fourcc.toString(16)}",
                 )
             }
             return ChromeImage(vkImage, memory, skia, d.width, d.height)
@@ -1163,7 +1164,7 @@ class VkPresenter(private val window: Long) {
 
     private val chromePaint = org.jetbrains.skia.Paint()
     private var chromeImportFailed = false
-    private var loggedChromeImport = false
+    private var lastChromeSize = -1
 
     /** DRM fourcc -> VkFormat, for the formats WPE actually hands out. */
     private fun drmFourccToVk(fourcc: Int): Int = when (fourcc) {
