@@ -39,6 +39,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import dev.chrisbanes.haze.HazeState
+import com.nuvio.app.isDesktop
 import dev.chrisbanes.haze.hazeEffect
 import org.jetbrains.compose.resources.DrawableResource
 import org.jetbrains.compose.resources.painterResource
@@ -147,6 +148,7 @@ fun NuvioNavigationBar(
             .then(
                 if (hazeState != null) {
                     Modifier.hazeEffect(state = hazeState) {
+                        blurEnabled = !isDesktop
                         blurRadius = 24.dp
                     }
                 } else {

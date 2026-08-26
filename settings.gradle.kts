@@ -9,6 +9,9 @@ pluginManagement {
         }
         mavenCentral()
         gradlePluginPortal()
+        maven("https://packages.jetbrains.team/maven/p/cmp/dev") {
+            mavenContent { includeGroupAndSubgroups("org.jetbrains.compose") }
+        }
     }
 }
 
@@ -29,6 +32,15 @@ dependencyResolutionManagement {
             }
         }
         mavenCentral()
+        // Compose dev builds and the Skiko they pin: 1.12.10-alpha01+dev4686 is
+        // the first on skiko 0.152.x, whose Linux binary is the only one built
+        // with Vulkan.
+        maven("https://packages.jetbrains.team/maven/p/cmp/dev") {
+            mavenContent {
+                includeGroupAndSubgroups("org.jetbrains.compose")
+                includeGroupAndSubgroups("org.jetbrains.skiko")
+            }
+        }
     }
 }
 

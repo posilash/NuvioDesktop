@@ -567,6 +567,11 @@ fun main(args: Array<String>) {
         }
     }
 
+    // 1.12.10 made the graphics backend pluggable and stopped registering it
+    // itself: without this the scene fails to build with "Registered
+    // implementation is null". It is also where Graphite would be selected.
+    androidx.compose.ui.platform.registerSkikoComposeImplementation()
+
     val scene: ComposeScene
     // Whichever recomposer drives `scene`: the pipeline's on the threaded path,
     // one of our own on the legacy in-loop path.

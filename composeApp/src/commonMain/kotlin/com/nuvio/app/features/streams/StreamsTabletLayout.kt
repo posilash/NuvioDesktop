@@ -44,6 +44,7 @@ import com.nuvio.app.core.ui.NuvioAsyncImage as AsyncImage
 import com.nuvio.app.core.ui.nuvioDesktopDragScroll
 import com.nuvio.app.isIos
 import dev.chrisbanes.haze.HazeInputScale
+import com.nuvio.app.isDesktop
 import dev.chrisbanes.haze.hazeEffect
 import dev.chrisbanes.haze.hazeSource
 import dev.chrisbanes.haze.rememberHazeState
@@ -176,6 +177,7 @@ internal fun TabletStreamsLayout(
                         .fillMaxSize()
                         .clip(RoundedCornerShape(24.dp))
                         .hazeEffect(state = hazeState) {
+                            blurEnabled = !isDesktop
                             inputScale = HazeInputScale.Fixed(0.66f)
                             blurRadius = 56.dp
                         }
