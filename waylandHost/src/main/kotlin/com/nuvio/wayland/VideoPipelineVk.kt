@@ -397,7 +397,19 @@ class VideoPipelineVk(private val mpv: Mpv) {
             if (w <= 0 || h <= 0) continue
             if (!mpv.hasNewFrame() && !needsRealloc(w, h)) continue
 
-            val buf = acquireBuffer(w, h) ?: continue
+            // Starvation, measured: a render that cannot start because every
+            // buffer is still with the consumer is the one thing that shows up
+            // as a late frame with nothing slow anywhere.
+            val buf = acquireBuffer(w, h)
+            if (buf == null) {
+                if (starvedSinceNs == 0L) starvedSinceNs = System.nanoTime()
+                continue
+            }
+            if (starvedSinceNs != 0L) {
+                waitedForBufferNs += System.nanoTime() - starvedSinceNs
+                waitedForBufferCount++
+                starvedSinceNs = 0L
+            }
 
             // Known-noisy: the fork caches exactly one wrapped target
             // (libmpv_vk_pl.c p->target) and rewraps whenever the VkImage
@@ -442,7 +454,47 @@ class VideoPipelineVk(private val mpv: Mpv) {
                 rendering = null
             }
             lastGeneration = buf.generation
+            notePublish(System.nanoTime())
             onFrame?.invoke()
+        }
+    }
+
+    // Publish cadence, measured HERE rather than at the far end of the host
+    // loop. The host's own histogram cannot tell "mpv handed us a frame late"
+    // apart from "we were slow to present it", and those have opposite fixes.
+    private val publishBuckets = IntArray(12)
+    private var lastPublishNs = 0L
+    private var publishReportNs = 0L
+    private var waitedForBufferNs = 0L
+    private var waitedForBufferCount = 0L
+    private var starvedSinceNs = 0L
+
+    private fun notePublish(now: Long) {
+        if (lastPublishNs != 0L) {
+            val ms = (now - lastPublishNs) / 1e6
+            publishBuckets[(ms / 6.06).toInt().coerceIn(0, publishBuckets.size - 1)]++
+        }
+        lastPublishNs = now
+        if (now - publishReportNs > 5_000_000_000L) {
+            if (publishReportNs != 0L) {
+                val body = publishBuckets.withIndex().filter { it.value > 0 }
+                    .joinToString(" ") { "${it.index}v=${it.value}" }
+                println(
+                    "[wayland-video] publish(vsyncs): $body " +
+                        "bufferWaits=$waitedForBufferCount " +
+                        "avgWait=%.1fms".format(
+                            if (waitedForBufferCount > 0) {
+                                waitedForBufferNs / 1e6 / waitedForBufferCount
+                            } else {
+                                0.0
+                            },
+                        ),
+                )
+                publishBuckets.fill(0)
+                waitedForBufferNs = 0
+                waitedForBufferCount = 0
+            }
+            publishReportNs = now
         }
     }
 

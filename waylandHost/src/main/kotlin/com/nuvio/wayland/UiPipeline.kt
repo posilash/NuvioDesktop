@@ -149,6 +149,15 @@ class UiPipeline(
      */
     fun requestFrame() {
         framePending = true
+        if (externallyDriven) {
+            // Nothing is published on this path, so the host's "the scene has
+            // something new" signal has to come from here instead. Without it
+            // sceneDirty is false forever and the loop only runs while video
+            // rolls -- which is why the chrome went stale and stopped
+            // responding the moment playback paused.
+            onFrame?.invoke()
+            return
+        }
         thread?.let { LockSupport.unpark(it) }
     }
 
@@ -297,6 +306,11 @@ class UiPipeline(
             if (!running) return
 
             if (externallyDriven) {
+                // Resizes still have to be applied: the host resizes through
+                // this class on both paths, and skipping it here left the scene
+                // at its construction size -- a small window inside a fullscreen
+                // one. Only the rasterization below is suppressed.
+                applyPendingSize()
                 // Park until posted work arrives -- a host frame, an input
                 // event, or something Compose dispatched. The timeout is only a
                 // shutdown backstop, as below.
@@ -335,16 +349,7 @@ class UiPipeline(
             // Woken for nothing that changed a pixel.
             if (!sceneWanted && !sizeDirty) continue
 
-            if (sizeDirty) {
-                sizeDirty = false
-                val w = targetWidth
-                val h = targetHeight
-                val d = targetDensity
-                if (w > 0 && h > 0) {
-                    scene.size = IntSize(w, h)
-                    if (scene.density.density != d) scene.density = Density(d)
-                }
-            }
+            applyPendingSize()
 
             val w = targetWidth
             val h = targetHeight
@@ -400,6 +405,19 @@ class UiPipeline(
             // Animations and pending effects keep the scene dirty; ask for the
             // next frame so the pacing above turns it into a steady cadence.
             if (frameRecomposer.hasPendingWork()) framePending = true
+        }
+    }
+
+    /** Apply a size/density the host asked for. Only ever on this thread. */
+    private fun applyPendingSize() {
+        if (!sizeDirty) return
+        sizeDirty = false
+        val w = targetWidth
+        val h = targetHeight
+        val d = targetDensity
+        if (w > 0 && h > 0) {
+            scene.size = IntSize(w, h)
+            if (scene.density.density != d) scene.density = Density(d)
         }
     }
 

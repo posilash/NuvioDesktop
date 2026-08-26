@@ -222,6 +222,38 @@ class WaylandVideoHost(
         drewVideo = true
     }
 
+    /** A frame from the Vulkan pipeline, and whether it may be drawn yet. */
+    class VulkanFrame(val frame: VideoPipelineVk.DisplayFrame, val draw: Boolean)
+
+    /**
+     * The Vulkan analogue of [compositeVideo]: identical bookkeeping, no GL.
+     *
+     * This exists because that bookkeeping is not incidental to drawing. It is
+     * what clears awaitingFirstFrame -- which is what the controls page reads
+     * as "still loading", so skipping it leaves the loading wheel up for the
+     * whole session -- and it is what refuses the outgoing file's last frame
+     * across a stream change, which is the flash of the previous stream.
+     *
+     * The frame is returned either way, because the caller owes it the
+     * semaphore handoff whether or not it draws it.
+     */
+    fun acquireVulkanFrame(vk: VideoPipelineVk): VulkanFrame? {
+        if (!hasFile) return null
+        if (rectWidth <= 0f || rectHeight <= 0f) return null
+        val frame = vk.acquireDisplayFrame() ?: return null
+        if (awaitingFirstFrame) {
+            if (!restartSeen || !frame.fresh) return VulkanFrame(frame, draw = false)
+            awaitingFirstFrame = false
+            traceSession("first frame on screen")
+            StartupTrace.mark("first video frame on screen")
+            StartupTrace.endAfter(400)
+        }
+        lastCompositeNs = System.nanoTime()
+        composites++
+        drewVideo = true
+        return VulkanFrame(frame, draw = true)
+    }
+
     private fun evictStaleWrappers(keep: Int) {
         // Generations only grow; anything older than (keep - 3) can no longer
         // be republished by the triple-buffered pipeline.

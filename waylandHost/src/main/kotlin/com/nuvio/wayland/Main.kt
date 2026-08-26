@@ -1154,15 +1154,12 @@ fun main(args: Array<String>) {
             onSceneThreadAndWait {
                 val canvas = presenter.beginFrameGraphite()
                 if (canvas != null) {
-                    val target = androidx.compose.ui.unit.IntSize(presenter.width, presenter.height)
-                    if (scene.size != target && presenter.width > 0 && presenter.height > 0) {
-                        width = presenter.width
-                        height = presenter.height
-                        scene.size = target
-                        val sc = currentScale()
-                        if (scene.density.density != sc) scene.density = Density(sc)
-                        input.scale = sc
-                    }
+                    // No resize handling here: renderOneFrame does it at the
+                    // top, for both backends, and it is the one that also tells
+                    // WPE and UiPipeline. This used to duplicate it because the
+                    // early return skipped it -- which left two places setting
+                    // the scene size, one of them calling GLFW off the main
+                    // thread.
                     // Transparent, not black: the scene's hole punch has to
                     // survive down to this canvas for the video to land in it,
                     // and CLEAR inside a Compose layer only stays transparent if
@@ -1191,19 +1188,22 @@ fun main(args: Array<String>) {
                         vp == null -> gVideoNoPipeline++
                         host == null || !host.hasFile -> gVideoNoFile++
                         else -> {
-                            val r = host.videoRect
-                            if (r[2] <= 0f || r[3] <= 0f) {
-                                gVideoNoRect++
+                            // Through the host, not straight to the pipeline:
+                            // it owns the first-frame and stream-change gating
+                            // that the controls page reads as "loading".
+                            val got = host.acquireVulkanFrame(vp)
+                            if (got == null) {
+                                gVideoNoFrame++
                             } else {
-                                val f = vp.acquireDisplayFrame()
-                                if (f == null) {
-                                    gVideoNoFrame++
-                                } else {
-                                    if (f.fresh) {
-                                        waitSem = f.buffer.semaphore
-                                        retired = f.retired
-                                        signalSem = retired?.glDoneSemaphore ?: 0L
-                                    }
+                                val f = got.frame
+                                // Owed whether or not the frame is drawn.
+                                if (f.fresh) {
+                                    waitSem = f.buffer.semaphore
+                                    retired = f.retired
+                                    signalSem = retired?.glDoneSemaphore ?: 0L
+                                }
+                                if (got.draw) {
+                                    val r = host.videoRect
                                     pendingVideo = f
                                     pendingRect = org.jetbrains.skia.Rect
                                         .makeXYWH(r[0], r[1], r[2], r[3])

@@ -149,6 +149,13 @@ class VkPresenter(private val window: Long) {
     private lateinit var mpvQueue: VkQueue
     private var queueFamily = 0
     private var queueCount = 1
+    private var presentMode = KHRSurface.VK_PRESENT_MODE_FIFO_KHR
+    /**
+     * Whether the host paces its own commits (vsync mode 2, the default). Read
+     * here rather than passed so the swapchain and the loop cannot disagree.
+     */
+    private val selfPaced =
+        (System.getProperty("nuvio.wayland.vsync")?.toIntOrNull() ?: 2) != 1
     private var separateQueues = false
     private var deviceName = "?"
 
@@ -245,7 +252,15 @@ class VkPresenter(private val window: Long) {
         // Match the swapchain, not the request: the surface's extent is the
         // only size that presents without scaling.
         createTarget(swapWidth, swapHeight)
-        println("vk-present: $deviceName swapchain=${swapWidth}x$swapHeight images=${swapImages.size}")
+        val modeName = when (presentMode) {
+            KHRSurface.VK_PRESENT_MODE_IMMEDIATE_KHR -> "IMMEDIATE"
+            KHRSurface.VK_PRESENT_MODE_MAILBOX_KHR -> "MAILBOX"
+            else -> "FIFO"
+        }
+        println(
+            "vk-present: $deviceName swapchain=${swapWidth}x$swapHeight " +
+                "images=${swapImages.size} mode=$modeName selfPaced=$selfPaced",
+        )
     }
 
     private fun createInstanceAndDevice() {
@@ -473,7 +488,37 @@ class VkPresenter(private val window: Long) {
             check(swapUsage and VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT != 0) {
                 "surface cannot be rendered into: usage=${caps.supportedUsageFlags()}"
             }
-            val minImages = maxOf(caps.minImageCount(), 2).let {
+            // Present mode has to agree with who is pacing. vsyncMode 2 paces
+            // commits onto the vblank grid itself -- that is what took this
+            // host from 82.5 to 165fps -- and FIFO paces them too, by blocking
+            // in acquire. Two pacers beat against each other: the cadence
+            // histogram spreads from a clean 6v/7v into 0v/1v bursts with 11v
+            // gaps, which is the judder. FIFO is the analogue of
+            // glfwSwapInterval(1), and this path wants the analogue of 0.
+            val modeCount = s.mallocInt(1)
+            KHRSurface.vkGetPhysicalDeviceSurfacePresentModesKHR(
+                physicalDevice, surface, modeCount, null,
+            )
+            val modes = s.mallocInt(modeCount.get(0))
+            KHRSurface.vkGetPhysicalDeviceSurfacePresentModesKHR(
+                physicalDevice, surface, modeCount, modes,
+            )
+            val availableModes = (0 until modes.capacity()).map { modes.get(it) }.toSet()
+            val wantedModes = if (selfPaced) {
+                listOf(
+                    KHRSurface.VK_PRESENT_MODE_IMMEDIATE_KHR,
+                    KHRSurface.VK_PRESENT_MODE_MAILBOX_KHR,
+                    KHRSurface.VK_PRESENT_MODE_FIFO_KHR,
+                )
+            } else {
+                listOf(KHRSurface.VK_PRESENT_MODE_FIFO_KHR)
+            }
+            presentMode = wantedModes.first { it in availableModes }
+            // FIFO is the only mode guaranteed to exist, so it is the only one
+            // that may be asked for with two images; the others need a third to
+            // keep acquire from blocking on the one being scanned out.
+            val wantImages = if (presentMode == KHRSurface.VK_PRESENT_MODE_FIFO_KHR) 2 else 3
+            val minImages = maxOf(caps.minImageCount(), wantImages).let {
                 if (caps.maxImageCount() > 0) minOf(it, caps.maxImageCount()) else it
             }
 
@@ -489,7 +534,7 @@ class VkPresenter(private val window: Long) {
                 .imageSharingMode(VK_SHARING_MODE_EXCLUSIVE)
                 .preTransform(caps.currentTransform())
                 .compositeAlpha(KHRSurface.VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR)
-                .presentMode(KHRSurface.VK_PRESENT_MODE_FIFO_KHR)
+                .presentMode(presentMode)
                 .clipped(true)
                 .oldSwapchain(VK_NULL_HANDLE)
             sci.imageExtent().width(swapWidth).height(swapHeight)
