@@ -568,6 +568,9 @@ fun main(args: Array<String>) {
     }
 
     val scene: ComposeScene
+    // Whichever recomposer drives `scene`: the pipeline's on the threaded path,
+    // one of our own on the legacy in-loop path.
+    val sceneRecomposer: androidx.compose.ui.platform.FrameRecomposer
     if (uiThreadEnabled) {
         val p = UiPipeline(uiWindow)
         p.onFrame = {
@@ -579,26 +582,27 @@ fun main(args: Array<String>) {
         // posts back to it: everything Compose launches -- effects, animations,
         // recomposition -- then runs on the one thread that is allowed to touch
         // the scene. MainUIDispatcher/the EDT is out of the picture entirely.
-        p.start(width, height, initialScale) {
+        p.start(width, height, initialScale) { recomposer ->
             CanvasLayersComposeScene(
+                frameRecomposer = recomposer,
                 density = Density(initialScale),
                 size = androidx.compose.ui.unit.IntSize(width, height),
                 platformContext = scenePlatformContext,
-                coroutineContext = p.dispatcher,
-                invalidate = { p.requestFrame() },
             )
         }
         p.awaitReady()
         uiPipeline = p
         uiLayer = UiLayer(context)
         scene = p.scene
+        sceneRecomposer = p.frameRecomposer
         println("ui: threaded rasterization (nuvio-ui thread, shared GL context + own DirectContext)")
     } else {
+        sceneRecomposer = androidx.compose.ui.platform.FrameRecomposer(MainUIDispatcher) {}
         scene = CanvasLayersComposeScene(
+            frameRecomposer = sceneRecomposer,
             density = Density(initialScale),
             size = androidx.compose.ui.unit.IntSize(width, height),
             platformContext = scenePlatformContext,
-            coroutineContext = MainUIDispatcher,
         )
         println("ui: in-loop rasterization on the EDT (legacy path, -Pnuvio.wayland.uiThread=false)")
     }
@@ -1186,7 +1190,7 @@ fun main(args: Array<String>) {
         val sceneDirty = if (uiPipeline != null) {
             forceRepaint || uiChanged
         } else {
-            forceRepaint || scene.hasInvalidations()
+            forceRepaint || sceneRecomposer.hasPendingWork()
         }
         // Stremio's presentation model, completed: while video plays, present
         // EVERY iteration -- vsync-paced by the swap -- and sample mpv's
@@ -1243,7 +1247,8 @@ fun main(args: Array<String>) {
             forceRepaint = false
             lastSceneRenderNs = t
             ui.canvas.clear(0x00000000)
-            scene.render(ui.canvas.asComposeCanvas(), System.nanoTime())
+            sceneRecomposer.performFrame(System.nanoTime())
+            scene.draw(ui.canvas.asComposeCanvas())
             val costMs = (System.nanoTime() - t) / 1e6
             sceneCostEmaMs += (costMs - sceneCostEmaMs) * 0.2
             timings.add("scene", System.nanoTime() - t)
@@ -1426,13 +1431,14 @@ fun main(args: Array<String>) {
             // ahead. Deferring it to the next loop iteration burned 4-12ms
             // of that margin and let 20ms scenes collide with the next
             // frame -- the residual 11-vsync gaps.
-            if (ui != null && scene.hasInvalidations() &&
+            if (ui != null && sceneRecomposer.hasPendingWork() &&
                 sceneCostEmaMs < (pipeline?.publishIntervalMs ?: 41.7) - 8.0
             ) {
                 val ts = System.nanoTime()
                 forceRepaint = false
                 ui.canvas.clear(0x00000000)
-                scene.render(ui.canvas.asComposeCanvas(), System.nanoTime())
+                sceneRecomposer.performFrame(System.nanoTime())
+            scene.draw(ui.canvas.asComposeCanvas())
                 context.flush()
                 val costMs = (System.nanoTime() - ts) / 1e6
                 sceneCostEmaMs += (costMs - sceneCostEmaMs) * 0.2

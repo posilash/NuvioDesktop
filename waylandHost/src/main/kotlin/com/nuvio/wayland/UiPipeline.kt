@@ -78,6 +78,13 @@ class UiPipeline(
 
     /** The Compose scene. Only touch it from [thread] (see [post]/[invokeAndWait]). */
     lateinit var scene: ComposeScene
+
+    /**
+     * Owns the frame clock in 1.12: recomposition, effects and animations run
+     * from performFrame(), and the scene only draws. Lives here because it must
+     * share the thread and dispatcher the scene is confined to.
+     */
+    lateinit var frameRecomposer: androidx.compose.ui.platform.FrameRecomposer
         private set
 
     // Requested framebuffer size and density, written by the presenting thread.
@@ -179,7 +186,12 @@ class UiPipeline(
      * Start the thread and build the scene on it. [sceneFactory] runs on the UI
      * thread with the GL context current and [context] initialised.
      */
-    fun start(width: Int, height: Int, density: Float, sceneFactory: () -> ComposeScene) {
+    fun start(
+        width: Int,
+        height: Int,
+        density: Float,
+        sceneFactory: (androidx.compose.ui.platform.FrameRecomposer) -> ComposeScene,
+    ) {
         targetWidth = width
         targetHeight = height
         targetDensity = density
@@ -222,7 +234,7 @@ class UiPipeline(
 
     // ---- the UI thread ----
 
-    private fun run(sceneFactory: () -> ComposeScene) {
+    private fun run(sceneFactory: (androidx.compose.ui.platform.FrameRecomposer) -> ComposeScene) {
         try {
             // Claim "main dispatcher thread" BEFORE anything composes: the
             // lifecycle registries Compose builds during the apply phase assert
@@ -236,7 +248,8 @@ class UiPipeline(
             glfwMakeContextCurrent(uiWindow)
             GL.createCapabilities()
             context = DirectContext.makeGL()
-            scene = sceneFactory()
+            frameRecomposer = androidx.compose.ui.platform.FrameRecomposer(dispatcher) { requestFrame() }
+            scene = sceneFactory(frameRecomposer)
         } catch (t: Throwable) {
             initError = t
             running = false
@@ -328,7 +341,8 @@ class UiPipeline(
             // expensive failure mode there is, because nothing says why. A
             // scene-side fault now degrades the UI and leaves the host alive.
             try {
-                scene.render(surface.canvas.asComposeCanvas(), System.nanoTime())
+                frameRecomposer.performFrame(System.nanoTime())
+                scene.draw(surface.canvas.asComposeCanvas())
             } catch (t: Throwable) {
                 if (renderErrors++ == 0L) {
                     System.err.println("[wayland-ui] scene.render failed (first occurrence)")
@@ -363,7 +377,7 @@ class UiPipeline(
 
             // Animations and pending effects keep the scene dirty; ask for the
             // next frame so the pacing above turns it into a steady cadence.
-            if (scene.hasInvalidations()) framePending = true
+            if (frameRecomposer.hasPendingWork()) framePending = true
         }
     }
 
