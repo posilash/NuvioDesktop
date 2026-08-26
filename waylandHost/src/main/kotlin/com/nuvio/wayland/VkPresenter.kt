@@ -851,6 +851,128 @@ class VkPresenter(private val window: Long) {
      * reports itself out of date, which is the only reliable notice of a resize
      * here: the window has no framebuffer for GLFW to measure.
      */
+    // The UI layer: what UiPipeline's published texture is on the GL path.
+    //
+    // Drawing the scene straight into the present target meant paying for it on
+    // every present -- measured at 9-29ms of Compose per frame, which dropped
+    // the host loop from 165fps to 29-67 and left mpv's frames uncollected
+    // (untaken=60-87 per 5s). The scene has to be rasterized on its own cadence
+    // and composited as one image, which is the whole reason UiPipeline exists.
+    private var uiImage = VK_NULL_HANDLE
+    private var uiMemory = VK_NULL_HANDLE
+    private var uiSurface: org.jetbrains.skia.Surface? = null
+    private var uiSkiaImage: org.jetbrains.skia.Image? = null
+
+    /** Canvas the scene draws into. Null until the layer exists. */
+    fun uiLayerCanvas(): org.jetbrains.skia.Canvas? = uiSurface?.canvas
+
+    /** The layer as something the present can sample. */
+    fun uiLayerImage(): org.jetbrains.skia.Image? = uiSkiaImage
+
+    private fun createUiLayer(w: Int, h: Int) {
+        val rec = recorder ?: return
+        stackPush().use { s ->
+            val ici = VkImageCreateInfo.calloc(s)
+                .sType(VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO)
+                .imageType(VK_IMAGE_TYPE_2D)
+                .format(swapFormat)
+                .mipLevels(1)
+                .arrayLayers(1)
+                .samples(VK_SAMPLE_COUNT_1_BIT)
+                .tiling(VK_IMAGE_TILING_OPTIMAL)
+                .usage(swapUsage or VK_IMAGE_USAGE_TRANSFER_SRC_BIT)
+                .sharingMode(VK_SHARING_MODE_EXCLUSIVE)
+                .initialLayout(VK_IMAGE_LAYOUT_UNDEFINED)
+            ici.extent().width(w).height(h).depth(1)
+            val pl = s.mallocLong(1)
+            check(vkCreateImage(device, ici, null, pl), "vkCreateImage(ui layer)")
+            uiImage = pl.get(0)
+            val mr = VkMemoryRequirements.calloc(s)
+            vkGetImageMemoryRequirements(device, uiImage, mr)
+            val ai = VkMemoryAllocateInfo.calloc(s)
+                .sType(VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO)
+                .allocationSize(mr.size())
+                .memoryTypeIndex(findMemoryType(mr.memoryTypeBits(), VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT))
+            check(vkAllocateMemory(device, ai, null, pl), "vkAllocateMemory(ui layer)")
+            uiMemory = pl.get(0)
+            check(vkBindImageMemory(device, uiImage, uiMemory, 0), "vkBindImageMemory(ui layer)")
+            transitionToGeneral(uiImage)
+        }
+        val info = org.jetbrains.skia.gpu.graphite.VulkanTextureInfo(
+            format = org.jetbrains.skia.gpu.graphite.VulkanFormat(swapFormat),
+            imageUsageFlags = org.jetbrains.skia.gpu.graphite.VulkanImageUsageFlags(
+                swapUsage or VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
+            ),
+        )
+        fun tex() = org.jetbrains.skia.gpu.graphite.BackendTexture.makeVulkan(
+            width = w, height = h, textureInfo = info,
+            imageLayout = VK_IMAGE_LAYOUT_GENERAL,
+            queueFamilyIndex = queueFamily, imagePtr = uiImage,
+        )
+        uiSurface = org.jetbrains.skia.Surface.wrapBackendTexture(rec, tex(), null, null)
+        // Same image wrapped a second time, to be read rather than written.
+        uiSkiaImage = org.jetbrains.skia.Image.wrapBackendTexture(
+            recorder = rec,
+            backendTexture = tex(),
+            alphaType = org.jetbrains.skia.ColorAlphaType.PREMUL,
+            colorSpace = null,
+            originTopLeft = true,
+        )
+        if (uiSurface == null || uiSkiaImage == null) {
+            System.err.println("vk-graphite: could not build the UI layer")
+        } else {
+            // Load-bearing: an opaque layer can never let the video through,
+            // whatever blend mode composites it.
+            println(
+                "vk-graphite: ui layer ${w}x$h alphaType=" +
+                    "${uiSurface!!.imageInfo.colorInfo.alphaType} " +
+                    "imageAlpha=${uiSkiaImage!!.imageInfo.colorInfo.alphaType}",
+            )
+        }
+    }
+
+    private fun destroyUiLayer() {
+        uiSkiaImage?.close(); uiSkiaImage = null
+        uiSurface?.close(); uiSurface = null
+        if (uiImage != VK_NULL_HANDLE) { vkDestroyImage(device, uiImage, null); uiImage = VK_NULL_HANDLE }
+        if (uiMemory != VK_NULL_HANDLE) { vkFreeMemory(device, uiMemory, null); uiMemory = VK_NULL_HANDLE }
+    }
+
+    /** UNDEFINED -> GENERAL, once, for an image Skia will render into. */
+    private fun transitionToGeneral(image: Long) = withQueue {
+        stackPush().use { s ->
+            val cb = cmdBuf ?: return@use
+            vkResetCommandBuffer(cb, 0)
+            val bi = VkCommandBufferBeginInfo.calloc(s)
+                .sType(VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO)
+                .flags(VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT)
+            vkBeginCommandBuffer(cb, bi)
+            val b = VkImageMemoryBarrier.calloc(1, s)
+            b.get(0).sType(VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER)
+                .oldLayout(VK_IMAGE_LAYOUT_UNDEFINED)
+                .newLayout(VK_IMAGE_LAYOUT_GENERAL)
+                .srcQueueFamilyIndex(VK_QUEUE_FAMILY_IGNORED)
+                .dstQueueFamilyIndex(VK_QUEUE_FAMILY_IGNORED)
+                .image(image)
+                .srcAccessMask(0)
+                .dstAccessMask(VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT)
+                .subresourceRange {
+                    it.aspectMask(VK_IMAGE_ASPECT_COLOR_BIT).baseMipLevel(0)
+                        .levelCount(1).baseArrayLayer(0).layerCount(1)
+                }
+            vkCmdPipelineBarrier(
+                cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, 0, null, null, b,
+            )
+            vkEndCommandBuffer(cb)
+            val si = VkSubmitInfo.calloc(s)
+                .sType(VK_STRUCTURE_TYPE_SUBMIT_INFO)
+                .pCommandBuffers(s.pointers(cb))
+            vkQueueSubmit(queue, si, VK_NULL_HANDLE)
+            vkQueueWaitIdle(queue)
+        }
+    }
+
     private fun createGraphiteTarget(w: Int, h: Int) {
         val rec = recorder ?: return
         stackPush().use { s ->
@@ -926,6 +1048,7 @@ class VkPresenter(private val window: Long) {
         if (gSurface == null) {
             System.err.println("vk-graphite: Skia refused the render target (format=$swapFormat)")
         }
+        createUiLayer(w, h)
     }
 
     /** Bring up Skia's Vulkan backend on this device. */
@@ -958,6 +1081,7 @@ class VkPresenter(private val window: Long) {
 
     private fun destroyGraphiteTarget() {
         vkDeviceWaitIdle(device)
+        destroyUiLayer()
         gSurface?.close()
         gSurface = null
         if (gTargetImage != VK_NULL_HANDLE) { vkDestroyImage(device, gTargetImage, null); gTargetImage = VK_NULL_HANDLE }
@@ -1149,6 +1273,16 @@ class VkPresenter(private val window: Long) {
         vkFreeMemory(device, c.memory, null)
         vkDestroyImage(device, c.vkImage, null)
     }
+
+    /** The UI layer, 1:1 over the whole target. Plain source-over. */
+    fun drawUiLayer(canvas: org.jetbrains.skia.Canvas, image: org.jetbrains.skia.Image) {
+        canvas.drawImage(image, 0f, 0f)
+    }
+
+    /** True once the layer exists and can actually carry transparency. */
+    val uiLayerHasAlpha: Boolean
+        get() = uiSurface?.imageInfo?.colorInfo?.alphaType !=
+            org.jetbrains.skia.ColorAlphaType.OPAQUE
 
     /** Chrome sits above everything the scene drew, so plain source-over. */
     fun drawChromeImage(canvas: org.jetbrains.skia.Canvas, c: ChromeImage, dst: org.jetbrains.skia.Rect) {

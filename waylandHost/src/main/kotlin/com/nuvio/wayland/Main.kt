@@ -1016,6 +1016,11 @@ fun main(args: Array<String>) {
     var gPresentNs = 0L
     var gDispatchNs = 0L
     var gLoopStartNs = 0L
+    var gReportNs = 0L
+    var lastUiDrawNs = 0L
+    val uiFrameIntervalNs =
+        1_000_000_000L / (System.getProperty("nuvio.wayland.uiFps")?.toIntOrNull() ?: 60)
+    var gFrames = 0L
     var gVideoNoPipeline = 0L
     var gVideoNoFile = 0L
     var gVideoNoRect = 0L
@@ -1147,7 +1152,7 @@ fun main(args: Array<String>) {
      * before a new stream, chrome that never composited. Backends differ in how
      * a frame is drawn and presented, and in nothing else.
      */
-    fun drawGraphiteFrame(presenter: VkPresenter): Boolean {
+    fun drawGraphiteFrame(presenter: VkPresenter, sceneDirty: Boolean): Boolean {
             var drew = false
             val tDispatch = System.nanoTime()
             if (gLoopStartNs == 0L) gLoopStartNs = tDispatch
@@ -1160,11 +1165,6 @@ fun main(args: Array<String>) {
                     // early return skipped it -- which left two places setting
                     // the scene size, one of them calling GLFW off the main
                     // thread.
-                    // Transparent, not black: the scene's hole punch has to
-                    // survive down to this canvas for the video to land in it,
-                    // and CLEAR inside a Compose layer only stays transparent if
-                    // what it composites onto is transparent too. The background
-                    // is filled back in at the end.
                     canvas.clear(0x00000000)
                     if (graphiteClearOnly) {
                         presenter.flushGraphite()
@@ -1213,27 +1213,50 @@ fun main(args: Array<String>) {
                     }
                     val tScene = System.nanoTime()
                     gVideoNs += tScene - tVideo
-                    sceneRecomposer.performFrame(System.nanoTime())
-                    val composeCanvas = graphiteComposeCanvas
-                        ?.takeIf { graphiteCanvasFor === canvas }
-                        ?: canvas.asComposeCanvas().also {
-                            graphiteComposeCanvas = it
-                            graphiteCanvasFor = canvas
-                        }
-                    scene.draw(composeCanvas)
+                    // The scene goes into its own layer, and only when it has
+                    // something new. Drawing it on every present cost 9-29ms a
+                    // frame and dropped the loop to 29-67fps; the present now
+                    // costs one image draw whatever Compose is doing.
+                    val uiCanvas = presenter.uiLayerCanvas()
+                    // Capped, like UiPipeline's own loop: animations keep the
+                    // scene dirty, and without this it rasterizes at the host's
+                    // rate (165) instead of the UI's (60). That is most of what
+                    // the scene costs a present, averaged out.
+                    val nowNs = System.nanoTime()
+                    val sceneDue = nowNs - lastUiDrawNs >= uiFrameIntervalNs
+                    if (uiCanvas != null && sceneDue &&
+                        (sceneDirty || sceneRecomposer.hasPendingWork())
+                    ) {
+                        lastUiDrawNs = nowNs
+                        uiCanvas.clear(0x00000000)
+                        val composeCanvas = graphiteComposeCanvas
+                            ?.takeIf { graphiteCanvasFor === uiCanvas }
+                            ?: uiCanvas.asComposeCanvas().also {
+                                graphiteComposeCanvas = it
+                                graphiteCanvasFor = uiCanvas
+                            }
+                        sceneRecomposer.performFrame(System.nanoTime())
+                        scene.draw(composeCanvas)
+                        // Its own submit: the composite below samples this
+                        // image, and a read-after-write inside one recording is
+                        // not ordered.
+                        presenter.flushGraphite()
+                    }
                     // Chrome above the scene, and above the video: it is the
                     // player's own controls. Source-over, so its transparent
                     // parts leave the hole open for the video below.
-                    // The session gating already ran in renderOneFrame, once.
-                    // Calling it here too double-acked every export, and an
-                    // un-paired ack is what sends WPE into a render storm.
-                    chromeLayer?.let { l ->
-                        l.update()
-                        l.drawInto(canvas, presenter.width, presenter.height)
-                    }
                     val tFlush = System.nanoTime()
                     gSceneNs += tFlush - tScene
-                    // Under the scene, into the hole it punched.
+                    // Video, then the UI layer over it, then the chrome:
+                    // the order the GL path composites in. The layer is
+                    // transparent where the player punched its hole, so the
+                    // video shows through without any blend-mode trickery.
+                    // Layer first, then the video underneath it with DST_OVER.
+                    // The scene does not punch its hole here -- measured,
+                    // punches/s=0 on both paths -- so the video's place is
+                    // simply wherever the layer left alpha, and DST_OVER is
+                    // what fills exactly that.
+                    presenter.uiLayerImage()?.let { presenter.drawUiLayer(canvas, it) }
                     val pv = pendingVideo
                     val pr = pendingRect
                     if (pv != null && pr != null) {
@@ -1246,8 +1269,11 @@ fun main(args: Array<String>) {
                             dst = pr,
                         )
                     }
-                    // Whatever is still transparent is background, not a hole.
                     presenter.fillBackground(canvas)
+                    chromeLayer?.let { l ->
+                        l.update()
+                        l.drawInto(canvas, presenter.width, presenter.height)
+                    }
                     presenter.flushGraphite(waitSemaphore = waitSem, signalSemaphore = signalSem)
                     // Only now is the signal on the queue, so only now may the
                     // buffer go back into mpv's rotation. Ordering matters: the
@@ -1259,6 +1285,30 @@ fun main(args: Array<String>) {
                     drew = true
                 }
             }
+        gDispatchNs += System.nanoTime() - tDispatch
+        if (drew) gFrames++
+        // Host-side counterpart to the video thread's publish histogram: what
+        // each stage of OUR frame costs, and how fast the loop actually turns.
+        // "The video is late" is either mpv delivering late or us presenting
+        // late, and only both halves together say which.
+        if (videoLog && System.nanoTime() - gReportNs > 5_000_000_000L) {
+            val secs = (System.nanoTime() - gReportNs) / 1e9
+            if (gReportNs != 0L && gFrames > 0) {
+                println(
+                    ("[wayland-video] host: fps=%.0f video=%.2fms scene=%.2fms " +
+                        "flush=%.2fms present=%.2fms dispatch=%.2fms noFrame=%d")
+                        .format(
+                            gFrames / secs,
+                            gVideoNs / 1e6 / gFrames, gSceneNs / 1e6 / gFrames,
+                            gFlushNs / 1e6 / gFrames, gPresentNs / 1e6 / gFrames,
+                            gDispatchNs / 1e6 / gFrames, gVideoNoFrame,
+                        ),
+                )
+            }
+            gReportNs = System.nanoTime()
+            gFrames = 0; gVideoNs = 0; gSceneNs = 0; gFlushNs = 0
+            gPresentNs = 0; gDispatchNs = 0; gVideoNoFrame = 0
+        }
         return drew
     }
 
@@ -1446,7 +1496,7 @@ fun main(args: Array<String>) {
         var uiFresh = false
         t = System.nanoTime()
         if (vkFrame != null) {
-            if (!drawGraphiteFrame(vkFrame)) return false
+            if (!drawGraphiteFrame(vkFrame, sceneDirty)) return false
             timings.add("composite", System.nanoTime() - t)
         } else {
         s!!
@@ -1604,7 +1654,9 @@ fun main(args: Array<String>) {
         }
         t = System.nanoTime()
         if (vkFrame != null) {
+            val tp = System.nanoTime()
             vkFrame.presentGraphite()
+            gPresentNs += System.nanoTime() - tp
         } else if (presenter != null) {
             presenter.present()
         } else {
