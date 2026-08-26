@@ -157,6 +157,9 @@ class VkPresenter(private val window: Long) {
     private var frameSurface: org.jetbrains.skia.Surface? = null
     private var frameImageIndex = -1
     private var wrapFailed = false
+    private var videoWrapFailed = false
+    var videoDraws = 0L
+        private set
     // Skia renders here, once, and it persists. A swapchain hands back a
     // different image each frame with undefined contents, and Compose only
     // paints when it thinks it is dirty -- so drawing straight into the
@@ -849,16 +852,84 @@ class VkPresenter(private val window: Long) {
         if (gTargetMemory != VK_NULL_HANDLE) { vkFreeMemory(device, gTargetMemory, null); gTargetMemory = VK_NULL_HANDLE }
     }
 
-    /** Flush Skia's work, then blit the result into a swapchain image. */
-    fun endFrameGraphite() {
+    // One wrap per image, not per frame. The pipeline rotates a small fixed
+    // set, so keying on the handle reuses them for the life of the buffers.
+    private val videoImages = HashMap<Long, org.jetbrains.skia.Image>()
+
+    /**
+     * Draw one of mpv's frames onto the canvas.
+     *
+     * The image is mpv's own, on this same device, so it is sampled where it
+     * lies -- nothing is exported, imported or copied. Wrapping it needs
+     * Image.wrapBackendTexture, which Skiko does not bind; ours does.
+     */
+    fun drawVideoFrame(
+        canvas: org.jetbrains.skia.Canvas,
+        image: Long,
+        srcWidth: Int,
+        srcHeight: Int,
+        dst: org.jetbrains.skia.Rect,
+    ): Boolean {
+        val rec = recorder ?: return false
+        if (image == VK_NULL_HANDLE || srcWidth <= 0 || srcHeight <= 0) return false
+        val wrapped = videoImages[image] ?: run {
+            val info = org.jetbrains.skia.gpu.graphite.VulkanTextureInfo(
+                format = org.jetbrains.skia.gpu.graphite.VulkanFormat(VideoPipelineVk.FORMAT),
+                imageUsageFlags = org.jetbrains.skia.gpu.graphite.VulkanImageUsageFlags(
+                    VideoPipelineVk.USAGE,
+                ),
+            )
+            val tex = org.jetbrains.skia.gpu.graphite.BackendTexture.makeVulkan(
+                width = srcWidth,
+                height = srcHeight,
+                textureInfo = info,
+                // mpv leaves its target images in GENERAL.
+                imageLayout = VK_IMAGE_LAYOUT_GENERAL,
+                queueFamilyIndex = queueFamily,
+                imagePtr = image,
+            )
+            val made = org.jetbrains.skia.Image.wrapBackendTexture(
+                recorder = rec,
+                backendTexture = tex,
+                alphaType = org.jetbrains.skia.ColorAlphaType.OPAQUE,
+                colorSpace = null,
+                originTopLeft = true,
+            )
+            if (made == null) {
+                if (!videoWrapFailed) {
+                    videoWrapFailed = true
+                    System.err.println("vk-graphite: could not wrap mpv's frame as an image")
+                }
+                return false
+            }
+            videoImages[image] = made
+            made
+        }
+        canvas.drawImageRect(wrapped, dst)
+        videoDraws++
+        return true
+    }
+
+    /**
+     * Hand Skia's recorded work to the GPU. Runs wherever the scene lives --
+     * every Skia object here belongs to that thread -- and is paired with
+     * [presentGraphite], which touches only Vulkan and runs on the loop.
+     */
+    fun flushGraphite() {
         val gc = graphiteContext ?: return
         val rec = recorder ?: return
         if (gTargetImage == VK_NULL_HANDLE) return
+        rec.snap().use { recording ->
+            gc.insertRecording(recording)
+            gc.submit(true)
+        }
+    }
+
+    /** Blit what Skia drew into a swapchain image and present it. */
+    fun presentGraphite() {
+        if (gTargetImage == VK_NULL_HANDLE) return
         // Skia's drawing runs first and on the same queue, so submission order
         // alone orders the blit after it.
-        gc.insertRecording(rec.snap())
-        gc.submit(false)
-
         stackPush().use { s ->
             if (everSubmitted) vkWaitForFences(device, submitFence, true, Long.MAX_VALUE)
             val pi = s.mallocInt(1)

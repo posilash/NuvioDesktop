@@ -38,6 +38,13 @@ class NuvioBackdropState {
     internal var layer: GraphicsLayer? = null
     internal var sourceOrigin by mutableStateOf(Offset.Zero)
     internal var effectOrigin by mutableStateOf(Offset.Zero)
+    /**
+     * Radius the layer's effect was built for. A RenderEffect is a native Skia
+     * image filter, and building one per frame leaks it: the peer is freed from
+     * a cleaner, and this draws far faster than the heap grows enough to
+     * collect. Measured at ~50MB/s under the Vulkan host.
+     */
+    internal var appliedRadius = Float.NaN
 }
 
 @Composable
@@ -75,7 +82,10 @@ fun Modifier.nuvioBackdropEffect(
                 return@drawBehind
             }
             val radiusPx = blurRadius.toPx()
-            layer.renderEffect = BlurEffect(radiusPx, radiusPx, TileMode.Clamp)
+            if (state.appliedRadius != radiusPx) {
+                state.appliedRadius = radiusPx
+                layer.renderEffect = BlurEffect(radiusPx, radiusPx, TileMode.Clamp)
+            }
             // The recording is in the source's coordinates; shift it so the
             // part behind this panel lands under this panel.
             val dx = state.sourceOrigin.x - state.effectOrigin.x

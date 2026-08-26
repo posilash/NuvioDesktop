@@ -22,7 +22,7 @@ import org.lwjgl.opengl.GL45
  * Must be constructed and used on the thread that owns the window GL context
  * (the EDT): imports and waits are context operations.
  */
-class VkGlDisplayPipeline(private val vk: VideoPipelineVk) : DisplayPipeline {
+class VkGlDisplayPipeline(val vk: VideoPipelineVk) : DisplayPipeline {
     // GL_LAYOUT_GENERAL_EXT: the layout mpv leaves images in (out_layout=2 =
     // VK_IMAGE_LAYOUT_GENERAL). The wait needs it so the driver can insert
     // the right transition.

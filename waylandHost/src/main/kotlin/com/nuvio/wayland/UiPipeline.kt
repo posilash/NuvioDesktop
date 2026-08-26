@@ -106,6 +106,20 @@ class UiPipeline(
     /** Called (from this thread) after each publish; wired to wake the host loop. */
     @Volatile var onFrame: (() -> Unit)? = null
 
+    /**
+     * Suppress this thread's own rasterization: it keeps the scene and runs its
+     * dispatcher, but draws nothing and publishes nothing.
+     *
+     * The Graphite path needs both halves of what this class does, split apart.
+     * The scene still has to be confined to one thread that is not the
+     * presenting one -- rasterizing in the host loop is what made the chrome lag
+     * and leaked a GB a minute -- but there is no texture to hand over: Skia and
+     * the swapchain share a VkDevice, so the presenting thread reads what was
+     * drawn directly. So the host drives a frame through [invokeAndWait] and
+     * presents it itself, and this loop stays out of the way.
+     */
+    @Volatile var externallyDriven = false
+
     // The chrome used to be composited into this thread's buffer. It is drawn
     // by the presenting thread now: a Compose frame has no upper bound, and
     // the controls must not wait on one. See where ChromeLayer is created.
@@ -281,6 +295,14 @@ class UiPipeline(
         while (running) {
             drainTasks()
             if (!running) return
+
+            if (externallyDriven) {
+                // Park until posted work arrives -- a host frame, an input
+                // event, or something Compose dispatched. The timeout is only a
+                // shutdown backstop, as below.
+                LockSupport.parkNanos(100_000_000L)
+                continue
+            }
 
             if (!framePending) {
                 // Parked until an invalidation, a chrome frame, a resize or

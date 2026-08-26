@@ -36,6 +36,9 @@ class WaylandVideoHost(
 
     // Where the video belongs, in framebuffer pixels. Reported by the surface
     // composable from layout; the demo path sets it directly.
+    /** Where the video belongs, in framebuffer pixels: left, top, width, height. */
+    val videoRect: FloatArray get() = floatArrayOf(rectLeft, rectTop, rectWidth, rectHeight)
+
     @Volatile private var rectLeft = 0f
     @Volatile private var rectTop = 0f
     @Volatile private var rectWidth = 0f

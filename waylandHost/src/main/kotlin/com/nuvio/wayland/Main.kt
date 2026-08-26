@@ -501,8 +501,7 @@ fun main(args: Array<String>) {
     // Skia context, and publishes finished textures (see UiPipeline). The
     // presenting thread then only ever draws. -Pnuvio.wayland.uiThread=false
     // restores the in-loop rasterization this replaced, for A/B.
-    val uiThreadEnabled = (System.getProperty("nuvio.wayland.uiThread")?.toBoolean() ?: true) &&
-        System.getProperty("nuvio.wayland.vkGraphite")?.toBoolean() != true
+    val uiThreadEnabled = System.getProperty("nuvio.wayland.uiThread")?.toBoolean() ?: true
 
     fun recreateSurface() {
         surface?.close()
@@ -591,6 +590,8 @@ fun main(args: Array<String>) {
     val sceneRecomposer: androidx.compose.ui.platform.FrameRecomposer
     if (uiThreadEnabled) {
         val p = UiPipeline(uiWindow)
+        // Graphite draws through this thread rather than being published by it.
+        p.externallyDriven = vkGraphite
         p.onFrame = {
             uiFrameReady.set(true)
             // Wake the host loop even if it is idle in glfwWaitEventsTimeout.
@@ -997,6 +998,11 @@ fun main(args: Array<String>) {
     var forceRepaint = true
     // Which target image the Skia surface was built against.
     var presenterGeneration = 0
+    var graphiteComposeCanvas: androidx.compose.ui.graphics.Canvas? = null
+    var graphiteCanvasFor: org.jetbrains.skia.Canvas? = null
+    // Bisects the graphite frame: clear, flush and present, drawing nothing.
+    // What is left is the swapchain machinery alone.
+    val graphiteClearOnly = System.getProperty("nuvio.wayland.vkClear")?.toBoolean() == true
 
     /** Returns true if this iteration actually presented a frame. */
     fun renderOneFrame(): Boolean {
@@ -1004,23 +1010,61 @@ fun main(args: Array<String>) {
         // swapchain image. No GL context is touched, so none of the compositing
         // below runs -- video and chrome still have to be ported to draw here.
         if (vkGraphite && presenter != null) {
-            val canvas = presenter.beginFrameGraphite() ?: return false
-            // The early return above skips the resize path, so the scene keeps
-            // its construction size and lays out for a surface that is not the
-            // one being drawn. Track the presenter instead.
-            val target = androidx.compose.ui.unit.IntSize(presenter.width, presenter.height)
-            if (scene.size != target && presenter.width > 0 && presenter.height > 0) {
-                width = presenter.width
-                height = presenter.height
-                scene.size = target
-                val sc = currentScale()
-                if (scene.density.density != sc) scene.density = Density(sc)
-                input.scale = sc
+            // Skia on the thread that owns the scene, Vulkan on this one. The
+            // in-loop path this used to force leaks and stalls the chrome; the
+            // scene's own thread is the one that works.
+            var drew = false
+            onSceneThreadAndWait {
+                val canvas = presenter.beginFrameGraphite()
+                if (canvas != null) {
+                    val target = androidx.compose.ui.unit.IntSize(presenter.width, presenter.height)
+                    if (scene.size != target && presenter.width > 0 && presenter.height > 0) {
+                        width = presenter.width
+                        height = presenter.height
+                        scene.size = target
+                        val sc = currentScale()
+                        if (scene.density.density != sc) scene.density = Density(sc)
+                        input.scale = sc
+                    }
+                    canvas.clear(0xFF000000.toInt())
+                    if (graphiteClearOnly) {
+                        presenter.flushGraphite()
+                        drew = true
+                        return@onSceneThreadAndWait
+                    }
+                    // Video first: the player screen punches a transparent hole
+                    // where it belongs, so this shows through the scene above.
+                    (pipeline as? VkGlDisplayPipeline)?.let { p ->
+                        val host = videoHost
+                        if (host != null && host.hasFile) {
+                            val r = host.videoRect
+                            if (r[2] > 0f && r[3] > 0f) {
+                                p.vk.acquireDisplayFrame()?.let { f ->
+                                    presenter.drawVideoFrame(
+                                        canvas = canvas,
+                                        image = f.buffer.image,
+                                        srcWidth = f.buffer.width,
+                                        srcHeight = f.buffer.height,
+                                        dst = org.jetbrains.skia.Rect.makeXYWH(r[0], r[1], r[2], r[3]),
+                                    )
+                                }
+                            }
+                        }
+                    }
+                    sceneRecomposer.performFrame(System.nanoTime())
+                    val composeCanvas = graphiteComposeCanvas
+                        ?.takeIf { graphiteCanvasFor === canvas }
+                        ?: canvas.asComposeCanvas().also {
+                            graphiteComposeCanvas = it
+                            graphiteCanvasFor = canvas
+                        }
+                    scene.draw(composeCanvas)
+                    presenter.flushGraphite()
+                    drew = true
+                }
             }
-            canvas.clear(0xFF000000.toInt())
-            sceneRecomposer.performFrame(System.nanoTime())
-            scene.draw(canvas.asComposeCanvas())
-            presenter.endFrameGraphite()
+            if (!drew) return false
+            presenter.presentGraphite()
             frames++
             return true
         }
