@@ -1156,7 +1156,13 @@ fun main(args: Array<String>) {
             var drew = false
             val tDispatch = System.nanoTime()
             if (gLoopStartNs == 0L) gLoopStartNs = tDispatch
-            onSceneThreadAndWait {
+            // On the calling thread, not the scene's. Everything here belongs
+            // to the host now that the scene is published rather than drawn:
+            // its own recorder, its own target, the video handoff, the chrome.
+            // Waiting on the scene thread meant waiting on Compose and on the
+            // Graphite lock it holds, and a host that stops answering the
+            // compositor gets SIGKILLed for being unresponsive.
+            run {
                 val canvas = presenter.beginFrameGraphite()
                 if (canvas != null) {
                     // No resize handling here: renderOneFrame does it at the
@@ -1169,7 +1175,7 @@ fun main(args: Array<String>) {
                     if (graphiteClearOnly) {
                         presenter.flushGraphite()
                         drew = true
-                        return@onSceneThreadAndWait
+                        return@run
                     }
                     val tVideo = System.nanoTime()
                     val vp = (pipeline as? VkGlDisplayPipeline)?.vk
