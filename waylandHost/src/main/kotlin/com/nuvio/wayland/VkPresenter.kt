@@ -864,9 +864,19 @@ class VkPresenter(private val window: Long) {
         if (gTargetMemory != VK_NULL_HANDLE) { vkFreeMemory(device, gTargetMemory, null); gTargetMemory = VK_NULL_HANDLE }
     }
 
-    // One wrap per image, not per frame. The pipeline rotates a small fixed
-    // set, so keying on the handle reuses them for the life of the buffers.
-    private val videoImages = HashMap<Long, org.jetbrains.skia.Image>()
+    // One wrap per buffer, not per frame -- keyed by generation, exactly as
+    // VkGlDisplayPipeline keys its GL imports. Keying on the VkImage handle
+    // instead is a trap: a resize makes mpv free its buffers and allocate new
+    // ones, the driver hands back the same handles, and the wrap that looks
+    // like a cache hit is a Skia image over destroyed memory. That is a device
+    // loss a few frames later, and it presents as the app vanishing mid-play.
+    private val videoImages = HashMap<Int, org.jetbrains.skia.Image>()
+    /** Drop wraps for buffers mpv has already thrown away. */
+    private fun evictVideoWraps(current: Int) {
+        val stale = videoImages.keys.filter { it < current - 3 }
+        for (g in stale) videoImages.remove(g)?.close()
+    }
+
     /** Reused, not per frame: a Paint is a native object like any other here. */
     private val videoPaint = org.jetbrains.skia.Paint().apply {
         blendMode = org.jetbrains.skia.BlendMode.DST_OVER
@@ -896,11 +906,13 @@ class VkPresenter(private val window: Long) {
         image: Long,
         srcWidth: Int,
         srcHeight: Int,
+        generation: Int,
         dst: org.jetbrains.skia.Rect,
     ): Boolean {
         val rec = recorder ?: return false
         if (image == VK_NULL_HANDLE || srcWidth <= 0 || srcHeight <= 0) return false
-        val wrapped = videoImages[image] ?: run {
+        val wrapped = videoImages[generation] ?: run {
+            evictVideoWraps(generation)
             val info = org.jetbrains.skia.gpu.graphite.VulkanTextureInfo(
                 format = org.jetbrains.skia.gpu.graphite.VulkanFormat(VideoPipelineVk.FORMAT),
                 imageUsageFlags = org.jetbrains.skia.gpu.graphite.VulkanImageUsageFlags(
@@ -930,7 +942,7 @@ class VkPresenter(private val window: Long) {
                 }
                 return false
             }
-            videoImages[image] = made
+            videoImages[generation] = made
             made
         }
         // DST_OVER, and drawn after the scene: the player screen punches its

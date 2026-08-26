@@ -1110,6 +1110,7 @@ fun main(args: Array<String>) {
                             image = pv.buffer.image,
                             srcWidth = pv.buffer.width,
                             srcHeight = pv.buffer.height,
+                            generation = pv.buffer.generation,
                             dst = pr,
                         )
                     }
