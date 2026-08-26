@@ -118,9 +118,24 @@ class VideoPipelineVk(private val mpv: Mpv) {
         val queueFamily: Int,
         val featuresChain: Long,
         val extensions: List<String>,
+        /**
+         * Guards the queue. Once mpv, Skia and the presenter share one device
+         * they share its queue, and vkQueueSubmit demands external
+         * synchronisation -- render_vk.h says so outright: the queues "must not
+         * be submitted to from another thread while mpv_render_context_render()
+         * runs, unless lock_queue and unlock_queue are provided".
+         */
+        val queueLock: java.util.concurrent.locks.ReentrantLock,
     )
 
     var sharedDevice: SharedDevice? = null
+
+    /** Runs [block] holding the shared queue lock, if there is one. */
+    private inline fun <T> withQueue(block: () -> T): T {
+        val l = sharedDevice?.queueLock ?: return block()
+        l.lock()
+        try { return block() } finally { l.unlock() }
+    }
 
     companion object {
         /** VK_FORMAT_R8G8B8A8_UNORM: what GL_RGBA8 imports as, both ways. */
@@ -337,6 +352,7 @@ class VideoPipelineVk(private val mpv: Mpv) {
                 features = sharedDevice?.featuresChain ?: features2!!.address(),
                 extensions = sharedDevice?.extensions ?: DEVICE_EXTENSIONS,
                 queueFamily = queueFamily,
+                queueLock = sharedDevice?.queueLock,
             )
             val self = Thread.currentThread()
             mpv.setUpdateCallback {
@@ -847,7 +863,7 @@ class VideoPipelineVk(private val mpv: Mpv) {
                 .waitSemaphoreCount(1)
                 .pWaitSemaphores(s.longs(sem))
                 .pWaitDstStageMask(s.ints(VK_PIPELINE_STAGE_ALL_COMMANDS_BIT))
-            vkCheck(vkQueueSubmit(queue, si, drainFence), "vkQueueSubmit(drain)")
+            withQueue { vkCheck(vkQueueSubmit(queue, si, drainFence), "vkQueueSubmit(drain)") }
             // Bounded: if the signal never comes (a failed render that never
             // submitted), an infinite wait would wedge the whole pipeline.
             val r = vkWaitForFences(device, drainFence, true, 1_000_000_000L)
@@ -872,7 +888,9 @@ class VideoPipelineVk(private val mpv: Mpv) {
                 .waitSemaphoreCount(1)
                 .pWaitSemaphores(s.longs(sem))
                 .pWaitDstStageMask(s.ints(VK_PIPELINE_STAGE_ALL_COMMANDS_BIT))
-            vkCheck(vkQueueSubmit(queue, si, VK_NULL_HANDLE), "vkQueueSubmit(glDone wait)")
+            withQueue {
+                vkCheck(vkQueueSubmit(queue, si, VK_NULL_HANDLE), "vkQueueSubmit(glDone wait)")
+            }
         }
     }
 

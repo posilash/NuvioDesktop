@@ -28,6 +28,23 @@ import java.lang.invoke.MethodType
 class Mpv private constructor(private val handle: MemorySegment, private val arena: Arena) {
 
     companion object {
+        /**
+         * One render context per process, so the lock the upcalls take is a
+         * static: an upcall stub carries no receiver.
+         */
+        @Volatile
+        private var sharedQueueLock: java.util.concurrent.locks.ReentrantLock? = null
+
+        @JvmStatic
+        fun lockQueue(ctx: MemorySegment, queueFamily: Int, queueIndex: Int) {
+            sharedQueueLock?.lock()
+        }
+
+        @JvmStatic
+        fun unlockQueue(ctx: MemorySegment, queueFamily: Int, queueIndex: Int) {
+            sharedQueueLock?.unlock()
+        }
+
         /** Explicit override for testing; null leaves the config to decide. */
         private val pacedOverride: Boolean? =
             System.getProperty("nuvio.wayland.paced")?.toBoolean()
@@ -423,6 +440,7 @@ class Mpv private constructor(private val handle: MemorySegment, private val are
         extensions: List<String>,
         queueFamily: Int,
         queueCount: Int = 1,
+        queueLock: java.util.concurrent.locks.ReentrantLock? = null,
     ) {
         val init = arena.allocate(VULKAN_INIT_PARAMS)
         init.set(ADDRESS, 0, MemorySegment.ofAddress(instance))
@@ -446,8 +464,28 @@ class Mpv private constructor(private val handle: MemorySegment, private val are
             init.set(JAVA_INT, off, queueFamily)
             init.set(JAVA_INT, off + 4, queueCount)
         }
-        // lock_queue/unlock_queue/queue_ctx stay NULL: the video thread is the
-        // only submitter to mpv's queues, so no cross-thread queue sharing.
+        // Queue sharing. Null was right while the video thread was the only
+        // submitter; on the shared device Skia and the presenter submit to the
+        // same queue from two other threads, and render_vk.h requires these
+        // callbacks for exactly that case. Without them the driver takes
+        // concurrent submissions and playback wedges after a handful of frames.
+        if (queueLock != null) {
+            sharedQueueLock = queueLock
+            val desc = FunctionDescriptor.ofVoid(ADDRESS, JAVA_INT, JAVA_INT)
+            val mt = MethodType.methodType(
+                Void.TYPE, MemorySegment::class.java, Integer.TYPE, Integer.TYPE,
+            )
+            val lk = MethodHandles.lookup()
+            init.set(
+                ADDRESS, 80,
+                linker.upcallStub(lk.findStatic(Mpv::class.java, "lockQueue", mt), desc, arena),
+            )
+            init.set(
+                ADDRESS, 88,
+                linker.upcallStub(lk.findStatic(Mpv::class.java, "unlockQueue", mt), desc, arena),
+            )
+            init.set(ADDRESS, 96, MemorySegment.NULL)
+        }
 
         val advanced = arena.allocateFrom(JAVA_INT, if (pacedMode) 1 else 0)
         val params = arena.allocate(RENDER_PARAM, 4)

@@ -1003,6 +1003,19 @@ fun main(args: Array<String>) {
     // Bisects the graphite frame: clear, flush and present, drawing nothing.
     // What is left is the swapchain machinery alone.
     val graphiteClearOnly = System.getProperty("nuvio.wayland.vkClear")?.toBoolean() == true
+    // Why a frame drew no video. "The video is black" has four causes on this
+    // path and they look identical on screen.
+    // Stage timings for the graphite frame, so "it got slow" names a stage.
+    var gVideoNs = 0L
+    var gSceneNs = 0L
+    var gFlushNs = 0L
+    var gPresentNs = 0L
+    var gDispatchNs = 0L
+    var gLoopStartNs = 0L
+    var gVideoNoPipeline = 0L
+    var gVideoNoFile = 0L
+    var gVideoNoRect = 0L
+    var gVideoNoFrame = 0L
 
     /** Returns true if this iteration actually presented a frame. */
     fun renderOneFrame(): Boolean {
@@ -1014,6 +1027,8 @@ fun main(args: Array<String>) {
             // in-loop path this used to force leaks and stalls the chrome; the
             // scene's own thread is the one that works.
             var drew = false
+            val tDispatch = System.nanoTime()
+            if (gLoopStartNs == 0L) gLoopStartNs = tDispatch
             onSceneThreadAndWait {
                 val canvas = presenter.beginFrameGraphite()
                 if (canvas != null) {
@@ -1026,31 +1041,56 @@ fun main(args: Array<String>) {
                         if (scene.density.density != sc) scene.density = Density(sc)
                         input.scale = sc
                     }
-                    canvas.clear(0xFF000000.toInt())
+                    // Transparent, not black: the scene's hole punch has to
+                    // survive down to this canvas for the video to land in it,
+                    // and CLEAR inside a Compose layer only stays transparent if
+                    // what it composites onto is transparent too. The background
+                    // is filled back in at the end.
+                    canvas.clear(0x00000000)
                     if (graphiteClearOnly) {
                         presenter.flushGraphite()
                         drew = true
                         return@onSceneThreadAndWait
                     }
-                    // Video first: the player screen punches a transparent hole
-                    // where it belongs, so this shows through the scene above.
-                    (pipeline as? VkGlDisplayPipeline)?.let { p ->
-                        val host = videoHost
-                        if (host != null && host.hasFile) {
+                    val tVideo = System.nanoTime()
+                    val vp = (pipeline as? VkGlDisplayPipeline)?.vk
+                    val host = videoHost
+                    // The buffer handoff, in Vulkan terms. On a fresh frame the
+                    // consumer inherits mpv's render-done wait, and owes the
+                    // buffer it replaces a glDone signal before mpv may write
+                    // there again. The GL path does this with GL_EXT_semaphore;
+                    // here both semaphores ride on Skia's own submit.
+                    var waitSem = 0L
+                    var signalSem = 0L
+                    var retired: VideoPipelineVk.Buffer? = null
+                    var pendingVideo: VideoPipelineVk.DisplayFrame? = null
+                    var pendingRect: org.jetbrains.skia.Rect? = null
+                    when {
+                        vp == null -> gVideoNoPipeline++
+                        host == null || !host.hasFile -> gVideoNoFile++
+                        else -> {
                             val r = host.videoRect
-                            if (r[2] > 0f && r[3] > 0f) {
-                                p.vk.acquireDisplayFrame()?.let { f ->
-                                    presenter.drawVideoFrame(
-                                        canvas = canvas,
-                                        image = f.buffer.image,
-                                        srcWidth = f.buffer.width,
-                                        srcHeight = f.buffer.height,
-                                        dst = org.jetbrains.skia.Rect.makeXYWH(r[0], r[1], r[2], r[3]),
-                                    )
+                            if (r[2] <= 0f || r[3] <= 0f) {
+                                gVideoNoRect++
+                            } else {
+                                val f = vp.acquireDisplayFrame()
+                                if (f == null) {
+                                    gVideoNoFrame++
+                                } else {
+                                    if (f.fresh) {
+                                        waitSem = f.buffer.semaphore
+                                        retired = f.retired
+                                        signalSem = retired?.glDoneSemaphore ?: 0L
+                                    }
+                                    pendingVideo = f
+                                    pendingRect = org.jetbrains.skia.Rect
+                                        .makeXYWH(r[0], r[1], r[2], r[3])
                                 }
                             }
                         }
                     }
+                    val tScene = System.nanoTime()
+                    gVideoNs += tScene - tVideo
                     sceneRecomposer.performFrame(System.nanoTime())
                     val composeCanvas = graphiteComposeCanvas
                         ?.takeIf { graphiteCanvasFor === canvas }
@@ -1059,13 +1099,58 @@ fun main(args: Array<String>) {
                             graphiteCanvasFor = canvas
                         }
                     scene.draw(composeCanvas)
-                    presenter.flushGraphite()
+                    val tFlush = System.nanoTime()
+                    gSceneNs += tFlush - tScene
+                    // Under the scene, into the hole it punched.
+                    val pv = pendingVideo
+                    val pr = pendingRect
+                    if (pv != null && pr != null) {
+                        presenter.drawVideoFrame(
+                            canvas = canvas,
+                            image = pv.buffer.image,
+                            srcWidth = pv.buffer.width,
+                            srcHeight = pv.buffer.height,
+                            dst = pr,
+                        )
+                    }
+                    // Whatever is still transparent is background, not a hole.
+                    presenter.fillBackground(canvas)
+                    presenter.flushGraphite(waitSemaphore = waitSem, signalSemaphore = signalSem)
+                    // Only now is the signal on the queue, so only now may the
+                    // buffer go back into mpv's rotation. Ordering matters: the
+                    // render thread waits this semaphore on the strength of the
+                    // flag, and a wait whose signal never reached a queue hangs
+                    // the device.
+                    retired?.let { vp?.notifyGlDone(it) }
+                    gFlushNs += System.nanoTime() - tFlush
                     drew = true
                 }
             }
+            gDispatchNs += System.nanoTime() - tDispatch
             if (!drew) return false
+            val tPresent = System.nanoTime()
             presenter.presentGraphite()
+            gPresentNs += System.nanoTime() - tPresent
             frames++
+            if (videoLog && frames % 300 == 0) {
+                println(
+                    "[wayland-video] vk-video: drawn=${presenter.videoDraws} " +
+                        "noPipeline=$gVideoNoPipeline noFile=$gVideoNoFile " +
+                        "noRect=$gVideoNoRect noFrame=$gVideoNoFrame " +
+                        "wraps=${presenter.videoImageCount} rss=${rssMb()}MB " +
+                        "video=%.1fms scene=%.1fms flush=%.1fms present=%.1fms dispatch=%.1fms period=%.1fms".format(
+                            gVideoNs / 1e6 / 300, gSceneNs / 1e6 / 300,
+                            gFlushNs / 1e6 / 300, gPresentNs / 1e6 / 300,
+                            gDispatchNs / 1e6 / 300,
+                            (System.nanoTime() - gLoopStartNs) / 1e6 / 300,
+                        ),
+                )
+                gVideoNs = 0; gSceneNs = 0; gFlushNs = 0; gPresentNs = 0
+                gDispatchNs = 0; gLoopStartNs = System.nanoTime()
+                // poll/edtWait live out here, and the early return above is
+                // what stopped them being reported on this path.
+                timings.report(System.nanoTime())?.let { println("[wayland-video] $it") }
+            }
             return true
         }
 

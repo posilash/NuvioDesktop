@@ -102,7 +102,17 @@ class VkPresenter(private val window: Long) {
         queueFamily = queueFamily,
         featuresChain = features2!!.address(),
         extensions = DEVICE_EXTENSIONS,
+        queueLock = queueLock,
     )
+
+    /** Serialises every submission to [queue]; see SharedDevice.queueLock. */
+    val queueLock = java.util.concurrent.locks.ReentrantLock()
+
+    /** Runs [block] holding [queueLock]. Every submission here goes through it. */
+    private inline fun <T> withQueue(block: () -> T): T {
+        queueLock.lock()
+        try { return block() } finally { queueLock.unlock() }
+    }
 
     /** Handles for whoever else renders on this device -- mpv and Skia. */
     val featuresChain: Long get() = features2?.address() ?: 0L
@@ -160,6 +170,8 @@ class VkPresenter(private val window: Long) {
     private var videoWrapFailed = false
     var videoDraws = 0L
         private set
+    /** Distinct mpv images wrapped so far -- the pool should be small and fixed. */
+    val videoImageCount: Int get() = videoImages.size
     // Skia renders here, once, and it persists. A swapchain hands back a
     // different image each frame with undefined contents, and Compose only
     // paints when it thinks it is dirty -- so drawing straight into the
@@ -855,6 +867,22 @@ class VkPresenter(private val window: Long) {
     // One wrap per image, not per frame. The pipeline rotates a small fixed
     // set, so keying on the handle reuses them for the life of the buffers.
     private val videoImages = HashMap<Long, org.jetbrains.skia.Image>()
+    /** Reused, not per frame: a Paint is a native object like any other here. */
+    private val videoPaint = org.jetbrains.skia.Paint().apply {
+        blendMode = org.jetbrains.skia.BlendMode.DST_OVER
+    }
+    private val backgroundPaint = org.jetbrains.skia.Paint().apply {
+        color = 0xFF000000.toInt()
+        blendMode = org.jetbrains.skia.BlendMode.DST_OVER
+    }
+
+    /** Opaque black behind everything already drawn. */
+    fun fillBackground(canvas: org.jetbrains.skia.Canvas) {
+        canvas.drawPaint(backgroundPaint)
+    }
+
+    private val wrappedSemaphores =
+        HashMap<Long, org.jetbrains.skia.gpu.graphite.BackendSemaphore>()
 
     /**
      * Draw one of mpv's frames onto the canvas.
@@ -905,7 +933,20 @@ class VkPresenter(private val window: Long) {
             videoImages[image] = made
             made
         }
-        canvas.drawImageRect(wrapped, dst)
+        // DST_OVER, and drawn after the scene: the player screen punches its
+        // hole with BlendMode.CLEAR, so the video's place on the canvas is
+        // exactly the transparent part. Drawing it first instead -- with the
+        // scene on the same canvas rather than its own layer, as on GL -- means
+        // the hole punch erases the video that was just drawn, which is why
+        // this path showed audio and a black rectangle.
+        canvas.drawImageRect(
+            wrapped,
+            org.jetbrains.skia.Rect.makeWH(srcWidth.toFloat(), srcHeight.toFloat()),
+            dst,
+            org.jetbrains.skia.SamplingMode.LINEAR,
+            videoPaint,
+            true,
+        )
         videoDraws++
         return true
     }
@@ -915,22 +956,46 @@ class VkPresenter(private val window: Long) {
      * every Skia object here belongs to that thread -- and is paired with
      * [presentGraphite], which touches only Vulkan and runs on the loop.
      */
-    fun flushGraphite() {
+    fun flushGraphite(waitSemaphore: Long = VK_NULL_HANDLE, signalSemaphore: Long = VK_NULL_HANDLE) {
         val gc = graphiteContext ?: return
         val rec = recorder ?: return
         if (gTargetImage == VK_NULL_HANDLE) return
         rec.snap().use { recording ->
-            gc.insertRecording(recording)
-            gc.submit(true)
+            gc.insertRecording(
+                org.jetbrains.skia.gpu.graphite.InsertRecordingInfo(
+                    recording = recording,
+                    waitSemaphores = backendSemaphores(waitSemaphore),
+                    signalSemaphores = backendSemaphores(signalSemaphore),
+                ),
+            )
+            // Skia submits inside here, to the queue mpv also uses.
+            withQueue { gc.submit(true) }
         }
+    }
+
+    /**
+     * BackendSemaphore wrappers, cached by handle. mpv rotates a fixed set, and
+     * a wrapper is a native object freed from a cleaner -- building one per
+     * frame is the same leak the backdrop's RenderEffect was.
+     */
+    private fun backendSemaphores(
+        sem: Long,
+    ): Array<org.jetbrains.skia.gpu.graphite.BackendSemaphore> {
+        if (sem == VK_NULL_HANDLE) return emptyArray()
+        return arrayOf(
+            wrappedSemaphores.getOrPut(sem) {
+                org.jetbrains.skia.gpu.graphite.BackendSemaphore.makeVulkan(sem)
+            },
+        )
     }
 
     /** Blit what Skia drew into a swapchain image and present it. */
     fun presentGraphite() {
         if (gTargetImage == VK_NULL_HANDLE) return
         // Skia's drawing runs first and on the same queue, so submission order
-        // alone orders the blit after it.
-        stackPush().use { s ->
+        // alone orders the blit after it. The lock is against mpv's render
+        // thread, which submits to this same queue.
+        withQueue { stackPush().use { s ->
             if (everSubmitted) vkWaitForFences(device, submitFence, true, Long.MAX_VALUE)
             val pi = s.mallocInt(1)
             val acquired = KHRSwapchain.vkAcquireNextImageKHR(
@@ -1028,7 +1093,7 @@ class VkPresenter(private val window: Long) {
             } else {
                 check(r, "vkQueuePresentKHR")
             }
-        }
+        } }
     }
 
     /**
