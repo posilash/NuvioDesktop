@@ -25,7 +25,7 @@ provides=("${pkgname}")
 # falls back to the legacy GL renderer, which is not what this is for. Built
 # and installed here so it is removed with the package rather than left behind
 # as a system mpv nobody remembers replacing.
-source=("${pkgname}::git+${url}.git#branch=render-api-wayland"
+source=("${pkgname}::git+${url}.git#branch=render-api-vulkan"
         "mpv::git+https://github.com/posilash/mpv.git#branch=vk-hwdec")
 sha256sums=('SKIP'
             'SKIP')
