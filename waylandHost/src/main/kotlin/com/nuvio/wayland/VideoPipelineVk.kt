@@ -853,7 +853,8 @@ class VideoPipelineVk(private val mpv: Mpv) {
     }
 
     /** Exported fds are raw kernel fds; only libc can close them. */
-    private object Posix {
+    /** Also used by Main, to leave without running atexit handlers. */
+    internal object Posix {
         private val closeHandle = Linker.nativeLinker().downcallHandle(
             Linker.nativeLinker().defaultLookup().find("close").orElseThrow(),
             FunctionDescriptor.of(ValueLayout.JAVA_INT, ValueLayout.JAVA_INT),
@@ -861,6 +862,26 @@ class VideoPipelineVk(private val mpv: Mpv) {
 
         fun close(fd: Int) {
             closeHandle.invokeExact(fd) as Int
+        }
+
+        private val exitHandle = Linker.nativeLinker().downcallHandle(
+            Linker.nativeLinker().defaultLookup().find("_exit").orElseThrow(),
+            FunctionDescriptor.ofVoid(ValueLayout.JAVA_INT),
+        )
+
+        /**
+         * End the process now, without atexit handlers or static destructors.
+         *
+         * exitProcess() leaves through exit(), and the graphics driver's own
+         * cleanup runs there -- faulting inside libnvidia-eglcore once the
+         * contexts it registered are gone, which is a crash dump on what was a
+         * clean shutdown. Nothing of ours is left to run by then: the teardown
+         * above has finished and mpv, the only component with state worth
+         * flushing, stopped first.
+         */
+        fun exitNow(code: Int): Nothing {
+            exitHandle.invokeExact(code)
+            error("_exit returned")
         }
     }
 }

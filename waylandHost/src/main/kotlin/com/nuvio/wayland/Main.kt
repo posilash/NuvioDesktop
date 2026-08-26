@@ -215,6 +215,8 @@ fun main(args: Array<String>) {
     }
     // The grid the next commit is due on; 0 until the first frame anchors it.
     var nextSwapDueNs = 0L
+    /** Set by the signal handler so a signal leaves through the normal teardown. */
+    val quitRequested = java.util.concurrent.atomic.AtomicBoolean(false)
     println("pace: vsyncMode=$vsyncMode vblank=${"%.2f".format(vblankNs / 1e6)}ms")
 
     java.awt.EventQueue.invokeAndWait {
@@ -1447,7 +1449,23 @@ fun main(args: Array<String>) {
 
     var presented = true
     try {
-        while (!glfwWindowShouldClose(window)) {
+        // SIGINT and SIGTERM take the same road out as the close button.
+        // Without this the JVM shuts down under the running loop, the teardown
+        // never runs, and the driver's atexit cleanup faults on the way out.
+        // A signal handler, not a shutdown hook: a hook runs with the JVM
+        // already shutting down, so Skia's cleaners fire alongside teardown's
+        // own close() calls. glfwPostEmptyEvent is the only GLFW call
+        // documented thread-safe, so the flag does the talking.
+        runCatching {
+            for (name in listOf("INT", "TERM")) {
+                sun.misc.Signal.handle(sun.misc.Signal(name)) {
+                    quitRequested.set(true)
+                    glfwPostEmptyEvent()
+                }
+            }
+        }.onFailure { println("signals: no handler installed ($it)") }
+
+        while (!glfwWindowShouldClose(window) && !quitRequested.get()) {
             // Input callbacks fire from here, on the main thread, and are
             // forwarded to the EDT by InputRouter.
             val beforePoll = System.nanoTime()
@@ -1519,5 +1537,7 @@ fun main(args: Array<String>) {
         glfwTerminate()
     }
     println("OK: clean shutdown")
-    exitProcess(exitCode)
+    System.out.flush()
+    System.err.flush()
+    VideoPipelineVk.Posix.exitNow(exitCode)
 }
