@@ -155,7 +155,13 @@ fun NuvioNavigationBar(
                     Modifier
                 },
             )
-            .background(Color(0xFF1C1C1E).copy(alpha = if (hazeState != null) 0.55f else 0.82f))
+            .background(
+                Color(0xFF1C1C1E).copy(
+                    // The translucent value assumes a blur behind it; without one
+                    // the pill has to carry the contrast itself.
+                    alpha = if (hazeState != null && !isDesktop) 0.55f else 0.82f,
+                ),
+            )
 
         Box(modifier = pillModifier) {
             Row(

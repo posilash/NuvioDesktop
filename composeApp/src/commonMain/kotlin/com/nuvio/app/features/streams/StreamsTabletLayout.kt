@@ -44,6 +44,9 @@ import com.nuvio.app.core.ui.NuvioAsyncImage as AsyncImage
 import com.nuvio.app.core.ui.nuvioDesktopDragScroll
 import com.nuvio.app.isIos
 import dev.chrisbanes.haze.HazeInputScale
+import com.nuvio.app.core.ui.nuvioBackdropEffect
+import com.nuvio.app.core.ui.nuvioBackdropSource
+import com.nuvio.app.core.ui.rememberNuvioBackdropState
 import com.nuvio.app.isDesktop
 import dev.chrisbanes.haze.hazeEffect
 import dev.chrisbanes.haze.hazeSource
@@ -73,6 +76,8 @@ internal fun TabletStreamsLayout(
     modifier: Modifier = Modifier,
 ) {
     val hazeState = rememberHazeState()
+    // haze's blur cannot run on 1.12; this stands in for it on desktop.
+    val backdrop = rememberNuvioBackdropState()
     val tabletBackdrop = remember(background, poster) {
         background ?: poster
     }
@@ -100,7 +105,8 @@ internal fun TabletStreamsLayout(
         Box(
             modifier = Modifier
                 .fillMaxSize()
-                .hazeSource(state = hazeState),
+                .hazeSource(state = hazeState)
+                .then(if (isDesktop) Modifier.nuvioBackdropSource(backdrop) else Modifier),
         ) {
             if (tabletBackdrop != null) {
                 AsyncImage(
@@ -176,12 +182,22 @@ internal fun TabletStreamsLayout(
                     modifier = Modifier
                         .fillMaxSize()
                         .clip(RoundedCornerShape(24.dp))
-                        .hazeEffect(state = hazeState) {
-                            blurEnabled = !isDesktop
-                            inputScale = HazeInputScale.Fixed(0.66f)
-                            blurRadius = 56.dp
-                        }
-                        .background(Color.Black.copy(alpha = 0.36f)),
+                        .then(
+                            if (isDesktop) {
+                                Modifier.nuvioBackdropEffect(
+                                    state = backdrop,
+                                    blurRadius = 56.dp,
+                                    tint = Color.Black.copy(alpha = 0.36f),
+                                )
+                            } else {
+                                Modifier
+                                    .hazeEffect(state = hazeState) {
+                                        inputScale = HazeInputScale.Fixed(0.66f)
+                                        blurRadius = 56.dp
+                                    }
+                                    .background(Color.Black.copy(alpha = 0.36f))
+                            },
+                        ),
                 ) {
                     Column(
                         modifier = Modifier
