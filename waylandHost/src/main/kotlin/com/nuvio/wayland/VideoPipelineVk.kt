@@ -911,7 +911,8 @@ class VideoPipelineVk(private val mpv: Mpv) {
     }
 
     /** Exported fds are raw kernel fds; only libc can close them. */
-    private object Posix {
+    /** Also used by ChromeLayer, to close a dmabuf fd a failed import left over. */
+    internal object Posix {
         private val closeHandle = Linker.nativeLinker().downcallHandle(
             Linker.nativeLinker().defaultLookup().find("close").orElseThrow(),
             FunctionDescriptor.of(ValueLayout.JAVA_INT, ValueLayout.JAVA_INT),

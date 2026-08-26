@@ -888,7 +888,11 @@ fun main(args: Array<String>) {
         //
         // The import needs a current GL context, and the window's is in the
         // same share group, so the presenting thread can do it just as well.
-        chromeLayer = ChromeLayer(wpeChrome!!)
+        chromeLayer = ChromeLayer(wpeChrome!!).also {
+            // With no GL context on the graphite path, the chrome's buffer has
+            // to arrive as a dmabuf and be imported as a VkImage.
+            if (vkGraphite) it.vk = presenter
+        }
         wpeChrome!!.onFrame = { glfwPostEmptyEvent() }
         if (runRealAppEarly) {
             com.nuvio.app.features.player.desktop.WaylandVideoBridge.webChromeActive = true
@@ -1017,240 +1021,13 @@ fun main(args: Array<String>) {
     var gVideoNoRect = 0L
     var gVideoNoFrame = 0L
 
-    /** Returns true if this iteration actually presented a frame. */
-    fun renderOneFrame(): Boolean {
-        // Full Vulkan: Skia records the scene straight into the acquired
-        // swapchain image. No GL context is touched, so none of the compositing
-        // below runs -- video and chrome still have to be ported to draw here.
-        if (vkGraphite && presenter != null) {
-            // Skia on the thread that owns the scene, Vulkan on this one. The
-            // in-loop path this used to force leaks and stalls the chrome; the
-            // scene's own thread is the one that works.
-            var drew = false
-            val tDispatch = System.nanoTime()
-            if (gLoopStartNs == 0L) gLoopStartNs = tDispatch
-            onSceneThreadAndWait {
-                val canvas = presenter.beginFrameGraphite()
-                if (canvas != null) {
-                    val target = androidx.compose.ui.unit.IntSize(presenter.width, presenter.height)
-                    if (scene.size != target && presenter.width > 0 && presenter.height > 0) {
-                        width = presenter.width
-                        height = presenter.height
-                        scene.size = target
-                        val sc = currentScale()
-                        if (scene.density.density != sc) scene.density = Density(sc)
-                        input.scale = sc
-                    }
-                    // Transparent, not black: the scene's hole punch has to
-                    // survive down to this canvas for the video to land in it,
-                    // and CLEAR inside a Compose layer only stays transparent if
-                    // what it composites onto is transparent too. The background
-                    // is filled back in at the end.
-                    canvas.clear(0x00000000)
-                    if (graphiteClearOnly) {
-                        presenter.flushGraphite()
-                        drew = true
-                        return@onSceneThreadAndWait
-                    }
-                    val tVideo = System.nanoTime()
-                    val vp = (pipeline as? VkGlDisplayPipeline)?.vk
-                    val host = videoHost
-                    // The buffer handoff, in Vulkan terms. On a fresh frame the
-                    // consumer inherits mpv's render-done wait, and owes the
-                    // buffer it replaces a glDone signal before mpv may write
-                    // there again. The GL path does this with GL_EXT_semaphore;
-                    // here both semaphores ride on Skia's own submit.
-                    var waitSem = 0L
-                    var signalSem = 0L
-                    var retired: VideoPipelineVk.Buffer? = null
-                    var pendingVideo: VideoPipelineVk.DisplayFrame? = null
-                    var pendingRect: org.jetbrains.skia.Rect? = null
-                    when {
-                        vp == null -> gVideoNoPipeline++
-                        host == null || !host.hasFile -> gVideoNoFile++
-                        else -> {
-                            val r = host.videoRect
-                            if (r[2] <= 0f || r[3] <= 0f) {
-                                gVideoNoRect++
-                            } else {
-                                val f = vp.acquireDisplayFrame()
-                                if (f == null) {
-                                    gVideoNoFrame++
-                                } else {
-                                    if (f.fresh) {
-                                        waitSem = f.buffer.semaphore
-                                        retired = f.retired
-                                        signalSem = retired?.glDoneSemaphore ?: 0L
-                                    }
-                                    pendingVideo = f
-                                    pendingRect = org.jetbrains.skia.Rect
-                                        .makeXYWH(r[0], r[1], r[2], r[3])
-                                }
-                            }
-                        }
-                    }
-                    val tScene = System.nanoTime()
-                    gVideoNs += tScene - tVideo
-                    sceneRecomposer.performFrame(System.nanoTime())
-                    val composeCanvas = graphiteComposeCanvas
-                        ?.takeIf { graphiteCanvasFor === canvas }
-                        ?: canvas.asComposeCanvas().also {
-                            graphiteComposeCanvas = it
-                            graphiteCanvasFor = canvas
-                        }
-                    scene.draw(composeCanvas)
-                    val tFlush = System.nanoTime()
-                    gSceneNs += tFlush - tScene
-                    // Under the scene, into the hole it punched.
-                    val pv = pendingVideo
-                    val pr = pendingRect
-                    if (pv != null && pr != null) {
-                        presenter.drawVideoFrame(
-                            canvas = canvas,
-                            image = pv.buffer.image,
-                            srcWidth = pv.buffer.width,
-                            srcHeight = pv.buffer.height,
-                            generation = pv.buffer.generation,
-                            dst = pr,
-                        )
-                    }
-                    // Whatever is still transparent is background, not a hole.
-                    presenter.fillBackground(canvas)
-                    presenter.flushGraphite(waitSemaphore = waitSem, signalSemaphore = signalSem)
-                    // Only now is the signal on the queue, so only now may the
-                    // buffer go back into mpv's rotation. Ordering matters: the
-                    // render thread waits this semaphore on the strength of the
-                    // flag, and a wait whose signal never reached a queue hangs
-                    // the device.
-                    retired?.let { vp?.notifyGlDone(it) }
-                    gFlushNs += System.nanoTime() - tFlush
-                    drew = true
-                }
-            }
-            gDispatchNs += System.nanoTime() - tDispatch
-            if (!drew) return false
-            val tPresent = System.nanoTime()
-            presenter.presentGraphite()
-            gPresentNs += System.nanoTime() - tPresent
-            frames++
-            if (videoLog && frames % 300 == 0) {
-                println(
-                    "[wayland-video] vk-video: drawn=${presenter.videoDraws} " +
-                        "noPipeline=$gVideoNoPipeline noFile=$gVideoNoFile " +
-                        "noRect=$gVideoNoRect noFrame=$gVideoNoFrame " +
-                        "wraps=${presenter.videoImageCount} rss=${rssMb()}MB " +
-                        "video=%.1fms scene=%.1fms flush=%.1fms present=%.1fms dispatch=%.1fms period=%.1fms".format(
-                            gVideoNs / 1e6 / 300, gSceneNs / 1e6 / 300,
-                            gFlushNs / 1e6 / 300, gPresentNs / 1e6 / 300,
-                            gDispatchNs / 1e6 / 300,
-                            (System.nanoTime() - gLoopStartNs) / 1e6 / 300,
-                        ),
-                )
-                gVideoNs = 0; gSceneNs = 0; gFlushNs = 0; gPresentNs = 0
-                gDispatchNs = 0; gLoopStartNs = System.nanoTime()
-                // poll/edtWait live out here, and the early return above is
-                // what stopped them being reported on this path.
-                timings.report(System.nanoTime())?.let { println("[wayland-video] $it") }
-            }
-            return true
-        }
-
-        val w = IntArray(1); val h = IntArray(1)
-        // With a Vulkan swapchain the window has no framebuffer to measure;
-        // the surface's extent is the size, and the presenter reports it.
-        if (presenter != null) {
-            w[0] = presenter.width; h[0] = presenter.height
-        } else {
-            glfwGetFramebufferSize(window, w, h)
-        }
-        val targetChanged = presenter != null && presenter.generation != presenterGeneration
-        if (w[0] != width || h[0] != height || targetChanged) {
-            presenterGeneration = presenter?.generation ?: 0
-            width = w[0]; height = h[0]
-            if (width > 0 && height > 0) {
-                recreateSurface()
-                // The presenter deletes and recreates its texture and FBO on a
-                // rebuild, and GL hands back the same ids -- so Skia's cached
-                // state describes an attachment that no longer exists.
-                if (presenter != null) context.resetGLAll()
-                forceRepaint = true
-                // Pointer positions arrive in window coordinates but the
-                // scene works in framebuffer pixels; on a fractionally
-                // scaled output those differ. The same ratio is the UI
-                // density, which can change when the window moves outputs.
-                val scale = currentScale()
-                input.scale = scale
-                val p = uiPipeline
-                if (p != null) {
-                    // Size and density are scene state, so they are applied on
-                    // the scene's own thread; the pipeline reallocates its
-                    // textures to match on the next frame.
-                    p.resize(width, height, scale)
-                } else {
-                    scene.size = androidx.compose.ui.unit.IntSize(width, height)
-                    if (scene.density.density != scale) scene.density = Density(scale)
-                }
-                val logicalW = Math.round(width / scale)
-                val logicalH = Math.round(height / scale)
-                if (videoLog) {
-                    println("[chrome-size] fb=${width}x$height logical=${logicalW}x$logicalH scale=$scale")
-                }
-                // set_size IS the CSS layout size (WPEWebViewLegacy:
-                // set_size -> view.setSize verbatim), so it must be LOGICAL;
-                // the scale factor makes WebKit raster it at logical*scale =
-                // physical, which this scene then draws 1:1.
-                wpeChrome?.dispatchScale(scale * chromeScaleMul)
-                wpeChrome?.dispatchSize(logicalW, logicalH)
-            }
-        }
-
-        val s = surface ?: return false
-        // Legacy path only: with threaded rasterization the UI layer is a
-        // published texture, not a surface this thread draws into.
-        val ui = uiSurface
-        if (ui == null && uiPipeline == null) return false
-
-        if (videoLog) {
-            wpeChrome?.let { chrome ->
-                if (frames % 120 == 0) {
-                    println("[wpe] exported=${chrome.framesExported} err=${chrome.lastError}")
-                }
-            }
-            videoHost?.report(System.nanoTime())?.let {
-                println("[wayland-video] $it rss=${rssMb()}MB heap=${Runtime.getRuntime().let { r -> (r.totalMemory() - r.freeMemory()) / 1_048_576 }}MB")
-            }
-            // Scene cost is reported from the thread that pays it; it no
-            // longer appears anywhere on this present path.
-            uiPipeline?.let { p ->
-                if (System.nanoTime() - lastUiReportNs > 1_000_000_000L) {
-                    val elapsed = (System.nanoTime() - lastUiReportNs) / 1e9
-                    lastUiReportNs = System.nanoTime()
-                    println("[wayland-video] ${p.report(elapsed)}")
-                    // Chrome cost is reported from the thread that pays it.
-                    // perMpx is the number that matters: it is what used to
-                    // grow with the window and made fullscreen chrome lag.
-                    chromeLayer?.let { l -> println("[wayland-video] ${l.report(elapsed)}") }
-                }
-            }
-            input.report(System.nanoTime())?.let { println("[wayland-video] $it") }
-            timings.report(System.nanoTime())?.let { println("[wayland-video] $it") }
-        }
-
-        // Present when there is something new: a video frame the pipeline
-        // published, a Compose invalidation, or a surface that was just
-        // rebuilt. Video presents take absolute priority: they reuse the last
-        // UI layer as-is and never wait on a scene rasterization. The cadence
-        // histogram showed why -- fullscreen scenes spike to 50ms, and video
-        // frames that queue behind them clump into 1-2 vsync bursts followed
-        // by 11-vsync gaps, which is exactly the judder the eye catches. The
-        // scene gets rasterized in the gaps between video frames instead; at
-        // 24fps there are 40ms of them, and when the UI is heavier than that
-        // it is the chrome that degrades, never the video.
-        val videoChanged = videoFrameReady.getAndSet(false)
-        // The chrome takes no part in this loop: it is a compositor-layered
-        // subsurface fed on the GLib thread. Keeping it (and every other
-        // foreign concern) out of this window's GL and present cadence is
-        // what preserves the measured-healthy video path.
+    /**
+     * The chrome's session gating: activity, reveal, priming and the acks that
+     * go with them. Extracted because both render paths need it -- the Vulkan
+     * path returns before the compositing below runs, and skipping this left
+     * the chrome imported every frame and composited never.
+     */
+    fun updateChromeSession(): Boolean {
         var chromeChanged = false
         wpeChrome?.let { chrome ->
             // Activity gate (linux-branch parity): while video plays with the
@@ -1355,6 +1132,237 @@ fun main(args: Array<String>) {
                 }
             }
         }
+        return chromeChanged
+    }
+
+    /**
+     * Draw and submit one Vulkan frame: the scene on the thread that owns it,
+     * with the video under the hole it punches and the chrome above.
+     *
+     * This is the compositing step, not a render loop. It used to be an early
+     * return at the top of renderOneFrame, which quietly skipped everything
+     * around it -- the dirty gating, the session gating, the swap pacing and
+     * the per-commit report_swap mpv times against. Every behaviour that had
+     * been fixed on the GL path came back as a bug here: judder, a stale frame
+     * before a new stream, chrome that never composited. Backends differ in how
+     * a frame is drawn and presented, and in nothing else.
+     */
+    fun drawGraphiteFrame(presenter: VkPresenter): Boolean {
+            var drew = false
+            val tDispatch = System.nanoTime()
+            if (gLoopStartNs == 0L) gLoopStartNs = tDispatch
+            onSceneThreadAndWait {
+                val canvas = presenter.beginFrameGraphite()
+                if (canvas != null) {
+                    val target = androidx.compose.ui.unit.IntSize(presenter.width, presenter.height)
+                    if (scene.size != target && presenter.width > 0 && presenter.height > 0) {
+                        width = presenter.width
+                        height = presenter.height
+                        scene.size = target
+                        val sc = currentScale()
+                        if (scene.density.density != sc) scene.density = Density(sc)
+                        input.scale = sc
+                    }
+                    // Transparent, not black: the scene's hole punch has to
+                    // survive down to this canvas for the video to land in it,
+                    // and CLEAR inside a Compose layer only stays transparent if
+                    // what it composites onto is transparent too. The background
+                    // is filled back in at the end.
+                    canvas.clear(0x00000000)
+                    if (graphiteClearOnly) {
+                        presenter.flushGraphite()
+                        drew = true
+                        return@onSceneThreadAndWait
+                    }
+                    val tVideo = System.nanoTime()
+                    val vp = (pipeline as? VkGlDisplayPipeline)?.vk
+                    val host = videoHost
+                    // The buffer handoff, in Vulkan terms. On a fresh frame the
+                    // consumer inherits mpv's render-done wait, and owes the
+                    // buffer it replaces a glDone signal before mpv may write
+                    // there again. The GL path does this with GL_EXT_semaphore;
+                    // here both semaphores ride on Skia's own submit.
+                    var waitSem = 0L
+                    var signalSem = 0L
+                    var retired: VideoPipelineVk.Buffer? = null
+                    var pendingVideo: VideoPipelineVk.DisplayFrame? = null
+                    var pendingRect: org.jetbrains.skia.Rect? = null
+                    when {
+                        vp == null -> gVideoNoPipeline++
+                        host == null || !host.hasFile -> gVideoNoFile++
+                        else -> {
+                            val r = host.videoRect
+                            if (r[2] <= 0f || r[3] <= 0f) {
+                                gVideoNoRect++
+                            } else {
+                                val f = vp.acquireDisplayFrame()
+                                if (f == null) {
+                                    gVideoNoFrame++
+                                } else {
+                                    if (f.fresh) {
+                                        waitSem = f.buffer.semaphore
+                                        retired = f.retired
+                                        signalSem = retired?.glDoneSemaphore ?: 0L
+                                    }
+                                    pendingVideo = f
+                                    pendingRect = org.jetbrains.skia.Rect
+                                        .makeXYWH(r[0], r[1], r[2], r[3])
+                                }
+                            }
+                        }
+                    }
+                    val tScene = System.nanoTime()
+                    gVideoNs += tScene - tVideo
+                    sceneRecomposer.performFrame(System.nanoTime())
+                    val composeCanvas = graphiteComposeCanvas
+                        ?.takeIf { graphiteCanvasFor === canvas }
+                        ?: canvas.asComposeCanvas().also {
+                            graphiteComposeCanvas = it
+                            graphiteCanvasFor = canvas
+                        }
+                    scene.draw(composeCanvas)
+                    // Chrome above the scene, and above the video: it is the
+                    // player's own controls. Source-over, so its transparent
+                    // parts leave the hole open for the video below.
+                    updateChromeSession()
+                    chromeLayer?.let { l ->
+                        l.update()
+                        l.drawInto(canvas, presenter.width, presenter.height)
+                    }
+                    val tFlush = System.nanoTime()
+                    gSceneNs += tFlush - tScene
+                    // Under the scene, into the hole it punched.
+                    val pv = pendingVideo
+                    val pr = pendingRect
+                    if (pv != null && pr != null) {
+                        presenter.drawVideoFrame(
+                            canvas = canvas,
+                            image = pv.buffer.image,
+                            srcWidth = pv.buffer.width,
+                            srcHeight = pv.buffer.height,
+                            generation = pv.buffer.generation,
+                            dst = pr,
+                        )
+                    }
+                    // Whatever is still transparent is background, not a hole.
+                    presenter.fillBackground(canvas)
+                    presenter.flushGraphite(waitSemaphore = waitSem, signalSemaphore = signalSem)
+                    // Only now is the signal on the queue, so only now may the
+                    // buffer go back into mpv's rotation. Ordering matters: the
+                    // render thread waits this semaphore on the strength of the
+                    // flag, and a wait whose signal never reached a queue hangs
+                    // the device.
+                    retired?.let { vp?.notifyGlDone(it) }
+                    gFlushNs += System.nanoTime() - tFlush
+                    drew = true
+                }
+            }
+        return drew
+    }
+
+    /** Returns true if this iteration actually presented a frame. */
+    fun renderOneFrame(): Boolean {
+        val w = IntArray(1); val h = IntArray(1)
+        // With a Vulkan swapchain the window has no framebuffer to measure;
+        // the surface's extent is the size, and the presenter reports it.
+        if (presenter != null) {
+            w[0] = presenter.width; h[0] = presenter.height
+        } else {
+            glfwGetFramebufferSize(window, w, h)
+        }
+        val targetChanged = presenter != null && presenter.generation != presenterGeneration
+        if (w[0] != width || h[0] != height || targetChanged) {
+            presenterGeneration = presenter?.generation ?: 0
+            width = w[0]; height = h[0]
+            if (width > 0 && height > 0) {
+                recreateSurface()
+                // The presenter deletes and recreates its texture and FBO on a
+                // rebuild, and GL hands back the same ids -- so Skia's cached
+                // state describes an attachment that no longer exists.
+                if (presenter != null) context.resetGLAll()
+                forceRepaint = true
+                // Pointer positions arrive in window coordinates but the
+                // scene works in framebuffer pixels; on a fractionally
+                // scaled output those differ. The same ratio is the UI
+                // density, which can change when the window moves outputs.
+                val scale = currentScale()
+                input.scale = scale
+                val p = uiPipeline
+                if (p != null) {
+                    // Size and density are scene state, so they are applied on
+                    // the scene's own thread; the pipeline reallocates its
+                    // textures to match on the next frame.
+                    p.resize(width, height, scale)
+                } else {
+                    scene.size = androidx.compose.ui.unit.IntSize(width, height)
+                    if (scene.density.density != scale) scene.density = Density(scale)
+                }
+                val logicalW = Math.round(width / scale)
+                val logicalH = Math.round(height / scale)
+                if (videoLog) {
+                    println("[chrome-size] fb=${width}x$height logical=${logicalW}x$logicalH scale=$scale")
+                }
+                // set_size IS the CSS layout size (WPEWebViewLegacy:
+                // set_size -> view.setSize verbatim), so it must be LOGICAL;
+                // the scale factor makes WebKit raster it at logical*scale =
+                // physical, which this scene then draws 1:1.
+                wpeChrome?.dispatchScale(scale * chromeScaleMul)
+                wpeChrome?.dispatchSize(logicalW, logicalH)
+            }
+        }
+
+        // The Vulkan path draws into Skia's own target, not a GL surface, so
+        // it needs neither of these -- but it reaches this point through all
+        // the same gating above, which is the point.
+        val vkFrame = if (vkGraphite) presenter ?: return false else null
+        val s = if (vkFrame != null) null else surface ?: return false
+        // Legacy path only: with threaded rasterization the UI layer is a
+        // published texture, not a surface this thread draws into.
+        val ui = uiSurface
+        if (vkFrame == null && ui == null && uiPipeline == null) return false
+
+        if (videoLog) {
+            wpeChrome?.let { chrome ->
+                if (frames % 120 == 0) {
+                    println("[wpe] exported=${chrome.framesExported} err=${chrome.lastError}")
+                }
+            }
+            videoHost?.report(System.nanoTime())?.let {
+                println("[wayland-video] $it rss=${rssMb()}MB heap=${Runtime.getRuntime().let { r -> (r.totalMemory() - r.freeMemory()) / 1_048_576 }}MB")
+            }
+            // Scene cost is reported from the thread that pays it; it no
+            // longer appears anywhere on this present path.
+            uiPipeline?.let { p ->
+                if (System.nanoTime() - lastUiReportNs > 1_000_000_000L) {
+                    val elapsed = (System.nanoTime() - lastUiReportNs) / 1e9
+                    lastUiReportNs = System.nanoTime()
+                    println("[wayland-video] ${p.report(elapsed)}")
+                    // Chrome cost is reported from the thread that pays it.
+                    // perMpx is the number that matters: it is what used to
+                    // grow with the window and made fullscreen chrome lag.
+                    chromeLayer?.let { l -> println("[wayland-video] ${l.report(elapsed)}") }
+                }
+            }
+            input.report(System.nanoTime())?.let { println("[wayland-video] $it") }
+            timings.report(System.nanoTime())?.let { println("[wayland-video] $it") }
+        }
+
+        // Present when there is something new: a video frame the pipeline
+        // published, a Compose invalidation, or a surface that was just
+        // rebuilt. Video presents take absolute priority: they reuse the last
+        // UI layer as-is and never wait on a scene rasterization. The cadence
+        // histogram showed why -- fullscreen scenes spike to 50ms, and video
+        // frames that queue behind them clump into 1-2 vsync bursts followed
+        // by 11-vsync gaps, which is exactly the judder the eye catches. The
+        // scene gets rasterized in the gaps between video frames instead; at
+        // 24fps there are 40ms of them, and when the UI is heavier than that
+        // it is the chrome that degrades, never the video.
+        val videoChanged = videoFrameReady.getAndSet(false)
+        // The chrome takes no part in this loop: it is a compositor-layered
+        // subsurface fed on the GLib thread. Keeping it (and every other
+        // foreign concern) out of this window's GL and present cadence is
+        // what preserves the measured-healthy video path.
+        var chromeChanged = updateChromeSession()
         // With threaded rasterization this thread never asks the scene
         // anything -- hasInvalidations() would be a cross-thread read of
         // Compose internals. The UI thread's publish is the signal instead.
@@ -1432,7 +1440,14 @@ fun main(args: Array<String>) {
             videoHost?.pushPlaybackUpdate()
         }
 
+        var uiGen = -1
+        var uiFresh = false
         t = System.nanoTime()
+        if (vkFrame != null) {
+            if (!drawGraphiteFrame(vkFrame)) return false
+            timings.add("composite", System.nanoTime() - t)
+        } else {
+        s!!
         s.canvas.clear(0xFF101014.toInt())
         videoHost?.compositeVideo(s.canvas)
 
@@ -1440,8 +1455,6 @@ fun main(args: Array<String>) {
         // scene render pay a full-resolution copy-on-write of the UI texture
         // (14MB at 2560x1440), which is what inflated scene costs to tens of
         // milliseconds and dragged the whole chrome down.
-        var uiGen = -1
-        var uiFresh = false
         if (ui != null) {
             ui.draw(s.canvas, 0, 0, null)
         } else {
@@ -1484,6 +1497,7 @@ fun main(args: Array<String>) {
             GL30.glBindFramebuffer(GL30.GL_FRAMEBUFFER, presenter?.fbo ?: 0)
             l.draw(width, height, originBottomLeft = true)
             context.resetGLAll()
+        }
         }
 
         // What this present actually put on screen, read back from the frame
@@ -1587,7 +1601,13 @@ fun main(args: Array<String>) {
             nextSwapDueNs += vblankNs
         }
         t = System.nanoTime()
-        if (presenter != null) presenter.present() else glfwSwapBuffers(window)
+        if (vkFrame != null) {
+            vkFrame.presentGraphite()
+        } else if (presenter != null) {
+            presenter.present()
+        } else {
+            glfwSwapBuffers(window)
+        }
         timings.add("swap", System.nanoTime() - t)
         // Vsync feedback: with ADVANCED_CONTROL this is the clock mpv times
         // against, and its contract is one call per swap -- what a real VO gets

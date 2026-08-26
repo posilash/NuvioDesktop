@@ -486,6 +486,100 @@ class WpeChrome(
 
     fun imageHeight(image: MemorySegment): Int = hImageHeight.invokeExact(image) as Int
 
+    /**
+     * What a dmabuf export describes. Single plane only, which is what WPE
+     * hands out for a rendered page -- [exportDmabuf] refuses anything else
+     * rather than importing a plane and calling it a frame.
+     *
+     * [fd] is owned by the caller and must be closed once imported.
+     */
+    class Dmabuf(
+        val fd: Int,
+        val fourcc: Int,
+        val modifier: Long,
+        val stride: Int,
+        val offset: Int,
+        val width: Int,
+        val height: Int,
+    )
+
+    /**
+     * Export [image] as a DMABUF, for a consumer that is not GL.
+     *
+     * EGL_MESA_image_dma_buf_export is the only route out of an EGLImage that
+     * does not involve a readback, and it is an extension of fdo's own
+     * isolated display, which is the display this image belongs to. Null when
+     * the driver lacks it or the image is not single-plane.
+     */
+    fun exportDmabuf(image: MemorySegment): Dmabuf? {
+        val query = eglExportQuery ?: return null
+        val export = eglExport ?: return null
+        val egl = eglImageOf(image)
+        if (egl.equals(MemorySegment.NULL)) return null
+        return Arena.ofConfined().use { a ->
+            val fourcc = a.allocate(JAVA_INT)
+            val numPlanes = a.allocate(JAVA_INT)
+            val modifiers = a.allocate(JAVA_LONG)
+            val ok = query.invokeExact(eglDisplay, egl, fourcc, numPlanes, modifiers) as Int
+            if (ok == 0) {
+                if (!loggedExportFail) {
+                    loggedExportFail = true
+                    System.err.println("[wpe] eglExportDMABUFImageQueryMESA failed")
+                }
+                return@use null
+            }
+            val planes = numPlanes.get(JAVA_INT, 0)
+            if (planes != 1) {
+                if (!loggedExportFail) {
+                    loggedExportFail = true
+                    System.err.println("[wpe] dmabuf export has $planes planes; only 1 is handled")
+                }
+                return@use null
+            }
+            val fds = a.allocate(JAVA_INT)
+            val strides = a.allocate(JAVA_INT)
+            val offsets = a.allocate(JAVA_INT)
+            val ok2 = export.invokeExact(eglDisplay, egl, fds, strides, offsets) as Int
+            if (ok2 == 0) {
+                if (!loggedExportFail) {
+                    loggedExportFail = true
+                    System.err.println("[wpe] eglExportDMABUFImageMESA failed")
+                }
+                return@use null
+            }
+            Dmabuf(
+                fd = fds.get(JAVA_INT, 0),
+                fourcc = fourcc.get(JAVA_INT, 0),
+                modifier = modifiers.get(JAVA_LONG, 0),
+                stride = strides.get(JAVA_INT, 0),
+                offset = offsets.get(JAVA_INT, 0),
+                width = imageWidth(image),
+                height = imageHeight(image),
+            )
+        }
+    }
+
+    private var loggedExportFail = false
+
+    /** Both are extension entry points, so they come from eglGetProcAddress. */
+    private val eglExportQuery: java.lang.invoke.MethodHandle? by lazy { eglProc(
+        "eglExportDMABUFImageQueryMESA",
+        FunctionDescriptor.of(JAVA_INT, ADDRESS, ADDRESS, ADDRESS, ADDRESS, ADDRESS),
+    ) }
+    private val eglExport: java.lang.invoke.MethodHandle? by lazy { eglProc(
+        "eglExportDMABUFImageMESA",
+        FunctionDescriptor.of(JAVA_INT, ADDRESS, ADDRESS, ADDRESS, ADDRESS, ADDRESS),
+    ) }
+
+    private fun eglProc(name: String, desc: FunctionDescriptor): java.lang.invoke.MethodHandle? {
+        val getProc = fn(eglLib, "eglGetProcAddress", FunctionDescriptor.of(ADDRESS, ADDRESS))
+        val addr = Arena.ofConfined().use { a ->
+            getProc.invokeExact(a.allocateFrom(name)) as MemorySegment
+        }
+        if (addr.equals(MemorySegment.NULL)) return null
+        return linker.downcallHandle(addr, desc)
+    }
+
     /** Hand an image back to WPE. Safe from any thread. */
     fun releaseImageAsync(image: MemorySegment) {
         Glib.post { releaseImage(image) }

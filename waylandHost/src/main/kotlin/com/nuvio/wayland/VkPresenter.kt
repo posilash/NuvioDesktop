@@ -1,5 +1,6 @@
 package com.nuvio.wayland
 
+import com.nuvio.wayland.wpe.WpeChrome
 import org.lwjgl.glfw.GLFWVulkan.glfwCreateWindowSurface
 import org.lwjgl.glfw.GLFWVulkan.glfwGetRequiredInstanceExtensions
 import org.lwjgl.opengl.EXTMemoryObject
@@ -23,6 +24,9 @@ import org.lwjgl.vulkan.VkCommandBufferBeginInfo
 import org.lwjgl.vulkan.VkCommandPoolCreateInfo
 import org.lwjgl.vulkan.VkDevice
 import org.lwjgl.vulkan.VkDeviceCreateInfo
+import org.lwjgl.vulkan.EXTExternalMemoryDmaBuf
+import org.lwjgl.vulkan.EXTImageDrmFormatModifier
+import org.lwjgl.vulkan.EXTQueueFamilyForeign
 import org.lwjgl.vulkan.VkDeviceQueueCreateInfo
 import org.lwjgl.vulkan.VkExportMemoryAllocateInfo
 import org.lwjgl.vulkan.VkExportSemaphoreCreateInfo
@@ -80,6 +84,17 @@ class VkPresenter(private val window: Long) {
             KHRExternalSemaphoreFd.VK_KHR_EXTERNAL_SEMAPHORE_FD_EXTENSION_NAME,
         )
 
+        /**
+         * Wanted, not required: importing the web chrome's dmabuf needs all
+         * three, and a device without them simply keeps the chrome on its GL
+         * path. Nothing here may assume a particular GPU.
+         */
+        private val DMABUF_EXTENSIONS = listOf(
+            EXTExternalMemoryDmaBuf.VK_EXT_EXTERNAL_MEMORY_DMA_BUF_EXTENSION_NAME,
+            EXTImageDrmFormatModifier.VK_EXT_IMAGE_DRM_FORMAT_MODIFIER_EXTENSION_NAME,
+            EXTQueueFamilyForeign.VK_EXT_QUEUE_FAMILY_FOREIGN_EXTENSION_NAME,
+        )
+
         /** GL_EXT_semaphore layout tokens; LWJGL exposes only some of these. */
         private const val GL_LAYOUT_TRANSFER_SRC_EXT = 0x9592
     }
@@ -101,7 +116,7 @@ class VkPresenter(private val window: Long) {
         queue = queue,
         queueFamily = queueFamily,
         featuresChain = features2!!.address(),
-        extensions = DEVICE_EXTENSIONS,
+        extensions = enabledExtensions,
         queueLock = queueLock,
     )
 
@@ -116,7 +131,12 @@ class VkPresenter(private val window: Long) {
 
     /** Handles for whoever else renders on this device -- mpv and Skia. */
     val featuresChain: Long get() = features2?.address() ?: 0L
-    val deviceExtensions: List<String> get() = DEVICE_EXTENSIONS
+    val deviceExtensions: List<String> get() = enabledExtensions
+
+    /** Whether [importDmabuf] can be used at all on this device. */
+    var dmabufImportSupported = false
+        private set
+    private var enabledExtensions: List<String> = DEVICE_EXTENSIONS
 
     private lateinit var instance: VkInstance
     private lateinit var physicalDevice: VkPhysicalDevice
@@ -274,6 +294,16 @@ class VkPresenter(private val window: Long) {
                 )
                 val available = (0 until extCount.get(0)).map { eprops.get(it).extensionNameString() }.toSet()
                 for (e in DEVICE_EXTENSIONS) check(e in available) { "$deviceName lacks $e" }
+                val dmabuf = DMABUF_EXTENSIONS.filter { it in available }
+                dmabufImportSupported = dmabuf.size == DMABUF_EXTENSIONS.size
+                enabledExtensions = DEVICE_EXTENSIONS + if (dmabufImportSupported) dmabuf else emptyList()
+                if (!dmabufImportSupported) {
+                    println(
+                        "vk-dmabuf: $deviceName lacks " +
+                            DMABUF_EXTENSIONS.filterNot { it in available }.joinToString() +
+                            " -- the chrome stays on GL",
+                    )
+                }
             } finally {
                 eprops.free()
             }
@@ -312,8 +342,8 @@ class VkPresenter(private val window: Long) {
                 .sType(VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO)
                 .queueFamilyIndex(queueFamily)
                 .pQueuePriorities(s.floats(1.0f))
-            val extNames = s.mallocPointer(DEVICE_EXTENSIONS.size)
-            for (e in DEVICE_EXTENSIONS) extNames.put(s.ASCII(e))
+            val extNames = s.mallocPointer(enabledExtensions.size)
+            for (e in enabledExtensions) extNames.put(s.ASCII(e))
             extNames.flip()
             val dci = VkDeviceCreateInfo.calloc(s)
                 .sType(VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO)
@@ -871,6 +901,209 @@ class VkPresenter(private val window: Long) {
     // like a cache hit is a Skia image over destroyed memory. That is a device
     // loss a few frames later, and it presents as the app vanishing mid-play.
     private val videoImages = HashMap<Int, org.jetbrains.skia.Image>()
+    /**
+     * The web chrome's frame, imported from a dmabuf and wrapped for Skia.
+     * Owns its Vulkan objects; [destroyChromeImage] frees them.
+     */
+    class ChromeImage(
+        val vkImage: Long,
+        val memory: Long,
+        val skia: org.jetbrains.skia.Image,
+        val width: Int,
+        val height: Int,
+    )
+
+    /**
+     * Import a WPE dmabuf as a sampleable VkImage and wrap it for Skia.
+     *
+     * The GL path gets here with glEGLImageTargetTexture2DOES; with no GL
+     * context on this path the same buffer has to arrive as a dmabuf, which is
+     * what EGL_MESA_image_dma_buf_export produces and
+     * VK_EXT_external_memory_dma_buf consumes. Still zero-copy: nothing is read
+     * back or uploaded, the page's own buffer is sampled where it lies.
+     *
+     * The fd is consumed on success -- importing transfers ownership -- and
+     * closed by the caller on failure.
+     */
+    fun importChromeDmabuf(d: WpeChrome.Dmabuf): ChromeImage? {
+        if (!dmabufImportSupported) return null
+        val rec = recorder ?: return null
+        val format = drmFourccToVk(d.fourcc)
+        if (format == 0) {
+            if (!chromeImportFailed) {
+                chromeImportFailed = true
+                System.err.println(
+                    "vk-dmabuf: unhandled fourcc 0x${d.fourcc.toString(16)} from the chrome",
+                )
+            }
+            return null
+        }
+        stackPush().use { s ->
+            // The modifier describes the tiling, so it must be given
+            // explicitly along with the plane's real offset and pitch.
+            val planeLayout = org.lwjgl.vulkan.VkSubresourceLayout.calloc(1, s)
+            planeLayout.get(0)
+                .offset(d.offset.toLong())
+                .size(0L)
+                .rowPitch(d.stride.toLong())
+                .arrayPitch(0L)
+                .depthPitch(0L)
+            val modInfo = org.lwjgl.vulkan.VkImageDrmFormatModifierExplicitCreateInfoEXT.calloc(s)
+                .sType(EXTImageDrmFormatModifier.VK_STRUCTURE_TYPE_IMAGE_DRM_FORMAT_MODIFIER_EXPLICIT_CREATE_INFO_EXT)
+                .drmFormatModifier(d.modifier)
+                .pPlaneLayouts(planeLayout)
+            val extInfo = org.lwjgl.vulkan.VkExternalMemoryImageCreateInfo.calloc(s)
+                .sType(VK11.VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO)
+                .pNext(modInfo.address())
+                .handleTypes(EXTExternalMemoryDmaBuf.VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT)
+            val ici = VkImageCreateInfo.calloc(s)
+                .sType(VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO)
+                .pNext(extInfo.address())
+                .imageType(VK_IMAGE_TYPE_2D)
+                .format(format)
+                .mipLevels(1)
+                .arrayLayers(1)
+                .samples(VK_SAMPLE_COUNT_1_BIT)
+                .tiling(EXTImageDrmFormatModifier.VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT)
+                .usage(VK_IMAGE_USAGE_SAMPLED_BIT)
+                .sharingMode(VK_SHARING_MODE_EXCLUSIVE)
+                .initialLayout(VK_IMAGE_LAYOUT_UNDEFINED)
+            ici.extent().width(d.width).height(d.height).depth(1)
+            val pImage = s.mallocLong(1)
+            if (vkCreateImage(device, ici, null, pImage) != VK_SUCCESS) {
+                if (!chromeImportFailed) {
+                    chromeImportFailed = true
+                    System.err.println(
+                        "vk-dmabuf: vkCreateImage rejected modifier 0x${d.modifier.toString(16)}",
+                    )
+                }
+                return null
+            }
+            val vkImage = pImage.get(0)
+
+            // Which memory types the fd is actually importable into. Guessing
+            // with DEVICE_LOCAL instead is how a dmabuf import turns into a
+            // driver error a frame later.
+            val fdProps = org.lwjgl.vulkan.VkMemoryFdPropertiesKHR.calloc(s)
+                .sType(KHRExternalMemoryFd.VK_STRUCTURE_TYPE_MEMORY_FD_PROPERTIES_KHR)
+            if (KHRExternalMemoryFd.vkGetMemoryFdPropertiesKHR(
+                    device,
+                    EXTExternalMemoryDmaBuf.VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT,
+                    d.fd, fdProps,
+                ) != VK_SUCCESS
+            ) {
+                vkDestroyImage(device, vkImage, null)
+                return null
+            }
+            val mr = VkMemoryRequirements.calloc(s)
+            vkGetImageMemoryRequirements(device, vkImage, mr)
+            val typeBits = mr.memoryTypeBits() and fdProps.memoryTypeBits()
+            if (typeBits == 0) {
+                vkDestroyImage(device, vkImage, null)
+                return null
+            }
+            val dedicated = VkMemoryDedicatedAllocateInfo.calloc(s)
+                .sType(VK11.VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO)
+                .image(vkImage)
+            val importInfo = org.lwjgl.vulkan.VkImportMemoryFdInfoKHR.calloc(s)
+                .sType(KHRExternalMemoryFd.VK_STRUCTURE_TYPE_IMPORT_MEMORY_FD_INFO_KHR)
+                .pNext(dedicated.address())
+                .handleType(EXTExternalMemoryDmaBuf.VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT)
+                .fd(d.fd)
+            val mai = VkMemoryAllocateInfo.calloc(s)
+                .sType(VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO)
+                .pNext(importInfo.address())
+                .allocationSize(mr.size())
+                .memoryTypeIndex(Integer.numberOfTrailingZeros(typeBits))
+            val pMem = s.mallocLong(1)
+            if (vkAllocateMemory(device, mai, null, pMem) != VK_SUCCESS) {
+                vkDestroyImage(device, vkImage, null)
+                return null
+            }
+            val memory = pMem.get(0)
+            if (vkBindImageMemory(device, vkImage, memory, 0) != VK_SUCCESS) {
+                vkFreeMemory(device, memory, null)
+                vkDestroyImage(device, vkImage, null)
+                return null
+            }
+
+            val info = org.jetbrains.skia.gpu.graphite.VulkanTextureInfo(
+                format = org.jetbrains.skia.gpu.graphite.VulkanFormat(format),
+                imageUsageFlags = org.jetbrains.skia.gpu.graphite.VulkanImageUsageFlags(
+                    VK_IMAGE_USAGE_SAMPLED_BIT,
+                ),
+            )
+            val tex = org.jetbrains.skia.gpu.graphite.BackendTexture.makeVulkan(
+                width = d.width,
+                height = d.height,
+                textureInfo = info,
+                // UNDEFINED, and left to Skia to transition when it samples.
+                // Doing it here means a submit and a queue wait per chrome
+                // frame, which stalls a queue the video is running at 165fps.
+                imageLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+                queueFamilyIndex = queueFamily,
+                imagePtr = vkImage,
+            )
+            val skia = org.jetbrains.skia.Image.wrapBackendTexture(
+                recorder = rec,
+                backendTexture = tex,
+                // WebKit's output is premultiplied, same as Compose's.
+                alphaType = org.jetbrains.skia.ColorAlphaType.PREMUL,
+                colorSpace = null,
+                originTopLeft = true,
+            )
+            if (skia == null) {
+                vkFreeMemory(device, memory, null)
+                vkDestroyImage(device, vkImage, null)
+                return null
+            }
+            if (!loggedChromeImport) {
+                loggedChromeImport = true
+                println(
+                    "vk-dmabuf: chrome imported zero-copy -- ${d.width}x${d.height} " +
+                        "fourcc=0x${d.fourcc.toString(16)} modifier=0x${d.modifier.toString(16)}",
+                )
+            }
+            return ChromeImage(vkImage, memory, skia, d.width, d.height)
+        }
+    }
+
+    fun destroyChromeImage(c: ChromeImage) {
+        // No wait here on purpose. This is only ever called for the frame the
+        // successor replaces, and [flushGraphite] submits with syncCpu, so the
+        // GPU finished with it before the frame that retires it even began.
+        // A vkDeviceWaitIdle instead would stall the queue at chrome frame
+        // rate -- on the queue the video is running at 165fps.
+        c.skia.close()
+        vkFreeMemory(device, c.memory, null)
+        vkDestroyImage(device, c.vkImage, null)
+    }
+
+    /** Chrome sits above everything the scene drew, so plain source-over. */
+    fun drawChromeImage(canvas: org.jetbrains.skia.Canvas, c: ChromeImage, dst: org.jetbrains.skia.Rect) {
+        canvas.drawImageRect(
+            c.skia,
+            org.jetbrains.skia.Rect.makeWH(c.width.toFloat(), c.height.toFloat()),
+            dst,
+            org.jetbrains.skia.SamplingMode.LINEAR,
+            chromePaint,
+            true,
+        )
+    }
+
+    private val chromePaint = org.jetbrains.skia.Paint()
+    private var chromeImportFailed = false
+    private var loggedChromeImport = false
+
+    /** DRM fourcc -> VkFormat, for the formats WPE actually hands out. */
+    private fun drmFourccToVk(fourcc: Int): Int = when (fourcc) {
+        // 'AR24' / 'XR24': BGRA in Vulkan's component order.
+        0x34325241, 0x34325258 -> VK_FORMAT_B8G8R8A8_UNORM
+        // 'AB24' / 'XB24'.
+        0x34324241, 0x34324258 -> VK_FORMAT_R8G8B8A8_UNORM
+        else -> 0
+    }
+
     /** Drop wraps for buffers mpv has already thrown away. */
     private fun evictVideoWraps(current: Int) {
         val stale = videoImages.keys.filter { it < current - 3 }

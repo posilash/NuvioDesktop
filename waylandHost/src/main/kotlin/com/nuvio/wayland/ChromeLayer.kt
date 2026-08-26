@@ -239,7 +239,11 @@ class ChromeLayer(private val chrome: WpeChrome) {
             return dirty
         }
         val start = System.nanoTime()
-        val changed = if (chrome.gpuActive) updateFromEglImage() else updateFromShm()
+        val changed = when {
+            vk != null && chrome.gpuActive -> updateFromDmabuf()
+            chrome.gpuActive -> updateFromEglImage()
+            else -> updateFromShm()
+        }
         if (changed) {
             val ns = System.nanoTime() - start
             updates++
@@ -294,6 +298,90 @@ class ChromeLayer(private val chrome: WpeChrome) {
         if (on == composited) return
         composited = on
         if (haveContent) dirtySincePublish = true
+    }
+
+    /**
+     * The presenter to import into, when there is no GL context to import to.
+     * Null on the GL path, which keeps [updateFromEglImage].
+     */
+    var vk: VkPresenter? = null
+
+    /** The imported frame currently on screen, and the image that backs it. */
+    private var vkImage: VkPresenter.ChromeImage? = null
+
+    /** Whether a Vulkan frame is ready to draw. */
+    val hasVkContent: Boolean get() = vkImage != null
+
+    /**
+     * Same handoff as [updateFromEglImage], one step longer: WPE's EGLImage is
+     * exported as a dmabuf and imported as a VkImage, because Skia is on
+     * Vulkan here and there is no GL context to target.
+     *
+     * Imported per frame rather than cached. WPE cycles a small pool, so a
+     * cache keyed on the image would be the faster thing -- and would be the
+     * same dangling-handle trap the video wraps just had, since a buffer we
+     * have released may be freed and its handle reused. The page renders only
+     * when it changes and is acked at ~30fps, so the import is not on a hot
+     * path.
+     */
+    private fun updateFromDmabuf(): Boolean {
+        val presenter = vk ?: return false
+        val image = chrome.takeEglImage() ?: return false
+        val dmabuf = chrome.exportDmabuf(image)
+        if (dmabuf == null) {
+            chrome.releaseImageAsync(image)
+            // Still ack, for the reason updateFromEglImage gives: an export
+            // that goes unanswered stops the page rendering for good.
+            chrome.ackFrameAfter(ackDelayMs)
+            return false
+        }
+        val imported = presenter.importChromeDmabuf(dmabuf)
+        if (imported == null) {
+            VideoPipelineVk.Posix.close(dmabuf.fd)
+            chrome.releaseImageAsync(image)
+            if (importErrors++ == 0L) {
+                System.err.println(
+                    "[chrome] dmabuf import failed; re-run without " +
+                        "-Pnuvio.wayland.vkGraphite, or with -Pnuvio.wayland.chromeGpu=false",
+                )
+            }
+            chrome.ackFrameAfter(ackDelayMs)
+            return false
+        }
+        // The fd belongs to the driver now: importing transferred ownership.
+        texW = dmabuf.width
+        texH = dmabuf.height
+        backing = Backing.EGL_IMAGE
+
+        // Successor is bound, so the predecessor is safe to let go -- and its
+        // import dies with it, since the buffer behind it goes back to WPE.
+        vkImage?.let { presenter.destroyChromeImage(it) }
+        vkImage = imported
+        displayedImage?.let { chrome.releaseImageAsync(it) }
+        displayedImage = image
+        haveContent = true
+        return true
+    }
+
+    /**
+     * Draw the imported chrome, above everything the scene drew, filling the
+     * target.
+     *
+     * Stretched to the target rather than blitted at its own size: the page is
+     * laid out in logical pixels and the target is physical, so on a
+     * fractionally scaled output they differ (1020x552 against 1272x687 at
+     * 1.25), and drawing 1:1 puts the whole chrome in the top-left corner.
+     */
+    fun drawInto(canvas: org.jetbrains.skia.Canvas, targetWidth: Int, targetHeight: Int) {
+        if (!composited || !haveContent) return
+        val presenter = vk ?: return
+        val img = vkImage ?: return
+        val t = System.nanoTime()
+        presenter.drawChromeImage(
+            canvas, img,
+            org.jetbrains.skia.Rect.makeWH(targetWidth.toFloat(), targetHeight.toFloat()),
+        )
+        drawNanos += System.nanoTime() - t
     }
 
     private fun updateFromEglImage(): Boolean {

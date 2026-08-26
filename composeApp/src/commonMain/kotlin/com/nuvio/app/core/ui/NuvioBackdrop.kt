@@ -35,7 +35,18 @@ import androidx.compose.ui.unit.Dp
  * against 1.12.
  */
 class NuvioBackdropState {
+    /** Holds the recorded content, and is never given a render effect. */
     internal var layer: GraphicsLayer? = null
+
+    /**
+     * Carries the blur. A separate layer because a GraphicsLayer has one
+     * renderEffect and two things draw this content: the source draws it
+     * sharp, the panel draws it blurred. Sharing one layer meant the effect
+     * the panel set was still on it when the source drew the next frame, so
+     * the whole backdrop came up blurred -- intermittently, depending on
+     * whether a panel had appeared yet.
+     */
+    internal var blurLayer: GraphicsLayer? = null
     internal var sourceOrigin by mutableStateOf(Offset.Zero)
     internal var effectOrigin by mutableStateOf(Offset.Zero)
     /**
@@ -50,7 +61,13 @@ class NuvioBackdropState {
 @Composable
 fun rememberNuvioBackdropState(): NuvioBackdropState {
     val layer = rememberGraphicsLayer()
-    return remember(layer) { NuvioBackdropState().apply { this.layer = layer } }
+    val blurLayer = rememberGraphicsLayer()
+    return remember(layer, blurLayer) {
+        NuvioBackdropState().apply {
+            this.layer = layer
+            this.blurLayer = blurLayer
+        }
+    }
 }
 
 /** The content to be blurred. Draws normally; also records itself. */
@@ -77,21 +94,27 @@ fun Modifier.nuvioBackdropEffect(
     this.onGloballyPositioned { state.effectOrigin = it.positionInRoot() }
         .drawBehind {
             val layer = state.layer
-            if (layer == null) {
+            val blurLayer = state.blurLayer
+            if (layer == null || blurLayer == null) {
                 drawRect(tint)
                 return@drawBehind
             }
             val radiusPx = blurRadius.toPx()
             if (state.appliedRadius != radiusPx) {
                 state.appliedRadius = radiusPx
-                layer.renderEffect = BlurEffect(radiusPx, radiusPx, TileMode.Clamp)
+                blurLayer.renderEffect = BlurEffect(radiusPx, radiusPx, TileMode.Clamp)
+            }
+            // The blurred copy: one cheap layer-to-layer draw, so the source's
+            // own recording stays sharp for its own drawing.
+            if (layer.size.width > 0 && layer.size.height > 0) {
+                blurLayer.record(size = layer.size) { drawLayer(layer) }
             }
             // The recording is in the source's coordinates; shift it so the
             // part behind this panel lands under this panel.
             val dx = state.sourceOrigin.x - state.effectOrigin.x
             val dy = state.sourceOrigin.y - state.effectOrigin.y
             clipRect {
-                translate(dx, dy) { drawLayer(layer) }
+                translate(dx, dy) { drawLayer(blurLayer) }
             }
             drawRect(tint)
         }
