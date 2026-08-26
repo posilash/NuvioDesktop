@@ -993,6 +993,10 @@ fun main(args: Array<String>) {
             width = w[0]; height = h[0]
             if (width > 0 && height > 0) {
                 recreateSurface()
+                // The presenter deletes and recreates its texture and FBO on a
+                // rebuild, and GL hands back the same ids -- so Skia's cached
+                // state describes an attachment that no longer exists.
+                if (presenter != null) context.resetGLAll()
                 forceRepaint = true
                 // Pointer positions arrive in window coordinates but the
                 // scene works in framebuffer pixels; on a fractionally

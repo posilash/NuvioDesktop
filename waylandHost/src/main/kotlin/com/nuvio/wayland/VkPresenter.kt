@@ -101,7 +101,11 @@ class VkPresenter(private val window: Long) {
     private var cmdBuf: VkCommandBuffer? = null
     private var submitFence = VK_NULL_HANDLE
     private var imageAvailable = VK_NULL_HANDLE
-    private var renderFinished = VK_NULL_HANDLE
+    // One per swapchain image, not one shared. The fence only says the command
+    // buffer finished; it says nothing about vkQueuePresentKHR having consumed
+    // the semaphore, so a shared one gets re-signalled while still signalled --
+    // VUID-vkQueueSubmit-pSignalSemaphores-00067, and undefined behaviour after.
+    private var renderFinished = LongArray(0)
 
     // Target: what GL draws into, what Vulkan blits from.
     private var targetImage = VK_NULL_HANDLE
@@ -117,6 +121,9 @@ class VkPresenter(private val window: Long) {
     private var glGlDoneSem = 0
     private var glVkDoneSem = 0
     private var everSubmitted = false
+
+    /** Diagnostic: skip the blit and present a flat colour. */
+    private val clearOnly = System.getProperty("nuvio.wayland.vkClear")?.toBoolean() == true
 
     /** The framebuffer the frame must be rendered into. */
     val fbo: Int get() = glFramebuffer
@@ -253,8 +260,6 @@ class VkPresenter(private val window: Long) {
             val sci = VkSemaphoreCreateInfo.calloc(s).sType(VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO)
             check(vkCreateSemaphore(device, sci, null, pl), "vkCreateSemaphore(imageAvailable)")
             imageAvailable = pl.get(0)
-            check(vkCreateSemaphore(device, sci, null, pl), "vkCreateSemaphore(renderFinished)")
-            renderFinished = pl.get(0)
 
             val fci = VkFenceCreateInfo.calloc(s).sType(VK_STRUCTURE_TYPE_FENCE_CREATE_INFO)
             check(vkCreateFence(device, fci, null, pl), "vkCreateFence")
@@ -334,6 +339,13 @@ class VkPresenter(private val window: Long) {
             val imgs = s.mallocLong(ic.get(0))
             KHRSwapchain.vkGetSwapchainImagesKHR(device, swapchain, ic, imgs)
             swapImages = LongArray(ic.get(0)) { imgs.get(it) }
+
+            val sci2 = VkSemaphoreCreateInfo.calloc(s).sType(VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO)
+            val ps = s.mallocLong(1)
+            renderFinished = LongArray(swapImages.size) {
+                check(vkCreateSemaphore(device, sci2, null, ps), "vkCreateSemaphore(renderFinished)")
+                ps.get(0)
+            }
         }
     }
 
@@ -541,10 +553,22 @@ class VkPresenter(private val window: Long) {
                 dstOffsets(0).set(0, 0, 0)
                 dstOffsets(1).set(swapWidth, swapHeight, 1)
             }
-            vkCmdBlitImage(
-                cb, targetImage, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-                image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, blit, VK_FILTER_LINEAR,
-            )
+            if (clearOnly) {
+                // Diagnostic: present a colour Vulkan produces itself, so a
+                // black window means the presentation is at fault rather than
+                // anything GL handed over.
+                val cc = org.lwjgl.vulkan.VkClearColorValue.calloc(s)
+                cc.float32(0, 1.0f).float32(1, 0.0f).float32(2, 1.0f).float32(3, 1.0f)
+                val range = org.lwjgl.vulkan.VkImageSubresourceRange.calloc(1, s)
+                range.get(0).aspectMask(VK_IMAGE_ASPECT_COLOR_BIT)
+                    .baseMipLevel(0).levelCount(1).baseArrayLayer(0).layerCount(1)
+                vkCmdClearColorImage(cb, image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, cc, range)
+            } else {
+                vkCmdBlitImage(
+                    cb, targetImage, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                    image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, blit, VK_FILTER_LINEAR,
+                )
+            }
 
             val toPresent = VkImageMemoryBarrier.calloc(1, s)
             toPresent.get(0)
@@ -572,13 +596,13 @@ class VkPresenter(private val window: Long) {
                 .pWaitSemaphores(s.longs(glDoneSem, imageAvailable))
                 .pWaitDstStageMask(s.ints(VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT))
                 .pCommandBuffers(s.pointers(cb))
-                .pSignalSemaphores(s.longs(renderFinished, vkDoneSem))
+                .pSignalSemaphores(s.longs(renderFinished[pi.get(0)], vkDoneSem))
             check(vkQueueSubmit(queue, si, submitFence), "vkQueueSubmit")
             everSubmitted = true
 
             val present = VkPresentInfoKHR.calloc(s)
                 .sType(KHRSwapchain.VK_STRUCTURE_TYPE_PRESENT_INFO_KHR)
-                .pWaitSemaphores(s.longs(renderFinished))
+                .pWaitSemaphores(s.longs(renderFinished[pi.get(0)]))
                 .swapchainCount(1)
                 .pSwapchains(s.longs(swapchain))
                 .pImageIndices(s.ints(pi.get(0)))
@@ -625,6 +649,8 @@ class VkPresenter(private val window: Long) {
         if (ww <= 0 || wh <= 0) return
         vkDeviceWaitIdle(device)
         destroyTarget()
+        for (sem in renderFinished) vkDestroySemaphore(device, sem, null)
+        renderFinished = LongArray(0)
         KHRSwapchain.vkDestroySwapchainKHR(device, swapchain, null)
         swapchain = VK_NULL_HANDLE
         createSwapchain(ww, wh)
@@ -653,7 +679,7 @@ class VkPresenter(private val window: Long) {
         if (swapchain != VK_NULL_HANDLE) KHRSwapchain.vkDestroySwapchainKHR(device, swapchain, null)
         if (submitFence != VK_NULL_HANDLE) vkDestroyFence(device, submitFence, null)
         if (imageAvailable != VK_NULL_HANDLE) vkDestroySemaphore(device, imageAvailable, null)
-        if (renderFinished != VK_NULL_HANDLE) vkDestroySemaphore(device, renderFinished, null)
+        for (sem in renderFinished) vkDestroySemaphore(device, sem, null)
         if (cmdPool != VK_NULL_HANDLE) vkDestroyCommandPool(device, cmdPool, null)
         vkDestroyDevice(device, null)
         if (surface != VK_NULL_HANDLE) KHRSurface.vkDestroySurfaceKHR(instance, surface, null)
