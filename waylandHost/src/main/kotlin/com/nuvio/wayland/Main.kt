@@ -590,8 +590,8 @@ fun main(args: Array<String>) {
     val sceneRecomposer: androidx.compose.ui.platform.FrameRecomposer
     if (uiThreadEnabled) {
         val p = UiPipeline(uiWindow)
-        // Graphite draws through this thread rather than being published by it.
-        p.externallyDriven = vkGraphite
+        // Vulkan-backed scene buffers, published exactly as the GL ones are.
+        if (vkGraphite) p.vk = presenter
         p.onFrame = {
             uiFrameReady.set(true)
             // Wake the host loop even if it is idle in glfwWaitEventsTimeout.
@@ -1152,7 +1152,7 @@ fun main(args: Array<String>) {
      * before a new stream, chrome that never composited. Backends differ in how
      * a frame is drawn and presented, and in nothing else.
      */
-    fun drawGraphiteFrame(presenter: VkPresenter, sceneDirty: Boolean): Boolean {
+    fun drawGraphiteFrame(presenter: VkPresenter): Boolean {
             var drew = false
             val tDispatch = System.nanoTime()
             if (gLoopStartNs == 0L) gLoopStartNs = tDispatch
@@ -1217,34 +1217,11 @@ fun main(args: Array<String>) {
                     // something new. Drawing it on every present cost 9-29ms a
                     // frame and dropped the loop to 29-67fps; the present now
                     // costs one image draw whatever Compose is doing.
-                    val uiCanvas = presenter.uiLayerCanvas()
-                    // Capped, like UiPipeline's own loop: animations keep the
-                    // scene dirty, and without this it rasterizes at the host's
-                    // rate (165) instead of the UI's (60). That is most of what
-                    // the scene costs a present, averaged out.
-                    val nowNs = System.nanoTime()
-                    val sceneDue = nowNs - lastUiDrawNs >= uiFrameIntervalNs
-                    if (uiCanvas != null && sceneDue &&
-                        (sceneDirty || sceneRecomposer.hasPendingWork())
-                    ) {
-                        lastUiDrawNs = nowNs
-                        uiCanvas.clear(0x00000000)
-                        val composeCanvas = graphiteComposeCanvas
-                            ?.takeIf { graphiteCanvasFor === uiCanvas }
-                            ?: uiCanvas.asComposeCanvas().also {
-                                graphiteComposeCanvas = it
-                                graphiteCanvasFor = uiCanvas
-                            }
-                        sceneRecomposer.performFrame(System.nanoTime())
-                        scene.draw(composeCanvas)
-                        // Its own submit: the composite below samples this
-                        // image, and a read-after-write inside one recording is
-                        // not ordered.
-                        presenter.flushGraphite()
-                    }
-                    // Chrome above the scene, and above the video: it is the
-                    // player's own controls. Source-over, so its transparent
-                    // parts leave the hole open for the video below.
+                    // The scene is not drawn here. It is rasterized on the
+                    // UI thread and published, and this only ever draws the
+                    // newest one -- the same bargain the GL path makes. Compose
+                    // costs 16-28ms a frame on both backends (measured); what
+                    // makes it survivable is never waiting for it.
                     val tFlush = System.nanoTime()
                     gSceneNs += tFlush - tScene
                     // Video, then the UI layer over it, then the chrome:
@@ -1256,7 +1233,9 @@ fun main(args: Array<String>) {
                     // punches/s=0 on both paths -- so the video's place is
                     // simply wherever the layer left alpha, and DST_OVER is
                     // what fills exactly that.
-                    presenter.uiLayerImage()?.let { presenter.drawUiLayer(canvas, it) }
+                    uiPipeline?.acquireVkFrame()?.let {
+                        presenter.drawUiLayer(canvas, it.skia)
+                    }
                     val pv = pendingVideo
                     val pr = pendingRect
                     if (pv != null && pr != null) {
@@ -1496,7 +1475,7 @@ fun main(args: Array<String>) {
         var uiFresh = false
         t = System.nanoTime()
         if (vkFrame != null) {
-            if (!drawGraphiteFrame(vkFrame, sceneDirty)) return false
+            if (!drawGraphiteFrame(vkFrame)) return false
             timings.add("composite", System.nanoTime() - t)
         } else {
         s!!

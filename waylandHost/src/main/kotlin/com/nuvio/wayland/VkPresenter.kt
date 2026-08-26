@@ -869,6 +869,136 @@ class VkPresenter(private val window: Long) {
     /** The layer as something the present can sample. */
     fun uiLayerImage(): org.jetbrains.skia.Image? = uiSkiaImage
 
+    /** One scene buffer: a VkImage Skia renders into and can also sample. */
+    class UiBuffer(
+        val image: Long,
+        val memory: Long,
+        val surface: org.jetbrains.skia.Surface,
+        val skia: org.jetbrains.skia.Image,
+        val width: Int,
+        val height: Int,
+        val generation: Int,
+    )
+
+    private var uiBufferGeneration = 0
+
+    /** A recorder of its own, because a Graphite Recorder belongs to one thread. */
+    fun makeUiRecorder(): org.jetbrains.skia.gpu.graphite.Recorder? =
+        graphiteContext?.makeRecorder()
+
+    /**
+     * Snap [rec] and hand it to the GPU. Locked: two recorders feed one
+     * Context, and Context::insertRecording is not thread-safe.
+     *
+     * Not syncCpu -- the caller must not block the GPU here. The scene thread
+     * would stall the queue the video runs on, and the present's own fence is
+     * what orders the frames that matter.
+     */
+    fun submitRecorder(
+        rec: org.jetbrains.skia.gpu.graphite.Recorder,
+        waitSemaphore: Long = VK_NULL_HANDLE,
+        signalSemaphore: Long = VK_NULL_HANDLE,
+        syncCpu: Boolean = false,
+    ) {
+        val gc = graphiteContext ?: return
+        rec.snap().use { recording ->
+            graphiteLock.lock()
+            try {
+                gc.insertRecording(
+                    org.jetbrains.skia.gpu.graphite.InsertRecordingInfo(
+                        recording = recording,
+                        waitSemaphores = backendSemaphores(waitSemaphore),
+                        signalSemaphores = backendSemaphores(signalSemaphore),
+                    ),
+                )
+                withQueue { gc.submit(syncCpu) }
+            } finally {
+                graphiteLock.unlock()
+            }
+        }
+    }
+
+    private val graphiteLock = java.util.concurrent.locks.ReentrantLock()
+
+    /** Allocate a scene buffer for [rec]. Caller owns it until destroyUiBuffer. */
+    fun createUiBuffer(
+        rec: org.jetbrains.skia.gpu.graphite.Recorder,
+        w: Int,
+        h: Int,
+    ): UiBuffer? {
+        var image = VK_NULL_HANDLE
+        var memory = VK_NULL_HANDLE
+        stackPush().use { s ->
+            val ici = VkImageCreateInfo.calloc(s)
+                .sType(VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO)
+                .imageType(VK_IMAGE_TYPE_2D)
+                .format(swapFormat)
+                .mipLevels(1)
+                .arrayLayers(1)
+                .samples(VK_SAMPLE_COUNT_1_BIT)
+                .tiling(VK_IMAGE_TILING_OPTIMAL)
+                .usage(swapUsage or VK_IMAGE_USAGE_TRANSFER_SRC_BIT)
+                .sharingMode(VK_SHARING_MODE_EXCLUSIVE)
+                .initialLayout(VK_IMAGE_LAYOUT_UNDEFINED)
+            ici.extent().width(w).height(h).depth(1)
+            val pl = s.mallocLong(1)
+            if (vkCreateImage(device, ici, null, pl) != VK_SUCCESS) return null
+            image = pl.get(0)
+            val mr = VkMemoryRequirements.calloc(s)
+            vkGetImageMemoryRequirements(device, image, mr)
+            val ai = VkMemoryAllocateInfo.calloc(s)
+                .sType(VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO)
+                .allocationSize(mr.size())
+                .memoryTypeIndex(findMemoryType(mr.memoryTypeBits(), VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT))
+            if (vkAllocateMemory(device, ai, null, pl) != VK_SUCCESS) {
+                vkDestroyImage(device, image, null); return null
+            }
+            memory = pl.get(0)
+            vkBindImageMemory(device, image, memory, 0)
+            transitionToGeneral(image)
+        }
+        val info = org.jetbrains.skia.gpu.graphite.VulkanTextureInfo(
+            format = org.jetbrains.skia.gpu.graphite.VulkanFormat(swapFormat),
+            imageUsageFlags = org.jetbrains.skia.gpu.graphite.VulkanImageUsageFlags(
+                swapUsage or VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
+            ),
+        )
+        fun tex() = org.jetbrains.skia.gpu.graphite.BackendTexture.makeVulkan(
+            width = w, height = h, textureInfo = info,
+            imageLayout = VK_IMAGE_LAYOUT_GENERAL,
+            queueFamilyIndex = queueFamily, imagePtr = image,
+        )
+        val surface = org.jetbrains.skia.Surface.wrapBackendTexture(rec, tex(), null, null)
+        // Wrapped for the HOST's recorder, because that is what samples it.
+        val hostRec = recorder
+        val skia = if (surface != null && hostRec != null) {
+            org.jetbrains.skia.Image.wrapBackendTexture(
+                recorder = hostRec,
+                backendTexture = tex(),
+                alphaType = org.jetbrains.skia.ColorAlphaType.PREMUL,
+                colorSpace = null,
+                originTopLeft = true,
+            )
+        } else {
+            null
+        }
+        if (surface == null || skia == null) {
+            surface?.close()
+            vkFreeMemory(device, memory, null)
+            vkDestroyImage(device, image, null)
+            return null
+        }
+        return UiBuffer(image, memory, surface, skia, w, h, ++uiBufferGeneration)
+    }
+
+    fun destroyUiBuffer(b: UiBuffer) {
+        vkDeviceWaitIdle(device)
+        b.skia.close()
+        b.surface.close()
+        vkFreeMemory(device, b.memory, null)
+        vkDestroyImage(device, b.image, null)
+    }
+
     private fun createUiLayer(w: Int, h: Int) {
         val rec = recorder ?: return
         stackPush().use { s ->

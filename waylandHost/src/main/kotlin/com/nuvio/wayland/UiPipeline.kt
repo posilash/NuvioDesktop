@@ -106,19 +106,30 @@ class UiPipeline(
     /** Called (from this thread) after each publish; wired to wake the host loop. */
     @Volatile var onFrame: (() -> Unit)? = null
 
+
     /**
-     * Suppress this thread's own rasterization: it keeps the scene and runs its
-     * dispatcher, but draws nothing and publishes nothing.
+     * Set to render the scene into Vulkan buffers instead of GL ones.
      *
-     * The Graphite path needs both halves of what this class does, split apart.
-     * The scene still has to be confined to one thread that is not the
-     * presenting one -- rasterizing in the host loop is what made the chrome lag
-     * and leaked a GB a minute -- but there is no texture to hand over: Skia and
-     * the swapchain share a VkDevice, so the presenting thread reads what was
-     * drawn directly. So the host drives a frame through [invokeAndWait] and
-     * presents it itself, and this loop stays out of the way.
+     * Everything else about this class is unchanged, and deliberately so: the
+     * scene costs 16-28ms a frame on either backend (measured on both), and
+     * what makes that survivable is that it is paid HERE and published, never
+     * waited on by the thread that presents. Drawing it inside the host's frame
+     * instead dropped that loop from 165fps to 22-33.
      */
-    @Volatile var externallyDriven = false
+    @Volatile var vk: VkPresenter? = null
+    private var vkRecorder: org.jetbrains.skia.gpu.graphite.Recorder? = null
+    private val vkBuffers = arrayOfNulls<VkPresenter.UiBuffer>(3)
+    private var vkFront: VkPresenter.UiBuffer? = null
+    private var vkDisplayed: VkPresenter.UiBuffer? = null
+
+    /** Newest published scene image, for the presenting thread. Null before the first. */
+    fun acquireVkFrame(): VkPresenter.UiBuffer? {
+        synchronized(lock) {
+            val f = vkFront
+            if (f != null) { vkFront = null; vkDisplayed = f }
+            return vkDisplayed
+        }
+    }
 
     // The chrome used to be composited into this thread's buffer. It is drawn
     // by the presenting thread now: a Compose frame has no upper bound, and
@@ -149,15 +160,6 @@ class UiPipeline(
      */
     fun requestFrame() {
         framePending = true
-        if (externallyDriven) {
-            // Nothing is published on this path, so the host's "the scene has
-            // something new" signal has to come from here instead. Without it
-            // sceneDirty is false forever and the loop only runs while video
-            // rolls -- which is why the chrome went stale and stopped
-            // responding the moment playback paused.
-            onFrame?.invoke()
-            return
-        }
         thread?.let { LockSupport.unpark(it) }
     }
 
@@ -305,19 +307,6 @@ class UiPipeline(
             drainTasks()
             if (!running) return
 
-            if (externallyDriven) {
-                // Resizes still have to be applied: the host resizes through
-                // this class on both paths, and skipping it here left the scene
-                // at its construction size -- a small window inside a fullscreen
-                // one. Only the rasterization below is suppressed.
-                applyPendingSize()
-                // Park until posted work arrives -- a host frame, an input
-                // event, or something Compose dispatched. The timeout is only a
-                // shutdown backstop, as below.
-                LockSupport.parkNanos(100_000_000L)
-                continue
-            }
-
             if (!framePending) {
                 // Parked until an invalidation, a chrome frame, a resize or
                 // posted work. The timeout is only a shutdown/robustness
@@ -354,6 +343,12 @@ class UiPipeline(
             val w = targetWidth
             val h = targetHeight
             if (w <= 0 || h <= 0) continue
+
+            val vkp = vk
+            if (vkp != null) {
+                renderVulkanScene(vkp, w, h)
+                continue
+            }
 
             val buf = acquireBuffer(w, h) ?: continue
             val surface = buf.surface ?: continue
@@ -419,6 +414,69 @@ class UiPipeline(
             scene.size = IntSize(w, h)
             if (scene.density.density != d) scene.density = Density(d)
         }
+    }
+
+    /** The Vulkan half of the render step. Same shape as the GL one below it. */
+    private fun renderVulkanScene(vkp: VkPresenter, w: Int, h: Int) {
+        val rec = vkRecorder ?: vkp.makeUiRecorder()?.also { vkRecorder = it } ?: return
+        val target = pickVkBuffer(vkp, rec, w, h) ?: return
+
+        lastRenderNs = System.nanoTime()
+        val t = lastRenderNs
+        // Transparent: the video shows through wherever the scene drew nothing.
+        target.surface.canvas.clear(0x00000000)
+        try {
+            frameRecomposer.performFrame(System.nanoTime())
+            scene.draw(target.surface.canvas.asComposeCanvas())
+        } catch (err: Throwable) {
+            if (renderErrors++ == 0L) {
+                System.err.println("[wayland-ui] scene.render failed (first occurrence)")
+                err.printStackTrace()
+            }
+        }
+        val composeNs = System.nanoTime() - t
+        // Async on purpose: blocking here would stall the queue the video runs
+        // on, and nothing downstream needs this finished before the next frame.
+        vkp.submitRecorder(rec)
+
+        val elapsed = System.nanoTime() - t
+        renders++
+        renderNanos += elapsed
+        composeNanos += composeNs
+        flushNanos += elapsed - composeNs
+        if (elapsed > maxRenderNanos) maxRenderNanos = elapsed
+
+        synchronized(lock) { vkFront = target }
+        lastGeneration = target.generation
+        onFrame?.invoke()
+        if (frameRecomposer.hasPendingWork()) framePending = true
+    }
+
+    /** A buffer that is neither published nor displayed, at the right size. */
+    private fun pickVkBuffer(
+        vkp: VkPresenter,
+        rec: org.jetbrains.skia.gpu.graphite.Recorder,
+        w: Int,
+        h: Int,
+    ): VkPresenter.UiBuffer? = synchronized(lock) {
+        for (b in vkBuffers) {
+            if (b != null && b !== vkFront && b !== vkDisplayed &&
+                b.width == w && b.height == h
+            ) {
+                return b
+            }
+        }
+        // None free at this size: take a free slot, reallocating if it held a
+        // stale one. Only happens on the first frames and on a resize.
+        val idx = vkBuffers.indexOfFirst { b ->
+            b == null || (b !== vkFront && b !== vkDisplayed)
+        }
+        if (idx < 0) return null
+        vkBuffers[idx]?.let { vkp.destroyUiBuffer(it) }
+        vkBuffers[idx] = null
+        val made = vkp.createUiBuffer(rec, w, h) ?: return null
+        vkBuffers[idx] = made
+        return made
     }
 
     private fun drainTasks() {
