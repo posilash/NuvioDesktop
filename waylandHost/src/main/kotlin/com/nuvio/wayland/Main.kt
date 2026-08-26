@@ -1018,6 +1018,7 @@ fun main(args: Array<String>) {
     var gLoopStartNs = 0L
     var gReportNs = 0L
     var lastUiDrawNs = 0L
+    var gUiNull = 0L
     val uiFrameIntervalNs =
         1_000_000_000L / (System.getProperty("nuvio.wayland.uiFps")?.toIntOrNull() ?: 60)
     var gFrames = 0L
@@ -1173,6 +1174,10 @@ fun main(args: Array<String>) {
                     // thread.
                     canvas.clear(0x00000000)
                     if (graphiteClearOnly) {
+                        // A known colour, so the pixel probe can tell "the
+                        // compositing works and the layer is empty" from
+                        // "nothing reaches the target at all".
+                        canvas.clear(0xFFFF00FF.toInt())
                         presenter.flushGraphite()
                         drew = true
                         return@run
@@ -1239,9 +1244,8 @@ fun main(args: Array<String>) {
                     // punches/s=0 on both paths -- so the video's place is
                     // simply wherever the layer left alpha, and DST_OVER is
                     // what fills exactly that.
-                    uiPipeline?.acquireVkFrame()?.let {
-                        presenter.drawUiLayer(canvas, it.skia)
-                    }
+                    val published = uiPipeline?.acquireVkFrame()
+                    presenter.drawUiLayerLatest(canvas)
                     val pv = pendingVideo
                     val pr = pendingRect
                     if (pv != null && pr != null) {
@@ -1281,18 +1285,28 @@ fun main(args: Array<String>) {
             if (gReportNs != 0L && gFrames > 0) {
                 println(
                     ("[wayland-video] host: fps=%.0f video=%.2fms scene=%.2fms " +
-                        "flush=%.2fms present=%.2fms dispatch=%.2fms noFrame=%d")
+                        "flush=%.2fms present=%.2fms dispatch=%.2fms noFrame=%d " +
+                        "uiDrawn=%d uiNull=%d wrapFail=%d noRec=%d")
                         .format(
                             gFrames / secs,
                             gVideoNs / 1e6 / gFrames, gSceneNs / 1e6 / gFrames,
                             gFlushNs / 1e6 / gFrames, gPresentNs / 1e6 / gFrames,
                             gDispatchNs / 1e6 / gFrames, gVideoNoFrame,
+                            presenter?.uiDrawn ?: -1, gUiNull,
+                            presenter?.uiWrapFailed ?: -1, presenter?.uiNoRecorder ?: -1,
                         ),
+                )
+            }
+            if (videoLog) {
+                val pub = uiPipeline?.acquireVkFrame()
+                println(
+                    "[wayland-video] pixels target=${presenter?.sampleTarget()} " +
+                        "uiLayer=${pub?.let { presenter?.sampleImage(it.image, it.width, it.height) }}",
                 )
             }
             gReportNs = System.nanoTime()
             gFrames = 0; gVideoNs = 0; gSceneNs = 0; gFlushNs = 0
-            gPresentNs = 0; gDispatchNs = 0; gVideoNoFrame = 0
+            gPresentNs = 0; gDispatchNs = 0; gVideoNoFrame = 0; gUiNull = 0
         }
         return drew
     }
@@ -1312,11 +1326,17 @@ fun main(args: Array<String>) {
             presenterGeneration = presenter?.generation ?: 0
             width = w[0]; height = h[0]
             if (width > 0 && height > 0) {
-                recreateSurface()
-                // The presenter deletes and recreates its texture and FBO on a
-                // rebuild, and GL hands back the same ids -- so Skia's cached
-                // state describes an attachment that no longer exists.
-                if (presenter != null) context.resetGLAll()
+                // GL-only housekeeping. The Vulkan path has no GL surface and
+                // no GL context on this thread, and calling into it aborts the
+                // JVM outright ("No context is current").
+                if (!vkGraphite) {
+                    recreateSurface()
+                    // The presenter deletes and recreates its texture and FBO
+                    // on a rebuild, and GL hands back the same ids -- so Skia's
+                    // cached state describes an attachment that no longer
+                    // exists.
+                    if (presenter != null) context.resetGLAll()
+                }
                 forceRepaint = true
                 // Pointer positions arrive in window coordinates but the
                 // scene works in framebuffer pixels; on a fractionally

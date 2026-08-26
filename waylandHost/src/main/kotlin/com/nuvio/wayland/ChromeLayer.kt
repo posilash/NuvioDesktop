@@ -355,7 +355,7 @@ class ChromeLayer(private val chrome: WpeChrome) {
 
         // Successor is bound, so the predecessor is safe to let go -- and its
         // import dies with it, since the buffer behind it goes back to WPE.
-        vkImage?.let { presenter.destroyChromeImage(it) }
+        vkImage?.let { presenter.retireChromeImage(it) }
         vkImage = imported
         displayedImage?.let { chrome.releaseImageAsync(it) }
         displayedImage = image

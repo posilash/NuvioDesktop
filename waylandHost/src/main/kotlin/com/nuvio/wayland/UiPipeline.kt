@@ -119,6 +119,7 @@ class UiPipeline(
     @Volatile var vk: VkPresenter? = null
     private var vkRecorder: org.jetbrains.skia.gpu.graphite.Recorder? = null
     private val vkBuffers = arrayOfNulls<VkPresenter.UiBuffer>(3)
+    private var vkVersion = 0L
     private var vkFront: VkPresenter.UiBuffer? = null
     private var vkDisplayed: VkPresenter.UiBuffer? = null
 
@@ -437,7 +438,10 @@ class UiPipeline(
         val composeNs = System.nanoTime() - t
         // Async on purpose: blocking here would stall the queue the video runs
         // on, and nothing downstream needs this finished before the next frame.
-        vkp.submitRecorder(rec)
+        // syncCpu here, on THIS thread: the copy below must see finished
+        // pixels, and blocking the scene thread costs the host nothing.
+        vkp.submitRecorder(rec, syncCpu = true)
+        vkp.copyToUiLayer(target.image, target.width, target.height)
 
         val elapsed = System.nanoTime() - t
         renders++
@@ -446,6 +450,7 @@ class UiPipeline(
         flushNanos += elapsed - composeNs
         if (elapsed > maxRenderNanos) maxRenderNanos = elapsed
 
+        target.version = ++vkVersion
         synchronized(lock) { vkFront = target }
         lastGeneration = target.generation
         onFrame?.invoke()

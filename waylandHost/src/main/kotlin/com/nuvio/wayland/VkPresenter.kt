@@ -126,8 +126,19 @@ class VkPresenter(private val window: Long) {
     val queueLock = java.util.concurrent.locks.ReentrantLock()
 
     /** Runs [block] holding [queueLock]. Every submission here goes through it. */
+    /**
+     * Guards submission to [queue]. ALWAYS locks.
+     *
+     * Splitting the queues took mpv off this one; it did not make us the only
+     * user of it. The host submits and presents here, and the scene thread
+     * submits its recordings here too. Skipping the lock when the queues were
+     * separate conflated "mpv is elsewhere" with "nobody else is here", and
+     * vkQueuePresentKHR raced a scene submit into a segfault.
+     *
+     * mpv keeps its own lock, or none: SharedDevice.queueLock is null when it
+     * has queue 0 to itself, and its own submits all come from one thread.
+     */
     private inline fun <T> withQueue(block: () -> T): T {
-        if (separateQueues) return block()
         queueLock.lock()
         try { return block() } finally { queueLock.unlock() }
     }
@@ -171,6 +182,7 @@ class VkPresenter(private val window: Long) {
 
     private var cmdPool = VK_NULL_HANDLE
     private var cmdBuf: VkCommandBuffer? = null
+    private var auxCmdBuf: VkCommandBuffer? = null
     private var submitFence = VK_NULL_HANDLE
     private var imageAvailable = VK_NULL_HANDLE
     // One per swapchain image, not one shared. The fence only says the command
@@ -427,6 +439,14 @@ class VkPresenter(private val window: Long) {
             val pb = s.mallocPointer(1)
             check(vkAllocateCommandBuffers(device, cbi, pb), "vkAllocateCommandBuffers")
             cmdBuf = VkCommandBuffer(pb.get(0), device)
+            // A second, for the one-shot work: layer copies, layout
+            // transitions, the pixel probe. They cannot share cmdBuf, because
+            // presentGraphite submits it with a fence and returns while it is
+            // still executing -- resetting it from another thread mid-flight
+            // clobbers the present's own commands, which is why frames landed
+            // intermittently rather than never.
+            check(vkAllocateCommandBuffers(device, cbi, pb), "vkAllocateCommandBuffers(aux)")
+            auxCmdBuf = VkCommandBuffer(pb.get(0), device)
 
             val sci = VkSemaphoreCreateInfo.calloc(s).sType(VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO)
             check(vkCreateSemaphore(device, sci, null, pl), "vkCreateSemaphore(imageAvailable)")
@@ -861,24 +881,29 @@ class VkPresenter(private val window: Long) {
     private var uiImage = VK_NULL_HANDLE
     private var uiMemory = VK_NULL_HANDLE
     private var uiSurface: org.jetbrains.skia.Surface? = null
-    private var uiSkiaImage: org.jetbrains.skia.Image? = null
 
     /** Canvas the scene draws into. Null until the layer exists. */
     fun uiLayerCanvas(): org.jetbrains.skia.Canvas? = uiSurface?.canvas
-
-    /** The layer as something the present can sample. */
-    fun uiLayerImage(): org.jetbrains.skia.Image? = uiSkiaImage
 
     /** One scene buffer: a VkImage Skia renders into and can also sample. */
     class UiBuffer(
         val image: Long,
         val memory: Long,
         val surface: org.jetbrains.skia.Surface,
-        val skia: org.jetbrains.skia.Image,
         val width: Int,
         val height: Int,
         val generation: Int,
-    )
+    ) {
+        /**
+         * Bumped by the scene thread on every render into this buffer.
+         *
+         * The wrap cache is keyed on it, not on [generation]: an SkImage over a
+         * texture is immutable as far as Skia is concerned, so a wrap cached
+         * for the life of the buffer shows whatever was in it the first time
+         * and never updates. That is a screen that draws once and then stops.
+         */
+        @Volatile var version: Long = 0L
+    }
 
     private var uiBufferGeneration = 0
 
@@ -919,6 +944,20 @@ class VkPresenter(private val window: Long) {
     }
 
     private val graphiteLock = java.util.concurrent.locks.ReentrantLock()
+
+    /**
+     * Guards [cmdBuf] and its pool. There is one command buffer, and both the
+     * host (presentGraphite) and the scene thread (transitionToGeneral, when it
+     * allocates a buffer) record into it. Vulkan requires external
+     * synchronisation for both, and without it this segfaults inside
+     * vkCmdPipelineBarrier.
+     */
+    private val cmdLock = java.util.concurrent.locks.ReentrantLock()
+
+    private inline fun <T> withCmd(block: () -> T): T {
+        cmdLock.lock()
+        try { return block() } finally { cmdLock.unlock() }
+    }
 
     /** Allocate a scene buffer for [rec]. Caller owns it until destroyUiBuffer. */
     fun createUiBuffer(
@@ -968,32 +1007,28 @@ class VkPresenter(private val window: Long) {
             imageLayout = VK_IMAGE_LAYOUT_GENERAL,
             queueFamilyIndex = queueFamily, imagePtr = image,
         )
+        // Only the surface here. The image the host samples is wrapped by the
+        // HOST's recorder, on the host's thread -- a Recorder belongs to one
+        // thread, and building it here (on the scene thread) is a cross-thread
+        // use that yields no scene at all.
         val surface = org.jetbrains.skia.Surface.wrapBackendTexture(rec, tex(), null, null)
-        // Wrapped for the HOST's recorder, because that is what samples it.
-        val hostRec = recorder
-        val skia = if (surface != null && hostRec != null) {
-            org.jetbrains.skia.Image.wrapBackendTexture(
-                recorder = hostRec,
-                backendTexture = tex(),
-                alphaType = org.jetbrains.skia.ColorAlphaType.PREMUL,
-                colorSpace = null,
-                originTopLeft = true,
-            )
-        } else {
-            null
-        }
-        if (surface == null || skia == null) {
-            surface?.close()
+        if (surface == null) {
             vkFreeMemory(device, memory, null)
             vkDestroyImage(device, image, null)
             return null
         }
-        return UiBuffer(image, memory, surface, skia, w, h, ++uiBufferGeneration)
+        return UiBuffer(image, memory, surface, w, h, ++uiBufferGeneration)
     }
 
     fun destroyUiBuffer(b: UiBuffer) {
-        vkDeviceWaitIdle(device)
-        b.skia.close()
+        // Our queue only: a device-wide wait would reach into mpv's as well,
+        // and needs every queue externally synchronised to be legal.
+        withQueue { vkQueueWaitIdle(queue) }
+        // uiImages is NOT touched here. This runs on the scene thread, and that
+        // map belongs to the host's -- a plain HashMap mutated from both is
+        // heap corruption ("malloc(): unaligned tcache chunk"). The host evicts
+        // by generation on its own, and can never be drawing this buffer: only
+        // one that is neither published nor displayed is ever destroyed.
         b.surface.close()
         vkFreeMemory(device, b.memory, null)
         vkDestroyImage(device, b.image, null)
@@ -1028,50 +1063,27 @@ class VkPresenter(private val window: Long) {
             check(vkBindImageMemory(device, uiImage, uiMemory, 0), "vkBindImageMemory(ui layer)")
             transitionToGeneral(uiImage)
         }
-        val info = org.jetbrains.skia.gpu.graphite.VulkanTextureInfo(
-            format = org.jetbrains.skia.gpu.graphite.VulkanFormat(swapFormat),
-            imageUsageFlags = org.jetbrains.skia.gpu.graphite.VulkanImageUsageFlags(
-                swapUsage or VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
-            ),
-        )
-        fun tex() = org.jetbrains.skia.gpu.graphite.BackendTexture.makeVulkan(
-            width = w, height = h, textureInfo = info,
-            imageLayout = VK_IMAGE_LAYOUT_GENERAL,
-            queueFamilyIndex = queueFamily, imagePtr = uiImage,
-        )
-        uiSurface = org.jetbrains.skia.Surface.wrapBackendTexture(rec, tex(), null, null)
-        // Same image wrapped a second time, to be read rather than written.
-        uiSkiaImage = org.jetbrains.skia.Image.wrapBackendTexture(
-            recorder = rec,
-            backendTexture = tex(),
-            alphaType = org.jetbrains.skia.ColorAlphaType.PREMUL,
-            colorSpace = null,
-            originTopLeft = true,
-        )
-        if (uiSurface == null || uiSkiaImage == null) {
-            System.err.println("vk-graphite: could not build the UI layer")
-        } else {
-            // Load-bearing: an opaque layer can never let the video through,
-            // whatever blend mode composites it.
-            println(
-                "vk-graphite: ui layer ${w}x$h alphaType=" +
-                    "${uiSurface!!.imageInfo.colorInfo.alphaType} " +
-                    "imageAlpha=${uiSkiaImage!!.imageInfo.colorInfo.alphaType}",
-            )
-        }
+        // No Surface over this image. It is a copy destination and a sampling
+        // source only -- the scene renders into its own buffers now. Wrapping
+        // one texture as both a render target and an image in the same recorder
+        // is a read-write hazard, and Graphite answers it by discarding the
+        // whole recording without a word.
     }
 
     private fun destroyUiLayer() {
-        uiSkiaImage?.close(); uiSkiaImage = null
+        uiImages.values.forEach { it.close() }
+        uiImages.clear()
+        uiLayerVersion = 0L
         uiSurface?.close(); uiSurface = null
         if (uiImage != VK_NULL_HANDLE) { vkDestroyImage(device, uiImage, null); uiImage = VK_NULL_HANDLE }
         if (uiMemory != VK_NULL_HANDLE) { vkFreeMemory(device, uiMemory, null); uiMemory = VK_NULL_HANDLE }
     }
 
     /** UNDEFINED -> GENERAL, once, for an image Skia will render into. */
-    private fun transitionToGeneral(image: Long) = withQueue {
+    private fun transitionToGeneral(image: Long) = withCmd {
+        withQueue {
         stackPush().use { s ->
-            val cb = cmdBuf ?: return@use
+            val cb = auxCmdBuf ?: return@use
             vkResetCommandBuffer(cb, 0)
             val bi = VkCommandBufferBeginInfo.calloc(s)
                 .sType(VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO)
@@ -1100,6 +1112,7 @@ class VkPresenter(private val window: Long) {
                 .pCommandBuffers(s.pointers(cb))
             vkQueueSubmit(queue, si, VK_NULL_HANDLE)
             vkQueueWaitIdle(queue)
+        }
         }
     }
 
@@ -1393,6 +1406,26 @@ class VkPresenter(private val window: Long) {
         }
     }
 
+    private var frameCounter = 0L
+    private val retiredChrome = ArrayDeque<Pair<Long, ChromeImage>>()
+
+    /**
+     * Hand back a chrome frame the successor replaced.
+     *
+     * Deferred, not destroyed: with an async submit the GPU may still be
+     * reading it. presentGraphite waits on the previous submit's fence, so
+     * three frames later it is certainly done.
+     */
+    fun retireChromeImage(c: ChromeImage) {
+        retiredChrome.addLast(frameCounter to c)
+    }
+
+    private fun drainRetiredChrome() {
+        while (retiredChrome.isNotEmpty() && frameCounter - retiredChrome.first().first > 3) {
+            destroyChromeImage(retiredChrome.removeFirst().second)
+        }
+    }
+
     fun destroyChromeImage(c: ChromeImage) {
         // No wait here on purpose. This is only ever called for the frame the
         // successor replaces, and [flushGraphite] submits with syncCpu, so the
@@ -1404,9 +1437,132 @@ class VkPresenter(private val window: Long) {
         vkDestroyImage(device, c.vkImage, null)
     }
 
-    /** The UI layer, 1:1 over the whole target. Plain source-over. */
-    fun drawUiLayer(canvas: org.jetbrains.skia.Canvas, image: org.jetbrains.skia.Image) {
-        canvas.drawImage(image, 0f, 0f)
+    /** Host thread only. See destroyUiBuffer for why that matters. */
+    private val uiImages = HashMap<Long, org.jetbrains.skia.Image>()
+
+    /**
+     * Draw a published scene buffer, 1:1 over the target.
+     *
+     * The wrap is built here, with the host's recorder, on the host's thread,
+     * and cached by generation exactly as the video wraps are.
+     */
+    @Volatile private var uiLayerVersion = 0L
+
+    /**
+     * Copy a finished scene buffer into the host's own layer image.
+     *
+     * A Graphite Image wrapped by one Recorder cannot be drawn by another: the
+     * draw does not fail, it discards the entire recording, so the frame comes
+     * out empty and every counter still reads healthy. Measured -- the scene
+     * buffer had content while the target was zero including alpha, and
+     * removing this one draw brought the target back.
+     *
+     * So the pixels cross by vkCmdCopyImage instead, into an image the host's
+     * recorder owns, and no texture is ever shared between recorders. One
+     * full-screen copy per published scene frame, on the scene's thread.
+     */
+    fun copyToUiLayer(src: Long, w: Int, h: Int): Boolean {
+        if (uiImage == VK_NULL_HANDLE) return false
+        if (w != swapWidth || h != swapHeight) return false
+        withCmd {
+            withQueue {
+                stackPush().use { s ->
+                    val cb = auxCmdBuf ?: return@use
+                    vkResetCommandBuffer(cb, 0)
+                    val bi = VkCommandBufferBeginInfo.calloc(s)
+                        .sType(VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO)
+                        .flags(VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT)
+                    vkBeginCommandBuffer(cb, bi)
+                    val region = org.lwjgl.vulkan.VkImageCopy.calloc(1, s)
+                    region.get(0).srcSubresource()
+                        .aspectMask(VK_IMAGE_ASPECT_COLOR_BIT)
+                        .mipLevel(0).baseArrayLayer(0).layerCount(1)
+                    region.get(0).dstSubresource()
+                        .aspectMask(VK_IMAGE_ASPECT_COLOR_BIT)
+                        .mipLevel(0).baseArrayLayer(0).layerCount(1)
+                    region.get(0).extent().set(w, h, 1)
+                    vkCmdCopyImage(
+                        cb, src, VK_IMAGE_LAYOUT_GENERAL,
+                        uiImage, VK_IMAGE_LAYOUT_GENERAL, region,
+                    )
+                    vkEndCommandBuffer(cb)
+                    val si = VkSubmitInfo.calloc(s)
+                        .sType(VK_STRUCTURE_TYPE_SUBMIT_INFO)
+                        .pCommandBuffers(s.pointers(cb))
+                    vkQueueSubmit(queue, si, VK_NULL_HANDLE)
+                    vkQueueWaitIdle(queue)
+                }
+            }
+        }
+        uiLayerVersion++
+        return true
+    }
+
+    /** Draw the newest scene pixels. The wrap is the host's, over the host's image. */
+    fun drawUiLayerLatest(canvas: org.jetbrains.skia.Canvas) {
+        val rec = recorder ?: run { uiNoRecorder++; return }
+        if (uiImage == VK_NULL_HANDLE || uiLayerVersion == 0L) return
+        val key = uiLayerVersion
+        val img = uiImages[key] ?: run {
+            val info = org.jetbrains.skia.gpu.graphite.VulkanTextureInfo(
+                format = org.jetbrains.skia.gpu.graphite.VulkanFormat(swapFormat),
+                imageUsageFlags = org.jetbrains.skia.gpu.graphite.VulkanImageUsageFlags(
+                    swapUsage or VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
+                ),
+            )
+            val tex = org.jetbrains.skia.gpu.graphite.BackendTexture.makeVulkan(
+                width = swapWidth, height = swapHeight, textureInfo = info,
+                imageLayout = VK_IMAGE_LAYOUT_GENERAL,
+                queueFamilyIndex = queueFamily, imagePtr = uiImage,
+            )
+            val made = org.jetbrains.skia.Image.wrapBackendTexture(
+                recorder = rec,
+                backendTexture = tex,
+                alphaType = org.jetbrains.skia.ColorAlphaType.PREMUL,
+                colorSpace = null,
+                originTopLeft = true,
+            ) ?: run { uiWrapFailed++; return }
+            uiImages.keys.filter { it < key - 2 }.forEach { uiImages.remove(it)?.close() }
+            uiImages[key] = made
+            made
+        }
+        canvas.drawImage(img, 0f, 0f)
+        uiDrawn++
+    }
+
+    var uiDrawn = 0L; private set
+    var uiWrapFailed = 0L; private set
+    var uiNoRecorder = 0L; private set
+
+    fun drawUiBuffer(canvas: org.jetbrains.skia.Canvas, b: UiBuffer) {
+        val rec = recorder ?: run { uiNoRecorder++; return }
+        val key = b.version
+        val img = uiImages[key] ?: run {
+            val info = org.jetbrains.skia.gpu.graphite.VulkanTextureInfo(
+                format = org.jetbrains.skia.gpu.graphite.VulkanFormat(swapFormat),
+                imageUsageFlags = org.jetbrains.skia.gpu.graphite.VulkanImageUsageFlags(
+                    swapUsage or VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
+                ),
+            )
+            val tex = org.jetbrains.skia.gpu.graphite.BackendTexture.makeVulkan(
+                width = b.width, height = b.height, textureInfo = info,
+                imageLayout = VK_IMAGE_LAYOUT_GENERAL,
+                queueFamilyIndex = queueFamily, imagePtr = b.image,
+            )
+            val made = org.jetbrains.skia.Image.wrapBackendTexture(
+                recorder = rec,
+                backendTexture = tex,
+                alphaType = org.jetbrains.skia.ColorAlphaType.PREMUL,
+                colorSpace = null,
+                originTopLeft = true,
+            ) ?: run { uiWrapFailed++; return }
+            uiImages.keys.filter { it < key - 3 }
+                .forEach { uiImages.remove(it)?.close() }
+            uiImages[key] = made
+            made
+        }
+        canvas.drawImage(img, 0f, 0f)
+        uiDrawn++
     }
 
     /** True once the layer exists and can actually carry transparency. */
@@ -1537,20 +1693,17 @@ class VkPresenter(private val window: Long) {
      * [presentGraphite], which touches only Vulkan and runs on the loop.
      */
     fun flushGraphite(waitSemaphore: Long = VK_NULL_HANDLE, signalSemaphore: Long = VK_NULL_HANDLE) {
-        val gc = graphiteContext ?: return
         val rec = recorder ?: return
         if (gTargetImage == VK_NULL_HANDLE) return
-        rec.snap().use { recording ->
-            gc.insertRecording(
-                org.jetbrains.skia.gpu.graphite.InsertRecordingInfo(
-                    recording = recording,
-                    waitSemaphores = backendSemaphores(waitSemaphore),
-                    signalSemaphores = backendSemaphores(signalSemaphore),
-                ),
-            )
-            // Skia submits inside here, to the queue mpv also uses.
-            withQueue { gc.submit(true) }
-        }
+        // Through the same lock the scene thread uses. Two recorders feed one
+        // Context, and Context::insertRecording is not thread-safe: leaving
+        // this call outside the lock lost the device (QueueSubmit -> -4) and
+        // took the driver down with it.
+        // NOT syncCpu. This submit waits on mpv's render-done semaphore, so
+        // syncing the CPU here blocks the host until mpv has rendered -- while
+        // holding the lock the scene thread needs, which starves it to 0
+        // frames. The present's own fence is what paces us.
+        submitRecorder(rec, waitSemaphore, signalSemaphore, syncCpu = false)
     }
 
     /**
@@ -1569,13 +1722,108 @@ class VkPresenter(private val window: Long) {
         )
     }
 
+    private var probeBuffer = VK_NULL_HANDLE
+    private var probeMemory = VK_NULL_HANDLE
+    private val probeTexels = 16
+
+    /**
+     * Read a few texels back out of the target, so "is anything actually on
+     * screen" is a measurement rather than a claim.
+     *
+     * Counters cannot answer it: every one of them can read healthy while the
+     * window is black. This copies a small patch of the image Skia just drew
+     * into host-visible memory and reports how much of it is non-zero.
+     */
+    fun sampleTarget(): String = sampleImage(gTargetImage, swapWidth, swapHeight)
+
+    /** Read a patch out of any GENERAL-layout image on this device. */
+    fun sampleImage(img: Long, iw: Int, ih: Int): String {
+        if (img == VK_NULL_HANDLE) return "none"
+        val bytes = probeTexels * 8L // worst case: 4x16-bit channels
+        if (probeBuffer == VK_NULL_HANDLE) {
+            stackPush().use { s ->
+                val bci = org.lwjgl.vulkan.VkBufferCreateInfo.calloc(s)
+                    .sType(VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO)
+                    .size(bytes)
+                    .usage(VK_BUFFER_USAGE_TRANSFER_DST_BIT)
+                    .sharingMode(VK_SHARING_MODE_EXCLUSIVE)
+                val pb = s.mallocLong(1)
+                if (vkCreateBuffer(device, bci, null, pb) != VK_SUCCESS) return "probe=nobuf"
+                probeBuffer = pb.get(0)
+                val mr = org.lwjgl.vulkan.VkMemoryRequirements.calloc(s)
+                vkGetBufferMemoryRequirements(device, probeBuffer, mr)
+                val ai = VkMemoryAllocateInfo.calloc(s)
+                    .sType(VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO)
+                    .allocationSize(mr.size())
+                    .memoryTypeIndex(
+                        findMemoryType(
+                            mr.memoryTypeBits(),
+                            VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT or VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                        ),
+                    )
+                if (vkAllocateMemory(device, ai, null, pb) != VK_SUCCESS) return "probe=nomem"
+                probeMemory = pb.get(0)
+                vkBindBufferMemory(device, probeBuffer, probeMemory, 0)
+            }
+        }
+        withCmd {
+            withQueue {
+                stackPush().use { s ->
+                    val cb = auxCmdBuf ?: return@use
+                    vkResetCommandBuffer(cb, 0)
+                    val bi = VkCommandBufferBeginInfo.calloc(s)
+                        .sType(VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO)
+                        .flags(VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT)
+                    vkBeginCommandBuffer(cb, bi)
+                    val region = org.lwjgl.vulkan.VkBufferImageCopy.calloc(1, s)
+                    region.get(0)
+                        .bufferOffset(0)
+                        .bufferRowLength(0)
+                        .bufferImageHeight(0)
+                    region.get(0).imageSubresource()
+                        .aspectMask(VK_IMAGE_ASPECT_COLOR_BIT)
+                        .mipLevel(0).baseArrayLayer(0).layerCount(1)
+                    region.get(0).imageOffset().set(iw / 2, ih / 2, 0)
+                    region.get(0).imageExtent().set(4, 4, 1)
+                    vkCmdCopyImageToBuffer(
+                        cb, img, VK_IMAGE_LAYOUT_GENERAL, probeBuffer, region,
+                    )
+                    vkEndCommandBuffer(cb)
+                    val si = VkSubmitInfo.calloc(s)
+                        .sType(VK_STRUCTURE_TYPE_SUBMIT_INFO)
+                        .pCommandBuffers(s.pointers(cb))
+                    vkQueueSubmit(queue, si, VK_NULL_HANDLE)
+                    vkQueueWaitIdle(queue)
+                }
+            }
+        }
+        val pp = org.lwjgl.system.MemoryUtil.memAllocPointer(1)
+        return try {
+            vkMapMemory(device, probeMemory, 0, bytes, 0, pp)
+            val buf = org.lwjgl.system.MemoryUtil.memByteBuffer(pp.get(0), bytes.toInt())
+            var nonZero = 0
+            val first = StringBuilder()
+            for (i in 0 until bytes.toInt()) {
+                val v = buf.get(i).toInt() and 0xFF
+                if (v != 0) nonZero++
+                if (i < 8) first.append("%02x".format(v))
+            }
+            vkUnmapMemory(device, probeMemory)
+            "centre: nonZero=$nonZero/$bytes first=$first"
+        } finally {
+            org.lwjgl.system.MemoryUtil.memFree(pp)
+        }
+    }
+
     /** Blit what Skia drew into a swapchain image and present it. */
     fun presentGraphite() {
         if (gTargetImage == VK_NULL_HANDLE) return
+        frameCounter++
+        drainRetiredChrome()
         // Skia's drawing runs first and on the same queue, so submission order
         // alone orders the blit after it. The lock is against mpv's render
         // thread, which submits to this same queue.
-        withQueue { stackPush().use { s ->
+        withCmd { withQueue { stackPush().use { s ->
             if (everSubmitted) vkWaitForFences(device, submitFence, true, Long.MAX_VALUE)
             val pi = s.mallocInt(1)
             val acquired = KHRSwapchain.vkAcquireNextImageKHR(
@@ -1673,7 +1921,7 @@ class VkPresenter(private val window: Long) {
             } else {
                 check(r, "vkQueuePresentKHR")
             }
-        } }
+        } } }
     }
 
     /**
