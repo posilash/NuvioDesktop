@@ -24,6 +24,8 @@ import com.nuvio.app.core.ui.LocalNuvioNavBarScrollState
 import com.nuvio.app.core.ui.NuvioClassicNavigationBar
 import com.nuvio.app.core.ui.NuvioNavigationBar
 import com.nuvio.app.core.ui.PlatformBackHandler
+import com.nuvio.app.core.ui.nuvioBackdropSource
+import com.nuvio.app.core.ui.rememberNuvioBackdropState
 import com.nuvio.app.core.ui.rememberNuvioNavBarScrollState
 import com.nuvio.app.features.profiles.NuvioProfile
 import com.nuvio.app.features.profiles.ProfileSwitcherTab
@@ -88,6 +90,7 @@ internal fun MainTabsDestination(
         val tabsRouteActiveState = rememberUpdatedState(rootRouteActive)
         val navBarScrollState = rememberNuvioNavBarScrollState()
         val navBarHazeState = rememberHazeState()
+        val navBarBackdrop = rememberNuvioBackdropState()
         val navBarStyleSetting by remember { ThemeSettingsRepository.navBarStyle }.collectAsStateWithLifecycle()
 
         Scaffold(
@@ -148,6 +151,13 @@ internal fun MainTabsDestination(
                         modifier = Modifier
                             .fillMaxSize()
                             .then(if (navBarStyleSetting != NavBarStyle.CLASSIC) Modifier.hazeSource(state = navBarHazeState) else Modifier)
+                            .then(
+                                if (isDesktop && navBarStyleSetting != NavBarStyle.CLASSIC) {
+                                    Modifier.nuvioBackdropSource(navBarBackdrop)
+                                } else {
+                                    Modifier
+                                },
+                            )
                             .then(if (navBarStyleSetting == NavBarStyle.ADAPTIVE) Modifier.nestedScroll(navBarScrollState.nestedScrollConnection) else Modifier)
                             .padding(innerPadding)
                             .padding(start = if (useDesktopSidebar) DesktopSidebarCollapsedWidth else 0.dp),
@@ -183,6 +193,7 @@ internal fun MainTabsDestination(
                         modifier = Modifier.align(Alignment.BottomCenter),
                         scrollState = navBarScrollState,
                         hazeState = navBarHazeState,
+                        backdrop = navBarBackdrop,
                     ) {
                         NavItem(
                             selected = selectedTab == AppScreenTab.Home,

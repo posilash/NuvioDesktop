@@ -114,6 +114,7 @@ fun NuvioNavigationBar(
     modifier: Modifier = Modifier,
     scrollState: NuvioNavBarScrollState? = null,
     hazeState: HazeState? = null,
+    backdrop: NuvioBackdropState? = null,
     content: @Composable NuvioNavigationBarScope.() -> Unit,
 ) {
     val labelFraction by animateFloatAsState(
@@ -146,9 +147,14 @@ fun NuvioNavigationBar(
             .fillMaxWidth()
             .clip(RoundedCornerShape(NuvioTokens.Radius.full))
             .then(
-                if (hazeState != null) {
+                if (isDesktop && backdrop != null) {
+                    Modifier.nuvioBackdropEffect(
+                        state = backdrop,
+                        blurRadius = 24.dp,
+                        tint = Color.Transparent,
+                    )
+                } else if (hazeState != null && !isDesktop) {
                     Modifier.hazeEffect(state = hazeState) {
-                        blurEnabled = !isDesktop
                         blurRadius = 24.dp
                     }
                 } else {
@@ -157,9 +163,7 @@ fun NuvioNavigationBar(
             )
             .background(
                 Color(0xFF1C1C1E).copy(
-                    // The translucent value assumes a blur behind it; without one
-                    // the pill has to carry the contrast itself.
-                    alpha = if (hazeState != null && !isDesktop) 0.55f else 0.82f,
+                    alpha = if (hazeState != null || backdrop != null) 0.55f else 0.82f,
                 ),
             )
 

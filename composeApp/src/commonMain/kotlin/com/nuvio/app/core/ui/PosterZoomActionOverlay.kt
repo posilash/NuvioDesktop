@@ -165,6 +165,7 @@ fun NuvioPosterZoomActionOverlay(
     anchor: PosterZoomAnchor?,
     actions: List<PosterZoomOverlayAction>,
     hazeState: HazeState,
+    backdrop: NuvioBackdropState? = null,
     onDismissed: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
@@ -261,12 +262,14 @@ fun NuvioPosterZoomActionOverlay(
         Box(
             modifier = Modifier
                 .fillMaxSize()
-                // With no blur there is nothing behind the overlay to darken
-                // the page, so the scrim has to be drawn.
                 .then(
-                    if (isDesktop) {
-                        Modifier.background(
-                            Color.Black.copy(alpha = (scrim.value * 0.75f).coerceIn(0f, 1f)),
+                    if (isDesktop && backdrop != null) {
+                        Modifier.nuvioBackdropEffect(
+                            state = backdrop,
+                            blurRadius = 36.dp,
+                            tint = Color.Black.copy(
+                                alpha = (scrim.value * 0.35f).coerceIn(0f, 1f),
+                            ),
                         )
                     } else {
                         Modifier
