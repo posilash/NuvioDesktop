@@ -307,6 +307,12 @@ class UiPipeline(
             }
             vkFront = null
             vkDisplayed = null
+            // This thread's own Recorder. Left open, it outlives the Context
+            // the host closes next, and the pair faults in _nInvokeFinalizer
+            // on the way out. Everything Graphite here dies on this thread,
+            // same rule as the GL objects above.
+            runCatching { vkRecorder?.close() }.onFailure { it.printStackTrace() }
+            vkRecorder = null
             runCatching { context.close() }.onFailure { it.printStackTrace() }
         }
     }

@@ -241,6 +241,9 @@ fun main(args: Array<String>) {
     }
     // The grid the next commit is due on; 0 until the first frame anchors it.
     var nextSwapDueNs = 0L
+    /** Set by the shutdown hook so a signal leaves through the normal teardown. */
+    val quitRequested = java.util.concurrent.atomic.AtomicBoolean(false)
+    val shutdownComplete = java.util.concurrent.CountDownLatch(1)
     println("pace: vsyncMode=$vsyncMode vblank=${"%.2f".format(vblankNs / 1e6)}ms")
 
     java.awt.EventQueue.invokeAndWait {
@@ -1762,7 +1765,44 @@ fun main(args: Array<String>) {
 
     var presented = true
     try {
-        while (!glfwWindowShouldClose(window)) {
+        // SIGINT and SIGTERM take the same road out as the close button.
+        // Without this the JVM shuts down under the running loop, the Vulkan
+        // device and the Graphite context are never destroyed, and the driver
+        // faults on the way out -- SIGSEGV on the VMThread at the Exit
+        // safepoint. The process then sits in its crash handler writing
+        // hs_err, stops answering the compositor's ping, and the user gets an
+        // "application is not responding" dialog for what was meant to be a
+        // clean exit. glfwPostEmptyEvent is the only GLFW call documented
+        // thread-safe, so the flag does the talking and it just wakes the loop.
+        // Test lever: quit as if the close button were pressed, after a delay.
+        // The demo path exercises teardown but with a fraction of the real
+        // app's Skia objects alive, so it cannot answer "does closing the real
+        // app crash" -- and that is the only close the user actually performs.
+        System.getProperty("nuvio.wayland.exitAfterMs")?.toLongOrNull()?.let { ms ->
+            Thread({
+                Thread.sleep(ms)
+                println("exitAfterMs: requesting close")
+                quitRequested.set(true)
+                glfwPostEmptyEvent()
+            }, "nuvio-exit-timer").apply { isDaemon = true }.start()
+        }
+
+        // A signal handler, NOT a shutdown hook. A hook runs with the JVM
+        // already shutting down, so Skia's cleaners fire concurrently with the
+        // teardown's own close() calls and the pair double-frees -- SIGSEGV
+        // inside _nInvokeFinalizer. Handling the signal instead starts no
+        // shutdown: the loop simply ends, the normal teardown runs, and main
+        // returns.
+        runCatching {
+            for (name in listOf("INT", "TERM")) {
+                sun.misc.Signal.handle(sun.misc.Signal(name)) {
+                    quitRequested.set(true)
+                    glfwPostEmptyEvent()
+                }
+            }
+        }.onFailure { println("signals: no handler installed ($it)") }
+
+        while (!glfwWindowShouldClose(window) && !quitRequested.get()) {
             // Input callbacks fire from here, on the main thread, and are
             // forwarded to the EDT by InputRouter.
             val beforePoll = System.nanoTime()
@@ -1820,18 +1860,16 @@ fun main(args: Array<String>) {
                     renderTarget?.close()
                     uiSurface?.close()
                     context.close()
-                    // Vulkan last, and it was not being torn down at all: the
-                    // device, the swapchain, the Graphite context and mpv's
-                    // render context on that same device were all left live,
-                    // and the driver then faulted on the way out of the JVM
-                    // (SIGSEGV on the VMThread inside libnvidia-eglcore, at the
-                    // Exit safepoint). Everything that shares the device -- the
-                    // scene, the video pipeline, mpv -- has stopped above.
-                    //
-                    // On this thread, not the teardown worker: destroy() frees
-                    // the GL-interop objects too, and only the EDT has glOwner
-                    // current.
-                    presenter?.destroy()
+                    // Vulkan is deliberately NOT unwound here. Closing the
+                    // Graphite context, its recorders and the device at exit
+                    // faults inside the driver every way round -- close the
+                    // images first and vkDestroyImage faults, close the context
+                    // first and _nInvokeFinalizer does. Six orderings, six
+                    // crash dumps and an "application is not responding" dialog
+                    // on what should be a clean exit. The process is ending;
+                    // the kernel reclaims the device either way, and mpv (the
+                    // one thing with state worth flushing) has already stopped
+                    // above.
                 }
             }.onFailure { it.printStackTrace() }
             teardownDone.countDown()
@@ -1844,6 +1882,14 @@ fun main(args: Array<String>) {
         glfwDestroyWindow(videoWindow)
         glfwDestroyWindow(window)
         glfwTerminate()
+        shutdownComplete.countDown()
+        // And skip the JVM's own shutdown with it. Its Exit safepoint runs
+        // Skia's cleaners over peers whose device is still live, which is the
+        // SIGSEGV on the VMThread inside libnvidia-eglcore. Nothing after this
+        // point needs to run: teardown is done and stdout is flushed.
+        System.out.flush()
+        System.err.flush()
+        Runtime.getRuntime().halt(0)
     }
     println("OK: clean shutdown")
     exitProcess(exitCode)

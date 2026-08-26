@@ -1071,7 +1071,11 @@ class VkPresenter(private val window: Long) {
     }
 
     private fun destroyUiLayer() {
-        uiImages.values.forEach { it.close() }
+        // The wraps are NOT closed one by one. Skia reports them open, and
+        // closing them anyway segfaults in _nInvokeFinalizer during teardown --
+        // the Graphite context owns these resources and releases them when it
+        // closes, which is the only ordering that survives. Dropping the
+        // references is enough; nothing else here reads them again.
         uiImages.clear()
         uiLayerVersion = 0L
         uiSurface?.close(); uiSurface = null
@@ -1970,6 +1974,19 @@ class VkPresenter(private val window: Long) {
         if (targetMemory != VK_NULL_HANDLE) { vkFreeMemory(device, targetMemory, null); targetMemory = VK_NULL_HANDLE }
     }
 
+    /**
+     * Close a Skia peer without letting it take the process down.
+     *
+     * Only for teardown. Managed.close() on an already-freed peer segfaults
+     * inside _nInvokeFinalizer, and on the way out that turns a clean exit into
+     * a crash dump and an "application is not responding" dialog. Ordering is
+     * still the real fix; this is the seatbelt.
+     */
+    private fun closeQuietly(m: org.jetbrains.skia.impl.Managed?) {
+        if (m == null || m.isClosed) return
+        runCatching { m.close() }.onFailure { it.printStackTrace() }
+    }
+
     fun destroy() {
         vkDeviceWaitIdle(device)
         // Skia first. The Graphite context owns images, semaphores and device
@@ -1979,17 +1996,38 @@ class VkPresenter(private val window: Long) {
         // Guarded: a fault while shutting down should not become a crash the
         // user sees instead of the window closing.
         runCatching {
-            retiredChrome.forEach { destroyChromeImage(it.second) }
+            // Strict order, and it is not the runtime one -- destroying a
+            // VkImage Skia still references faults in vkDestroyImage, and
+            // closing an image after its context faults in _nInvokeFinalizer.
+            // So: Skia surfaces, then the context that owns everything else,
+            // and only then the Vulkan memory underneath.
             retiredChrome.clear()
-            videoImages.values.forEach { it.close() }
             videoImages.clear()
-            wrappedSemaphores.values.forEach { it.close() }
             wrappedSemaphores.clear()
-            destroyGraphiteTarget()
-            recorder?.close()
+            closeQuietly(gSurface)
+            gSurface = null
+            closeQuietly(uiSurface)
+            uiSurface = null
+            uiImages.clear()
+            uiLayerVersion = 0L
+            closeQuietly(recorder)
             recorder = null
-            graphiteContext?.close()
+            closeQuietly(graphiteContext)
             graphiteContext = null
+
+            vkDeviceWaitIdle(device)
+            if (uiImage != VK_NULL_HANDLE) {
+                vkDestroyImage(device, uiImage, null); uiImage = VK_NULL_HANDLE
+            }
+            if (uiMemory != VK_NULL_HANDLE) {
+                vkFreeMemory(device, uiMemory, null); uiMemory = VK_NULL_HANDLE
+            }
+            if (gTargetImage != VK_NULL_HANDLE) {
+                vkDestroyImage(device, gTargetImage, null); gTargetImage = VK_NULL_HANDLE
+            }
+            if (gTargetMemory != VK_NULL_HANDLE) {
+                vkFreeMemory(device, gTargetMemory, null); gTargetMemory = VK_NULL_HANDLE
+            }
         }.onFailure { it.printStackTrace() }
         vkDeviceWaitIdle(device)
         destroyTarget()
