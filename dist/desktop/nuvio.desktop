@@ -7,5 +7,5 @@ Icon=nuvio
 Categories=AudioVideo;Player;
 Terminal=false
 StartupNotify=true
-StartupWMClass=com-nuvio-app-MainKt
+StartupWMClass=nuvio
 MimeType=x-scheme-handler/nuvio;x-scheme-handler/stremio;

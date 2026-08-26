@@ -100,6 +100,9 @@ private fun sampleFramebuffer(width: Int, height: Int): String {
  * scene, and -Dnuvio.wayland.realApp=false still does too, since every script
  * and note from this port passes realApp explicitly.
  */
+/** Desktop identity. Must match the installed nuvio.desktop, or nothing matches. */
+private const val APP_ID = "nuvio"
+
 private fun runRealApp(): Boolean {
     if (System.getProperty("nuvio.wayland.harness")?.toBoolean() == true) return false
     return System.getProperty("nuvio.wayland.realApp")?.toBoolean() ?: true
@@ -145,7 +148,20 @@ fun main(args: Array<String>) {
     glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_CORE_PROFILE)
     glfwWindowHint(GLFW_VISIBLE, GLFW_TRUE)
 
-    val window = glfwCreateWindow(INITIAL_WIDTH, INITIAL_HEIGHT, "Nuvio Wayland host", NULL, NULL)
+    // How the desktop identifies this window, and the reason it was showing a
+    // Java icon and no class: on Wayland the identity is the xdg-toplevel
+    // app_id, GLFW only sends one if asked, and a compositor with nothing to
+    // match falls back to the window title and a generic icon. It has to equal
+    // the .desktop basename -- nuvio.desktop, per the PKGBUILD -- or the match
+    // still fails. The X11 pair is the same thing for the XWayland fallback,
+    // where it becomes WM_CLASS.
+    glfwWindowHintString(GLFW_WAYLAND_APP_ID, APP_ID)
+    glfwWindowHintString(GLFW_X11_CLASS_NAME, APP_ID)
+    glfwWindowHintString(GLFW_X11_INSTANCE_NAME, APP_ID)
+
+    // The title is what the user sees in a task switcher, so it is the product
+    // name, not the name of this executable.
+    val window = glfwCreateWindow(INITIAL_WIDTH, INITIAL_HEIGHT, "Nuvio", NULL, NULL)
     if (window == NULL) {
         glfwTerminate()
         error("glfwCreateWindow failed")
