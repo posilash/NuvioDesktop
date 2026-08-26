@@ -31,6 +31,9 @@ dependencyResolutionManagement {
                 includeGroupAndSubgroups("com.google")
             }
         }
+        // The locally built Skiko: Graphite drops SkDrawables, so RenderNode --
+        // and therefore every Compose layer -- draws nothing without the patch.
+        mavenLocal { mavenContent { includeGroupAndSubgroups("org.jetbrains.skiko") } }
         mavenCentral()
         // Compose dev builds and the Skiko they pin: 1.12.10-alpha01+dev4686 is
         // the first on skiko 0.152.x, whose Linux binary is the only one built

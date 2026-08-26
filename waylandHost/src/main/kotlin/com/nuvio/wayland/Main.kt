@@ -1010,18 +1010,7 @@ fun main(args: Array<String>) {
                 if (scene.density.density != sc) scene.density = Density(sc)
                 input.scale = sc
             }
-            canvas.clear(0xFF102030.toInt())
-            if (frames % 120L == 0L) {
-                println(
-                    "vk-graphite: canvas=${presenter.width}x${presenter.height} " +
-                        "sceneSize=${scene.size} pendingDraw=${scene.hasPendingDraw}",
-                )
-            }
-            // Skia-side proof that the path paints: independent of Compose.
-            org.jetbrains.skia.Paint().use { p ->
-                p.color = 0xFFFF0000.toInt()
-                canvas.drawRect(org.jetbrains.skia.Rect.makeXYWH(20f, 20f, 200f, 120f), p)
-            }
+            canvas.clear(0xFF000000.toInt())
             sceneRecomposer.performFrame(System.nanoTime())
             scene.draw(canvas.asComposeCanvas())
             presenter.endFrameGraphite()

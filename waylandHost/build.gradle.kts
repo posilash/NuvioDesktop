@@ -75,8 +75,9 @@ dependencies {
 
     // Skia's Vulkan backend. Only the graphite variant's Linux binary is built
     // with Vulkan; the base skiko one is not, which is why this is separate.
-    implementation("org.jetbrains.skiko:skiko-graphite-awt:0.152.0-alpha02")
-    runtimeOnly("org.jetbrains.skiko:skiko-graphite-awt-runtime-linux-x64:0.152.0-alpha02")
+    implementation("org.jetbrains.skiko:skiko-graphite-awt:0.152.0-alpha02-nuvio1-SNAPSHOT")
+    runtimeOnly("org.jetbrains.skiko:skiko-graphite-awt-runtime-linux-x64:0.152.0-alpha02-nuvio1-SNAPSHOT")
+    runtimeOnly("org.jetbrains.skiko:skiko-awt-runtime-linux-x64:0.152.0-alpha02-nuvio1-SNAPSHOT")
     runtimeOnly("org.lwjgl:lwjgl:$lwjglVersion:natives-linux")
     runtimeOnly("org.lwjgl:lwjgl-glfw:$lwjglVersion:natives-linux")
     runtimeOnly("org.lwjgl:lwjgl-opengl:$lwjglVersion:natives-linux")
