@@ -405,11 +405,18 @@ fun main(args: Array<String>) {
         // with -Pnuvio.wayland.vk=true when working on that path.
         val useVk = System.getProperty("nuvio.wayland.vk")?.toBoolean() == true
         pipeline = when {
-            useVk ->
+            useVk || vkGraphite ->
                 // mpv renders with Vulkan -- the API the user's reference
-                // build runs -- with zero-copy nvdec; the scene imports the
-                // exported images into GL. See VkGlDisplayPipeline.
-                VkGlDisplayPipeline(VideoPipelineVk(mpv!!))
+                // build runs -- with zero-copy nvdec. Under vkGraphite it
+                // renders on the presenter's own device, so its frames, the
+                // scene and the swapchain share one VkDevice and nothing is
+                // exported anywhere; otherwise the scene imports the exported
+                // images into GL. See VkGlDisplayPipeline.
+                VkGlDisplayPipeline(
+                    VideoPipelineVk(mpv!!).apply {
+                        if (vkGraphite) sharedDevice = presenter?.sharedDevice()
+                    },
+                )
             Mpv.pacedMode ->
                 // The blocking-paced model needs its own thread.
                 VideoPipeline(mpv!!, videoWindow)

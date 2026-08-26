@@ -101,6 +101,27 @@ import org.lwjgl.vulkan.VkSubmitInfo
  */
 class VideoPipelineVk(private val mpv: Mpv) {
 
+    /**
+     * Render on someone else's device instead of creating one.
+     *
+     * Set before [start] to share the presenter's device, so mpv's frames, the
+     * scene Skia draws and the swapchain all live on one VkDevice and nothing
+     * has to be exported and imported between them. The device must already
+     * carry the feature chain and extensions mpv needs, which is why the
+     * presenter creates it with them.
+     */
+    class SharedDevice(
+        val instance: VkInstance,
+        val physicalDevice: VkPhysicalDevice,
+        val device: VkDevice,
+        val queue: VkQueue,
+        val queueFamily: Int,
+        val featuresChain: Long,
+        val extensions: List<String>,
+    )
+
+    var sharedDevice: SharedDevice? = null
+
     companion object {
         /** VK_FORMAT_R8G8B8A8_UNORM: what GL_RGBA8 imports as, both ways. */
         val FORMAT = VK_FORMAT_R8G8B8A8_UNORM
@@ -313,8 +334,8 @@ class VideoPipelineVk(private val mpv: Mpv) {
                 // through.
                 getInstanceProcAddr = VK.getFunctionProvider()
                     .getFunctionAddress("vkGetInstanceProcAddr"),
-                features = features2!!.address(),
-                extensions = DEVICE_EXTENSIONS,
+                features = sharedDevice?.featuresChain ?: features2!!.address(),
+                extensions = sharedDevice?.extensions ?: DEVICE_EXTENSIONS,
                 queueFamily = queueFamily,
             )
             val self = Thread.currentThread()
@@ -506,6 +527,25 @@ class VideoPipelineVk(private val mpv: Mpv) {
     }
 
     private fun initVulkan() {
+        sharedDevice?.let { shared ->
+            instance = shared.instance
+            physicalDevice = shared.physicalDevice
+            device = shared.device
+            queue = shared.queue
+            queueFamily = shared.queueFamily
+            stackPush().use { s ->
+                val props = VkPhysicalDeviceProperties.calloc(s)
+                vkGetPhysicalDeviceProperties(physicalDevice, props)
+                deviceName = props.deviceNameString()
+                val fci = VkFenceCreateInfo.calloc(s)
+                    .sType(VK_STRUCTURE_TYPE_FENCE_CREATE_INFO)
+                val pf = s.mallocLong(1)
+                vkCheck(vkCreateFence(device, fci, null, pf), "vkCreateFence")
+                drainFence = pf.get(0)
+            }
+            println("[wayland-video] vk: sharing the presenter's device ($deviceName)")
+            return
+        }
         stackPush().use { s ->
             // Instance: 1.3, no layers, no instance extensions -- headless,
             // and mpv/libplacebo need nothing beyond the loader entry point.

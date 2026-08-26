@@ -84,6 +84,30 @@ class VkPresenter(private val window: Long) {
         private const val GL_LAYOUT_TRANSFER_SRC_EXT = 0x9592
     }
 
+    // mpv, through libplacebo, will not create a render context on a device
+    // without these. The device is shared with it and with Skia, so it has to
+    // satisfy the strictest of the three; heap-allocated because mpv holds the
+    // pointer for the life of its render context.
+    private var f13: org.lwjgl.vulkan.VkPhysicalDeviceVulkan13Features? = null
+    private var f12: org.lwjgl.vulkan.VkPhysicalDeviceVulkan12Features? = null
+    private var f11: org.lwjgl.vulkan.VkPhysicalDeviceVulkan11Features? = null
+    private var features2: org.lwjgl.vulkan.VkPhysicalDeviceFeatures2? = null
+
+    /** The device, for mpv to render on instead of creating its own. */
+    fun sharedDevice() = VideoPipelineVk.SharedDevice(
+        instance = instance,
+        physicalDevice = physicalDevice,
+        device = device,
+        queue = queue,
+        queueFamily = queueFamily,
+        featuresChain = features2!!.address(),
+        extensions = DEVICE_EXTENSIONS,
+    )
+
+    /** Handles for whoever else renders on this device -- mpv and Skia. */
+    val featuresChain: Long get() = features2?.address() ?: 0L
+    val deviceExtensions: List<String> get() = DEVICE_EXTENSIONS
+
     private lateinit var instance: VkInstance
     private lateinit var physicalDevice: VkPhysicalDevice
     private lateinit var device: VkDevice
@@ -215,9 +239,12 @@ class VkPresenter(private val window: Long) {
             vkGetPhysicalDeviceQueueFamilyProperties(physicalDevice, qc, null)
             val qprops = VkQueueFamilyProperties.calloc(qc.get(0), s)
             vkGetPhysicalDeviceQueueFamilyProperties(physicalDevice, qc, qprops)
+            // Graphics AND compute: mpv wants all three kinds from one family,
+            // and this device is shared with it.
             queueFamily = (0 until qc.get(0)).firstOrNull {
-                qprops.get(it).queueFlags() and VK_QUEUE_GRAPHICS_BIT != 0
-            } ?: error("no graphics queue family")
+                val f = qprops.get(it).queueFlags()
+                f and VK_QUEUE_GRAPHICS_BIT != 0 && f and VK_QUEUE_COMPUTE_BIT != 0
+            } ?: error("no graphics+compute queue family")
 
             val extCount = s.mallocInt(1)
             check(
@@ -236,6 +263,35 @@ class VkPresenter(private val window: Long) {
                 eprops.free()
             }
 
+            f13 = org.lwjgl.vulkan.VkPhysicalDeviceVulkan13Features.calloc()
+                .sType(org.lwjgl.vulkan.VK13.VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES)
+                .synchronization2(true)
+                .dynamicRendering(true)
+                .maintenance4(true)
+            f12 = org.lwjgl.vulkan.VkPhysicalDeviceVulkan12Features.calloc()
+                .sType(org.lwjgl.vulkan.VK12.VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES)
+                .pNext(f13!!.address())
+                .hostQueryReset(true)
+                .timelineSemaphore(true)
+                .bufferDeviceAddress(true)
+                .descriptorIndexing(true)
+                .uniformBufferStandardLayout(true)
+                .shaderSubgroupExtendedTypes(true)
+                .vulkanMemoryModel(true)
+                .vulkanMemoryModelDeviceScope(true)
+            f11 = org.lwjgl.vulkan.VkPhysicalDeviceVulkan11Features.calloc()
+                .sType(org.lwjgl.vulkan.VK12.VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES)
+                .pNext(f12!!.address())
+                .samplerYcbcrConversion(true)
+                .storageBuffer16BitAccess(true)
+            features2 = org.lwjgl.vulkan.VkPhysicalDeviceFeatures2.calloc()
+                .sType(org.lwjgl.vulkan.VK11.VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2)
+                .pNext(f11!!.address())
+            features2!!.features()
+                .shaderImageGatherExtended(true)
+                .shaderStorageImageReadWithoutFormat(true)
+                .shaderStorageImageWriteWithoutFormat(true)
+
             val qci = VkDeviceQueueCreateInfo.calloc(1, s)
             qci.get(0)
                 .sType(VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO)
@@ -246,6 +302,7 @@ class VkPresenter(private val window: Long) {
             extNames.flip()
             val dci = VkDeviceCreateInfo.calloc(s)
                 .sType(VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO)
+                .pNext(features2!!.address())
                 .pQueueCreateInfos(qci)
                 .ppEnabledExtensionNames(extNames)
             val pd = s.mallocPointer(1)
