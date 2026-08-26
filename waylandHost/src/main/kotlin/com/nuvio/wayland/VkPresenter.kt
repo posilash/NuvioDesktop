@@ -1972,6 +1972,26 @@ class VkPresenter(private val window: Long) {
 
     fun destroy() {
         vkDeviceWaitIdle(device)
+        // Skia first. The Graphite context owns images, semaphores and device
+        // memory here, and destroying the device out from under it faults in
+        // the driver on the way out -- it surfaced as a SIGSEGV in
+        // vkDestroySemaphore, which reads like a Vulkan bug and is not one.
+        // Guarded: a fault while shutting down should not become a crash the
+        // user sees instead of the window closing.
+        runCatching {
+            retiredChrome.forEach { destroyChromeImage(it.second) }
+            retiredChrome.clear()
+            videoImages.values.forEach { it.close() }
+            videoImages.clear()
+            wrappedSemaphores.values.forEach { it.close() }
+            wrappedSemaphores.clear()
+            destroyGraphiteTarget()
+            recorder?.close()
+            recorder = null
+            graphiteContext?.close()
+            graphiteContext = null
+        }.onFailure { it.printStackTrace() }
+        vkDeviceWaitIdle(device)
         destroyTarget()
         if (swapchain != VK_NULL_HANDLE) KHRSwapchain.vkDestroySwapchainKHR(device, swapchain, null)
         if (submitFence != VK_NULL_HANDLE) vkDestroyFence(device, submitFence, null)

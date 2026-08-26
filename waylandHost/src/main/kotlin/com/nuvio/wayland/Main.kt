@@ -141,9 +141,12 @@ fun main(args: Array<String>) {
     println("GLFW platform: $platformName")
 
     // A Vulkan surface needs the window to have no client API: one wl_surface
-    // has one buffer producer, and GLFW's EGL surface would be it. The scene
-    // still renders with GL, from a context of its own -- see glOwner below.
-    val vkSwapchain = System.getProperty("nuvio.wayland.vkSwapchain")?.toBoolean() == true
+    // has one buffer producer, and GLFW's EGL surface would be it.
+    //
+    // On by default on this branch: the Vulkan path is what it is for.
+    // -Pnuvio.wayland.vkSwapchain=false goes back to the GL swapchain, which
+    // stays supported -- render-api-wayland is the same host on GL.
+    val vkSwapchain = System.getProperty("nuvio.wayland.vkSwapchain")?.toBoolean() ?: true
 
     glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 3)
     glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 3)
@@ -244,7 +247,12 @@ fun main(args: Array<String>) {
     // Skia's Vulkan backend, on the presenter's own device: the point of the
     // whole exercise is one device shared by mpv, Skia and the swapchain, with
     // no GL in between.
-    val vkGraphite = System.getProperty("nuvio.wayland.vkGraphite")?.toBoolean() == true
+    //
+    // Requires the Vulkan swapchain, and says so rather than trusting the two
+    // flags to agree: Graphite with no presenter renders nothing at all, so
+    // -Pnuvio.wayland.vkSwapchain=false has to take Skia back to GL with it.
+    val vkGraphite = (System.getProperty("nuvio.wayland.vkGraphite")?.toBoolean() ?: true) &&
+        vkSwapchain
     if (presenter != null) {
         java.awt.EventQueue.invokeAndWait {
             val fw = IntArray(1); val fh = IntArray(1)
@@ -395,14 +403,11 @@ fun main(args: Array<String>) {
                 requestLogMessages("v")
             }
         }
-        // Vulkan by default -- the user's reference build runs Vulkan for a
-        // reason, and with the usage-bit and lifetime fixes it measures
-        // 1.4-1.9ms renders with zero-copy nvdec. -Pnuvio.wayland.vk=false
-        // selects the GL sample-at-present pipeline for A/B.
-        // GL by default. Vulkan renders mpv fine (and gets zero-copy nvdec
-        // from the fork), but it can only reach a GL/Skia window through an
-        // interop handoff whose corruption showed up as flicker -- opt in
-        // with -Pnuvio.wayland.vk=true when working on that path.
+        // Only matters when Graphite is off: vkGraphite already puts mpv on
+        // the presenter's device, and that is the arrangement this branch
+        // ships. On the GL swapchain, mpv's Vulkan frames can only reach a
+        // GL/Skia window through an interop handoff whose corruption showed up
+        // as flicker, so there it stays opt-in with -Pnuvio.wayland.vk=true.
         val useVk = System.getProperty("nuvio.wayland.vk")?.toBoolean() == true
         pipeline = when {
             useVk || vkGraphite ->
@@ -1799,6 +1804,18 @@ fun main(args: Array<String>) {
                     renderTarget?.close()
                     uiSurface?.close()
                     context.close()
+                    // Vulkan last, and it was not being torn down at all: the
+                    // device, the swapchain, the Graphite context and mpv's
+                    // render context on that same device were all left live,
+                    // and the driver then faulted on the way out of the JVM
+                    // (SIGSEGV on the VMThread inside libnvidia-eglcore, at the
+                    // Exit safepoint). Everything that shares the device -- the
+                    // scene, the video pipeline, mpv -- has stopped above.
+                    //
+                    // On this thread, not the teardown worker: destroy() frees
+                    // the GL-interop objects too, and only the EDT has glOwner
+                    // current.
+                    presenter?.destroy()
                 }
             }.onFailure { it.printStackTrace() }
             teardownDone.countDown()

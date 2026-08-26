@@ -297,6 +297,16 @@ class UiPipeline(
                 if (frontFence != 0L) { GL32.glDeleteSync(frontFence); frontFence = 0L }
             }
             for (b in buffers) releaseBuffer(b)
+            // The Vulkan scene buffers belong to this thread too, and they hold
+            // device memory the presenter is about to be destroyed with.
+            vk?.let { p ->
+                for (i in vkBuffers.indices) {
+                    vkBuffers[i]?.let { p.destroyUiBuffer(it) }
+                    vkBuffers[i] = null
+                }
+            }
+            vkFront = null
+            vkDisplayed = null
             runCatching { context.close() }.onFailure { it.printStackTrace() }
         }
     }
