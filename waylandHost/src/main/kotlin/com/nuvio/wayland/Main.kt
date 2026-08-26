@@ -780,7 +780,16 @@ fun main(args: Array<String>) {
                             chromeActiveUntilNs.set(System.nanoTime() + 5_000_000_000L)
                         "hideChrome" ->
                             // Fade grace: the hide animation still needs frames.
-                            chromeActiveUntilNs.set(System.nanoTime() + 600_000_000L)
+                            // Clamped, never extended -- the page runs its own
+                            // auto-hide timer, and when the host's activity
+                            // window expires first the chrome is already gone by
+                            // the time this arrives. A plain set() then revives
+                            // it for 600ms, which is the flash a second or two
+                            // after it correctly disappears. "Please hide" must
+                            // never grant more visibility than is already owed.
+                            chromeActiveUntilNs.updateAndGet { current ->
+                                minOf(current, System.nanoTime() + 600_000_000L)
+                            }
                     }
                     if (type == "controlsReady") {
                         // A fresh page context. Everything painted before it
@@ -1049,6 +1058,8 @@ fun main(args: Array<String>) {
                 println(
                     "[session] chrome ${if (wantChrome) "SHOW" else "hide"} " +
                         "(hasFile=${videoHost?.hasFile} active=$active " +
+                        "playing=$playing ${videoHost?.pauseReason()} " +
+                        "windowMs=${(chromeActiveUntilNs.get() - System.nanoTime()) / 1_000_000} " +
                         "drawn=$chromeDrawn taken=${chrome.framesTaken})",
                 )
                 StartupTrace.mark(

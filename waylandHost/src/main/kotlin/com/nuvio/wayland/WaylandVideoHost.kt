@@ -364,6 +364,13 @@ class WaylandVideoHost(
             (mpv.cachedBoolean("paused-for-cache") ?: false) ||
             (mpv.cachedBoolean("seeking") ?: false)
 
+    /** Which of the three, for the session log. "The chrome came back" is one
+     *  of them going true for a moment and they are not interchangeable. */
+    fun pauseReason(): String =
+        "pause=${mpv.cachedBoolean("pause")} " +
+            "cache=${mpv.cachedBoolean("paused-for-cache")} " +
+            "seek=${mpv.cachedBoolean("seeking")}"
+
     fun pushPlaybackUpdate() {
         val c = chrome ?: return
         if (!hasFile) return
