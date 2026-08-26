@@ -72,6 +72,11 @@ dependencies {
     // system libvulkan.so.1 at runtime (the natives jar is macOS-only, for
     // MoltenVK).
     implementation("org.lwjgl:lwjgl-vulkan:$lwjglVersion")
+
+    // Skia's Vulkan backend. Only the graphite variant's Linux binary is built
+    // with Vulkan; the base skiko one is not, which is why this is separate.
+    implementation("org.jetbrains.skiko:skiko-graphite-awt:0.152.0-alpha02")
+    runtimeOnly("org.jetbrains.skiko:skiko-graphite-awt-runtime-linux-x64:0.152.0-alpha02")
     runtimeOnly("org.lwjgl:lwjgl:$lwjglVersion:natives-linux")
     runtimeOnly("org.lwjgl:lwjgl-glfw:$lwjglVersion:natives-linux")
     runtimeOnly("org.lwjgl:lwjgl-opengl:$lwjglVersion:natives-linux")
@@ -126,7 +131,7 @@ compose.desktop.application {
             "chromeAlwaysOn", "chromeScaleMul",
             // Test lever: the window size the host asks for, so chrome cost
             // can be measured against pixel area without touching the compositor.
-            "winW", "winH", "displayFps", "vsync", "vkSwapchain", "vkProbe",
+            "winW", "winH", "displayFps", "vsync", "vkSwapchain", "vkProbe", "vkClear", "vkGraphite", "vkFormat",
         )) {
             providers.gradleProperty("nuvio.wayland.$k").orNull
                 ?.let { add("-Dnuvio.wayland.$k=$it") }

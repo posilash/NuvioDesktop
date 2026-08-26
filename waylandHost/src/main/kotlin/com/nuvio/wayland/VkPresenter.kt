@@ -50,6 +50,7 @@ import org.lwjgl.vulkan.VkSubmitInfo
 import org.lwjgl.vulkan.VkSurfaceCapabilitiesKHR
 import org.lwjgl.vulkan.VkSurfaceFormatKHR
 import org.lwjgl.vulkan.VkSwapchainCreateInfoKHR
+import org.jetbrains.skia.gpu.graphite.wrapBackendTexture
 import java.nio.ByteBuffer
 
 /**
@@ -96,6 +97,9 @@ class VkPresenter(private val window: Long) {
     private var swapFormat = 0
     private var swapWidth = 0
     private var swapHeight = 0
+    /** Exactly what the swapchain images were created with, so the wrap can
+     *  describe them truthfully instead of guessing. */
+    private var swapUsage = 0
 
     private var cmdPool = VK_NULL_HANDLE
     private var cmdBuf: VkCommandBuffer? = null
@@ -122,8 +126,33 @@ class VkPresenter(private val window: Long) {
     private var glVkDoneSem = 0
     private var everSubmitted = false
 
+    // Skia on Vulkan, sharing this device: the scene is recorded straight into
+    // the acquired swapchain image, so nothing crosses to GL.
+    private var graphiteContext: org.jetbrains.skia.gpu.graphite.GraphiteContext? = null
+    private var recorder: org.jetbrains.skia.gpu.graphite.Recorder? = null
+    private var frameSurface: org.jetbrains.skia.Surface? = null
+    private var frameImageIndex = -1
+    private var wrapFailed = false
+    // Skia renders here, once, and it persists. A swapchain hands back a
+    // different image each frame with undefined contents, and Compose only
+    // paints when it thinks it is dirty -- so drawing straight into the
+    // swapchain leaves stale frames blank. GENERAL throughout, so no layout
+    // transition is ever needed: Skia can render to it and a blit can read it.
+    private var gTargetImage = VK_NULL_HANDLE
+    private var gTargetMemory = VK_NULL_HANDLE
+    private var gSurface: org.jetbrains.skia.Surface? = null
+
+    private val videoLog = System.getProperty("nuvio.wayland.videoLog")?.toBoolean() == true
+
     /** Diagnostic: skip the blit and present a flat colour. */
     private val clearOnly = System.getProperty("nuvio.wayland.vkClear")?.toBoolean() == true
+
+    /** Raw handles, for a Skia Vulkan context sharing this device. */
+    val instanceHandle: Long get() = instance.address()
+    val physicalDeviceHandle: Long get() = physicalDevice.address()
+    val deviceHandle: Long get() = device.address()
+    val queueHandle: Long get() = queue.address()
+    val graphicsQueueIndex: Int get() = queueFamily
 
     /** The framebuffer the frame must be rendered into. */
     val fbo: Int get() = glFramebuffer
@@ -278,22 +307,45 @@ class VkPresenter(private val window: Long) {
             KHRSurface.vkGetPhysicalDeviceSurfaceFormatsKHR(physicalDevice, surface, fc, null)
             val formats = VkSurfaceFormatKHR.calloc(fc.get(0), s)
             KHRSurface.vkGetPhysicalDeviceSurfaceFormatsKHR(physicalDevice, surface, fc, formats)
-            // Whatever the surface offers first, unless the usual 8-bit BGRA is
-            // there. The colour space is where HDR would be selected later.
+            // What the surface actually offers, in its own order of preference,
+            // with -Pnuvio.wayland.vkFormat=<VkFormat> to ask for a specific
+            // one. Nothing is hardcoded here: a 10-bit or float format with an
+            // HDR colour space is chosen the same way when we want one.
+            val wanted = System.getProperty("nuvio.wayland.vkFormat")?.toIntOrNull()
             var chosen = formats.get(0)
-            for (i in 0 until fc.get(0)) {
-                val f = formats.get(i)
-                if (f.format() == VK_FORMAT_B8G8R8A8_UNORM &&
-                    f.colorSpace() == KHRSurface.VK_COLOR_SPACE_SRGB_NONLINEAR_KHR
-                ) {
-                    chosen = f
-                    break
+            if (wanted != null) {
+                for (i in 0 until fc.get(0)) {
+                    if (formats.get(i).format() == wanted) {
+                        chosen = formats.get(i)
+                        break
+                    }
                 }
+            }
+            if (videoLog) {
+                val offered = (0 until fc.get(0)).joinToString(" ") {
+                    "${formats.get(it).format()}/${formats.get(it).colorSpace()}"
+                }
+                println("vk-format: offered=[$offered] chosen=${chosen.format()}/${chosen.colorSpace()}")
             }
             swapFormat = chosen.format()
 
             swapWidth = if (caps.currentExtent().width() != -1) caps.currentExtent().width() else width
             swapHeight = if (caps.currentExtent().height() != -1) caps.currentExtent().height() else height
+            // Ask for everything Graphite may need of a render target and keep
+            // only what this surface supports. INPUT_ATTACHMENT matters: its
+            // Vulkan backend reads the destination through one when blending,
+            // which is why Skiko exposes that flag at all. Never request usage
+            // the surface does not advertise -- that fails swapchain creation.
+            swapUsage = caps.supportedUsageFlags() and (
+                VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT or
+                    VK_IMAGE_USAGE_SAMPLED_BIT or
+                    VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT or
+                    VK_IMAGE_USAGE_TRANSFER_DST_BIT or
+                    VK_IMAGE_USAGE_TRANSFER_SRC_BIT
+                )
+            check(swapUsage and VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT != 0) {
+                "surface cannot be rendered into: usage=${caps.supportedUsageFlags()}"
+            }
             val minImages = maxOf(caps.minImageCount(), 2).let {
                 if (caps.maxImageCount() > 0) minOf(it, caps.maxImageCount()) else it
             }
@@ -306,7 +358,7 @@ class VkPresenter(private val window: Long) {
                 .imageColorSpace(chosen.colorSpace())
                 .imageArrayLayers(1)
                 // TRANSFER_DST because the frame arrives as a blit, not a draw.
-                .imageUsage(VK_IMAGE_USAGE_TRANSFER_DST_BIT or VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT)
+                .imageUsage(swapUsage)
                 .imageSharingMode(VK_SHARING_MODE_EXCLUSIVE)
                 .preTransform(caps.currentTransform())
                 .compositeAlpha(KHRSurface.VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR)
@@ -627,6 +679,230 @@ class VkPresenter(private val window: Long) {
      * reports itself out of date, which is the only reliable notice of a resize
      * here: the window has no framebuffer for GLFW to measure.
      */
+    private fun createGraphiteTarget(w: Int, h: Int) {
+        val rec = recorder ?: return
+        stackPush().use { s ->
+            val ici = VkImageCreateInfo.calloc(s)
+                .sType(VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO)
+                .imageType(VK_IMAGE_TYPE_2D)
+                .format(swapFormat)
+                .mipLevels(1)
+                .arrayLayers(1)
+                .samples(VK_SAMPLE_COUNT_1_BIT)
+                .tiling(VK_IMAGE_TILING_OPTIMAL)
+                .usage(swapUsage or VK_IMAGE_USAGE_TRANSFER_SRC_BIT)
+                .sharingMode(VK_SHARING_MODE_EXCLUSIVE)
+                .initialLayout(VK_IMAGE_LAYOUT_UNDEFINED)
+            ici.extent().width(w).height(h).depth(1)
+            val pl = s.mallocLong(1)
+            check(vkCreateImage(device, ici, null, pl), "vkCreateImage(graphite target)")
+            gTargetImage = pl.get(0)
+            val mr = VkMemoryRequirements.calloc(s)
+            vkGetImageMemoryRequirements(device, gTargetImage, mr)
+            val ai = VkMemoryAllocateInfo.calloc(s)
+                .sType(VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO)
+                .allocationSize(mr.size())
+                .memoryTypeIndex(findMemoryType(mr.memoryTypeBits(), VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT))
+            check(vkAllocateMemory(device, ai, null, pl), "vkAllocateMemory(graphite target)")
+            gTargetMemory = pl.get(0)
+            check(vkBindImageMemory(device, gTargetImage, gTargetMemory, 0), "vkBindImageMemory")
+
+            // Once into GENERAL, and it stays there for good.
+            val cb = cmdBuf ?: return
+            vkResetCommandBuffer(cb, 0)
+            val bi = VkCommandBufferBeginInfo.calloc(s)
+                .sType(VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO)
+                .flags(VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT)
+            vkBeginCommandBuffer(cb, bi)
+            val b = VkImageMemoryBarrier.calloc(1, s)
+            b.get(0).sType(VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER)
+                .oldLayout(VK_IMAGE_LAYOUT_UNDEFINED)
+                .newLayout(VK_IMAGE_LAYOUT_GENERAL)
+                .srcQueueFamilyIndex(VK_QUEUE_FAMILY_IGNORED)
+                .dstQueueFamilyIndex(VK_QUEUE_FAMILY_IGNORED)
+                .image(gTargetImage)
+                .srcAccessMask(0)
+                .dstAccessMask(VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT)
+                .subresourceRange {
+                    it.aspectMask(VK_IMAGE_ASPECT_COLOR_BIT).baseMipLevel(0)
+                        .levelCount(1).baseArrayLayer(0).layerCount(1)
+                }
+            vkCmdPipelineBarrier(
+                cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, 0, null, null, b,
+            )
+            vkEndCommandBuffer(cb)
+            val si = VkSubmitInfo.calloc(s)
+                .sType(VK_STRUCTURE_TYPE_SUBMIT_INFO)
+                .pCommandBuffers(s.pointers(cb))
+            vkQueueSubmit(queue, si, VK_NULL_HANDLE)
+            vkQueueWaitIdle(queue)
+        }
+
+        val info = org.jetbrains.skia.gpu.graphite.VulkanTextureInfo(
+            format = org.jetbrains.skia.gpu.graphite.VulkanFormat(swapFormat),
+            imageUsageFlags = org.jetbrains.skia.gpu.graphite.VulkanImageUsageFlags(
+                swapUsage or VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
+            ),
+        )
+        val tex = org.jetbrains.skia.gpu.graphite.BackendTexture.makeVulkan(
+            width = w, height = h, textureInfo = info,
+            imageLayout = VK_IMAGE_LAYOUT_GENERAL,
+            queueFamilyIndex = queueFamily, imagePtr = gTargetImage,
+        )
+        gSurface = org.jetbrains.skia.Surface.wrapBackendTexture(rec, tex, null, null)
+        if (gSurface == null) {
+            System.err.println("vk-graphite: Skia refused the render target (format=$swapFormat)")
+        }
+    }
+
+    /** Bring up Skia's Vulkan backend on this device. */
+    fun initGraphite() {
+        val gc = org.jetbrains.skia.gpu.graphite.GraphiteContext.makeVulkan(
+            instance.address(), physicalDevice.address(), device.address(),
+            queue.address(), queueFamily, VK11.VK_API_VERSION_1_1,
+        )
+        graphiteContext = gc
+        recorder = gc.makeRecorder()
+        createGraphiteTarget(swapWidth, swapHeight)
+        println("vk-graphite: Skia is rendering with Vulkan on $deviceName")
+    }
+
+    /**
+     * Acquire the next image and wrap it as a Skia surface. The canvas returned
+     * draws directly into what will be presented -- no intermediate image, no
+     * export, no blit. Null means the frame should be skipped.
+     */
+    fun beginFrameGraphite(): org.jetbrains.skia.Canvas? {
+        val (ww, wh) = windowSize()
+        if (ww > 0 && wh > 0 && (ww != swapWidth || wh != swapHeight)) {
+            rebuild()
+            destroyGraphiteTarget()
+            createGraphiteTarget(swapWidth, swapHeight)
+            return null
+        }
+        return gSurface?.canvas
+    }
+
+    private fun destroyGraphiteTarget() {
+        vkDeviceWaitIdle(device)
+        gSurface?.close()
+        gSurface = null
+        if (gTargetImage != VK_NULL_HANDLE) { vkDestroyImage(device, gTargetImage, null); gTargetImage = VK_NULL_HANDLE }
+        if (gTargetMemory != VK_NULL_HANDLE) { vkFreeMemory(device, gTargetMemory, null); gTargetMemory = VK_NULL_HANDLE }
+    }
+
+    /** Flush Skia's work, then blit the result into a swapchain image. */
+    fun endFrameGraphite() {
+        val gc = graphiteContext ?: return
+        val rec = recorder ?: return
+        if (gTargetImage == VK_NULL_HANDLE) return
+        // Skia's drawing runs first and on the same queue, so submission order
+        // alone orders the blit after it.
+        gc.insertRecording(rec.snap())
+        gc.submit(false)
+
+        stackPush().use { s ->
+            if (everSubmitted) vkWaitForFences(device, submitFence, true, Long.MAX_VALUE)
+            val pi = s.mallocInt(1)
+            val acquired = KHRSwapchain.vkAcquireNextImageKHR(
+                device, swapchain, Long.MAX_VALUE, imageAvailable, VK_NULL_HANDLE, pi,
+            )
+            if (acquired == KHRSwapchain.VK_ERROR_OUT_OF_DATE_KHR ||
+                acquired == KHRSwapchain.VK_SUBOPTIMAL_KHR
+            ) {
+                rebuild(); destroyGraphiteTarget(); createGraphiteTarget(swapWidth, swapHeight)
+                return
+            }
+            check(acquired, "vkAcquireNextImageKHR")
+            vkResetFences(device, submitFence)
+            val idx = pi.get(0)
+            val image = swapImages[idx]
+
+            val cb = cmdBuf ?: return
+            vkResetCommandBuffer(cb, 0)
+            val bi = VkCommandBufferBeginInfo.calloc(s)
+                .sType(VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO)
+                .flags(VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT)
+            check(vkBeginCommandBuffer(cb, bi), "vkBeginCommandBuffer")
+
+            val toDst = VkImageMemoryBarrier.calloc(1, s)
+            toDst.get(0).sType(VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER)
+                .oldLayout(VK_IMAGE_LAYOUT_UNDEFINED)
+                .newLayout(VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL)
+                .srcQueueFamilyIndex(VK_QUEUE_FAMILY_IGNORED)
+                .dstQueueFamilyIndex(VK_QUEUE_FAMILY_IGNORED)
+                .image(image).srcAccessMask(0).dstAccessMask(VK_ACCESS_TRANSFER_WRITE_BIT)
+                .subresourceRange {
+                    it.aspectMask(VK_IMAGE_ASPECT_COLOR_BIT).baseMipLevel(0)
+                        .levelCount(1).baseArrayLayer(0).layerCount(1)
+                }
+            vkCmdPipelineBarrier(
+                cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                0, null, null, toDst,
+            )
+
+            // Both are top-left origin here, so no flip.
+            val blit = VkImageBlit.calloc(1, s)
+            blit.get(0).apply {
+                srcSubresource {
+                    it.aspectMask(VK_IMAGE_ASPECT_COLOR_BIT).mipLevel(0).baseArrayLayer(0).layerCount(1)
+                }
+                dstSubresource {
+                    it.aspectMask(VK_IMAGE_ASPECT_COLOR_BIT).mipLevel(0).baseArrayLayer(0).layerCount(1)
+                }
+                srcOffsets(0).set(0, 0, 0)
+                srcOffsets(1).set(swapWidth, swapHeight, 1)
+                dstOffsets(0).set(0, 0, 0)
+                dstOffsets(1).set(swapWidth, swapHeight, 1)
+            }
+            vkCmdBlitImage(
+                cb, gTargetImage, VK_IMAGE_LAYOUT_GENERAL,
+                image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, blit, VK_FILTER_NEAREST,
+            )
+
+            val toPresent = VkImageMemoryBarrier.calloc(1, s)
+            toPresent.get(0).sType(VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER)
+                .oldLayout(VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL)
+                .newLayout(KHRSwapchain.VK_IMAGE_LAYOUT_PRESENT_SRC_KHR)
+                .srcQueueFamilyIndex(VK_QUEUE_FAMILY_IGNORED)
+                .dstQueueFamilyIndex(VK_QUEUE_FAMILY_IGNORED)
+                .image(image).srcAccessMask(VK_ACCESS_TRANSFER_WRITE_BIT).dstAccessMask(0)
+                .subresourceRange {
+                    it.aspectMask(VK_IMAGE_ASPECT_COLOR_BIT).baseMipLevel(0)
+                        .levelCount(1).baseArrayLayer(0).layerCount(1)
+                }
+            vkCmdPipelineBarrier(
+                cb, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+                0, null, null, toPresent,
+            )
+            check(vkEndCommandBuffer(cb), "vkEndCommandBuffer")
+
+            val si = VkSubmitInfo.calloc(s)
+                .sType(VK_STRUCTURE_TYPE_SUBMIT_INFO)
+                .waitSemaphoreCount(1)
+                .pWaitSemaphores(s.longs(imageAvailable))
+                .pWaitDstStageMask(s.ints(VK_PIPELINE_STAGE_TRANSFER_BIT))
+                .pCommandBuffers(s.pointers(cb))
+                .pSignalSemaphores(s.longs(renderFinished[idx]))
+            check(vkQueueSubmit(queue, si, submitFence), "vkQueueSubmit")
+            everSubmitted = true
+
+            val present = VkPresentInfoKHR.calloc(s)
+                .sType(KHRSwapchain.VK_STRUCTURE_TYPE_PRESENT_INFO_KHR)
+                .pWaitSemaphores(s.longs(renderFinished[idx]))
+                .swapchainCount(1)
+                .pSwapchains(s.longs(swapchain))
+                .pImageIndices(s.ints(idx))
+            val r = KHRSwapchain.vkQueuePresentKHR(queue, present)
+            if (r == KHRSwapchain.VK_ERROR_OUT_OF_DATE_KHR || r == KHRSwapchain.VK_SUBOPTIMAL_KHR) {
+                rebuild(); destroyGraphiteTarget(); createGraphiteTarget(swapWidth, swapHeight)
+            } else {
+                check(r, "vkQueuePresentKHR")
+            }
+        }
+    }
+
     /**
      * The surface's size. This is the only notice of a resize we get: with a
      * client-chosen extent (caps reports -1) the buffer we present *is* the

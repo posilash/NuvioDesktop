@@ -241,12 +241,17 @@ fun main(args: Array<String>) {
     // surface is built: recreateSurface() wraps whatever framebuffer is current,
     // so binding here is what points the whole scene at the exported image.
     val presenter: VkPresenter? = if (vkSwapchain) VkPresenter(window) else null
+    // Skia's Vulkan backend, on the presenter's own device: the point of the
+    // whole exercise is one device shared by mpv, Skia and the swapchain, with
+    // no GL in between.
+    val vkGraphite = System.getProperty("nuvio.wayland.vkGraphite")?.toBoolean() == true
     if (presenter != null) {
         java.awt.EventQueue.invokeAndWait {
             val fw = IntArray(1); val fh = IntArray(1)
             glfwGetFramebufferSize(window, fw, fh)
             presenter.init(maxOf(fw[0], 1), maxOf(fh[0], 1))
             GL30.glBindFramebuffer(GL30.GL_FRAMEBUFFER, presenter.fbo)
+            if (vkGraphite) presenter.initGraphite()
         }
     }
 
@@ -489,7 +494,8 @@ fun main(args: Array<String>) {
     // Skia context, and publishes finished textures (see UiPipeline). The
     // presenting thread then only ever draws. -Pnuvio.wayland.uiThread=false
     // restores the in-loop rasterization this replaced, for A/B.
-    val uiThreadEnabled = System.getProperty("nuvio.wayland.uiThread")?.toBoolean() ?: true
+    val uiThreadEnabled = (System.getProperty("nuvio.wayland.uiThread")?.toBoolean() ?: true) &&
+        System.getProperty("nuvio.wayland.vkGraphite")?.toBoolean() != true
 
     fun recreateSurface() {
         surface?.close()
@@ -987,6 +993,41 @@ fun main(args: Array<String>) {
 
     /** Returns true if this iteration actually presented a frame. */
     fun renderOneFrame(): Boolean {
+        // Full Vulkan: Skia records the scene straight into the acquired
+        // swapchain image. No GL context is touched, so none of the compositing
+        // below runs -- video and chrome still have to be ported to draw here.
+        if (vkGraphite && presenter != null) {
+            val canvas = presenter.beginFrameGraphite() ?: return false
+            // The early return above skips the resize path, so the scene keeps
+            // its construction size and lays out for a surface that is not the
+            // one being drawn. Track the presenter instead.
+            val target = androidx.compose.ui.unit.IntSize(presenter.width, presenter.height)
+            if (scene.size != target && presenter.width > 0 && presenter.height > 0) {
+                width = presenter.width
+                height = presenter.height
+                scene.size = target
+                val sc = currentScale()
+                if (scene.density.density != sc) scene.density = Density(sc)
+                input.scale = sc
+            }
+            canvas.clear(0xFF102030.toInt())
+            if (frames % 120L == 0L) {
+                println(
+                    "vk-graphite: canvas=${presenter.width}x${presenter.height} " +
+                        "sceneSize=${scene.size} pendingDraw=${scene.hasPendingDraw}",
+                )
+            }
+            // Skia-side proof that the path paints: independent of Compose.
+            org.jetbrains.skia.Paint().use { p ->
+                p.color = 0xFFFF0000.toInt()
+                canvas.drawRect(org.jetbrains.skia.Rect.makeXYWH(20f, 20f, 200f, 120f), p)
+            }
+            sceneRecomposer.performFrame(System.nanoTime())
+            scene.draw(canvas.asComposeCanvas())
+            presenter.endFrameGraphite()
+            frames++
+            return true
+        }
 
         val w = IntArray(1); val h = IntArray(1)
         // With a Vulkan swapchain the window has no framebuffer to measure;
