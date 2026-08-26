@@ -125,7 +125,7 @@ class VideoPipelineVk(private val mpv: Mpv) {
          * be submitted to from another thread while mpv_render_context_render()
          * runs, unless lock_queue and unlock_queue are provided".
          */
-        val queueLock: java.util.concurrent.locks.ReentrantLock,
+        val queueLock: java.util.concurrent.locks.ReentrantLock?,
     )
 
     var sharedDevice: SharedDevice? = null

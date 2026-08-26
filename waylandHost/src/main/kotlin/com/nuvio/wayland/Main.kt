@@ -1224,7 +1224,9 @@ fun main(args: Array<String>) {
                     // Chrome above the scene, and above the video: it is the
                     // player's own controls. Source-over, so its transparent
                     // parts leave the hole open for the video below.
-                    updateChromeSession()
+                    // The session gating already ran in renderOneFrame, once.
+                    // Calling it here too double-acked every export, and an
+                    // un-paired ack is what sends WPE into a render storm.
                     chromeLayer?.let { l ->
                         l.update()
                         l.drawInto(canvas, presenter.width, presenter.height)

@@ -113,11 +113,13 @@ class VkPresenter(private val window: Long) {
         instance = instance,
         physicalDevice = physicalDevice,
         device = device,
-        queue = queue,
+        queue = mpvQueue,
         queueFamily = queueFamily,
         featuresChain = features2!!.address(),
         extensions = enabledExtensions,
-        queueLock = queueLock,
+        // Only when they share one: with a queue each there is nothing to
+        // serialise, and the lock would only put them back in each other's way.
+        queueLock = if (separateQueues) null else queueLock,
     )
 
     /** Serialises every submission to [queue]; see SharedDevice.queueLock. */
@@ -125,6 +127,7 @@ class VkPresenter(private val window: Long) {
 
     /** Runs [block] holding [queueLock]. Every submission here goes through it. */
     private inline fun <T> withQueue(block: () -> T): T {
+        if (separateQueues) return block()
         queueLock.lock()
         try { return block() } finally { queueLock.unlock() }
     }
@@ -142,7 +145,11 @@ class VkPresenter(private val window: Long) {
     private lateinit var physicalDevice: VkPhysicalDevice
     private lateinit var device: VkDevice
     private lateinit var queue: VkQueue
+    /** mpv's queue: index 0, which is the only one it can be given. */
+    private lateinit var mpvQueue: VkQueue
     private var queueFamily = 0
+    private var queueCount = 1
+    private var separateQueues = false
     private var deviceName = "?"
 
     private var surface = VK_NULL_HANDLE
@@ -280,6 +287,14 @@ class VkPresenter(private val window: Long) {
                 val f = qprops.get(it).queueFlags()
                 f and VK_QUEUE_GRAPHICS_BIT != 0 && f and VK_QUEUE_COMPUTE_BIT != 0
             } ?: error("no graphics+compute queue family")
+            // Two queues if the family has them: one for mpv, one for Skia and
+            // the present. Sharing a single queue means every submission takes
+            // the lock, and Skia's is a synchronous submit at frame rate --
+            // measured mpv down to 11 renders/s against a 24fps stream, waiting
+            // for a queue it could not get. Cross-queue ordering is already
+            // handled: the video handoff rides on semaphores either way.
+            queueCount = minOf(2, qprops.get(queueFamily).queueCount())
+            separateQueues = queueCount > 1
 
             val extCount = s.mallocInt(1)
             check(
@@ -341,7 +356,9 @@ class VkPresenter(private val window: Long) {
             qci.get(0)
                 .sType(VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO)
                 .queueFamilyIndex(queueFamily)
-                .pQueuePriorities(s.floats(1.0f))
+                .pQueuePriorities(
+                    if (separateQueues) s.floats(1.0f, 1.0f) else s.floats(1.0f),
+                )
             val extNames = s.mallocPointer(enabledExtensions.size)
             for (e in enabledExtensions) extNames.put(s.ASCII(e))
             extNames.flip()
@@ -353,8 +370,16 @@ class VkPresenter(private val window: Long) {
             val pd = s.mallocPointer(1)
             check(vkCreateDevice(physicalDevice, dci, null, pd), "vkCreateDevice")
             device = VkDevice(pd.get(0), physicalDevice, dci)
-            vkGetDeviceQueue(device, queueFamily, 0, pd)
+            // Index 1 is ours when there is one; mpv keeps index 0, because
+            // mpv_vulkan_queue counts from queue 0 and cannot be offset.
+            vkGetDeviceQueue(device, queueFamily, if (separateQueues) 1 else 0, pd)
             queue = VkQueue(pd.get(0), device)
+            vkGetDeviceQueue(device, queueFamily, 0, pd)
+            mpvQueue = if (separateQueues) VkQueue(pd.get(0), device) else queue
+            println(
+                "vk-queue: family=$queueFamily " +
+                    if (separateQueues) "skia=1 mpv=0 (no lock)" else "shared=0 (locked)",
+            )
         }
     }
 
