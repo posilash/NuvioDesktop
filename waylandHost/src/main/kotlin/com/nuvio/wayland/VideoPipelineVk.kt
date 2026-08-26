@@ -996,5 +996,24 @@ class VideoPipelineVk(private val mpv: Mpv) {
         fun close(fd: Int) {
             closeHandle.invokeExact(fd) as Int
         }
+
+        private val exitHandle = Linker.nativeLinker().downcallHandle(
+            Linker.nativeLinker().defaultLookup().find("_exit").orElseThrow(),
+            FunctionDescriptor.ofVoid(ValueLayout.JAVA_INT),
+        )
+
+        /**
+         * End the process now, without atexit handlers or static destructors.
+         *
+         * Runtime.halt() still goes through exit(), and the NVIDIA driver's own
+         * cleanup runs there -- faulting inside libnvidia-eglcore once the
+         * contexts it registered are gone, which is the crash dump on close.
+         * Nothing of ours is left to run: the teardown has finished and mpv,
+         * the only component with state worth flushing, stopped first.
+         */
+        fun exitNow(code: Int): Nothing {
+            exitHandle.invokeExact(code)
+            error("_exit returned")
+        }
     }
 }

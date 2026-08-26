@@ -1843,15 +1843,20 @@ fun main(args: Array<String>) {
                 // rasterized them and must die there. Ordering is unchanged:
                 // scene first (its disposals stop playback through a live mpv),
                 // then the core, then the video pipeline.
+                if (videoLog) println("[teardown] scene/ui stop")
                 val p = uiPipeline
                 if (p != null) p.stop() else java.awt.EventQueue.invokeAndWait { scene.close() }
+                if (videoLog) println("[teardown] scene/ui stopped")
+                if (videoLog) println("[teardown] mpv quit")
                 mpv?.quitAndAwaitShutdown()
+                if (videoLog) println("[teardown] mpv quit done")
                 if (pipeline is EdtSampledPipeline) {
                     java.awt.EventQueue.invokeAndWait { pipeline?.stop() }
                 } else {
                     pipeline?.stop()
                 }
                 mpv?.close()
+                if (videoLog) println("[teardown] mpv closed")
                 java.awt.EventQueue.invokeAndWait {
                     // uiLayer's wrappers live in the window context, so they
                     // go here, not with the UI thread's own objects.
@@ -1860,6 +1865,7 @@ fun main(args: Array<String>) {
                     renderTarget?.close()
                     uiSurface?.close()
                     context.close()
+                    if (videoLog) println("[teardown] gl closed")
                     // Vulkan is deliberately NOT unwound here. Closing the
                     // Graphite context, its recorders and the device at exit
                     // faults inside the driver every way round -- close the
@@ -1872,16 +1878,20 @@ fun main(args: Array<String>) {
                     // above.
                 }
             }.onFailure { it.printStackTrace() }
+            if (videoLog) println("[teardown] worker done")
             teardownDone.countDown()
         }, "nuvio-teardown").start()
         while (!teardownDone.await(10, java.util.concurrent.TimeUnit.MILLISECONDS)) {
             glfwPollEvents()
         }
+        if (videoLog) println("[teardown] main: worker joined")
         chromeImage?.close()
         glfwDestroyWindow(uiWindow)
         glfwDestroyWindow(videoWindow)
         glfwDestroyWindow(window)
+        if (videoLog) println("[teardown] windows destroyed")
         glfwTerminate()
+        if (videoLog) println("[teardown] glfwTerminate done")
         shutdownComplete.countDown()
         // And skip the JVM's own shutdown with it. Its Exit safepoint runs
         // Skia's cleaners over peers whose device is still live, which is the
@@ -1889,7 +1899,8 @@ fun main(args: Array<String>) {
         // point needs to run: teardown is done and stdout is flushed.
         System.out.flush()
         System.err.flush()
-        Runtime.getRuntime().halt(0)
+        if (videoLog) println("[teardown] exit")
+        VideoPipelineVk.Posix.exitNow(0)
     }
     println("OK: clean shutdown")
     exitProcess(exitCode)
