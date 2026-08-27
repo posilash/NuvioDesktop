@@ -20,13 +20,16 @@ makedepends=('git' 'java-environment>=17' 'gcc' 'meson' 'ninja' 'pkgconf'
              'vulkan-headers')
 provides=("${pkgname}")
 # The fork carries the render API this host is written against: a gpu-next
-# backend ("opengl-next"), a Vulkan backend, and a render() that does not block
-# without advanced control. Stock libmpv answers NOT_IMPLEMENTED, and the host
-# falls back to the legacy GL renderer, which is not what this is for. Built
-# and installed here so it is removed with the package rather than left behind
-# as a system mpv nobody remembers replacing.
+# backend ("opengl-next"), a Vulkan backend, a render() that does not block
+# without advanced control, and the target colour space fields the host uses to
+# say what it presents in. Stock libmpv answers NOT_IMPLEMENTED and the host
+# falls back to the legacy GL renderer, which is not what this is for; an mpv
+# without the colour space fields builds fine and then silently gives SDR,
+# because mpv assumes an sRGB target and tone-maps HDR away. Built and
+# installed here so it is removed with the package rather than left behind as a
+# system mpv nobody remembers replacing.
 source=("${pkgname}::git+${url}.git#branch=render-api-vulkan"
-        "mpv::git+https://github.com/posilash/mpv.git#branch=vk-hwdec")
+        "mpv::git+https://github.com/posilash/mpv.git#branch=render-target-colorspace")
 sha256sums=('SKIP'
             'SKIP')
 
