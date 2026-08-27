@@ -1450,6 +1450,38 @@ fun main(args: Array<String>) {
         // 24fps there are 40ms of them, and when the UI is heavier than that
         // it is the chrome that degrades, never the video.
         val videoChanged = videoFrameReady.getAndSet(false)
+
+        // Follow the source's colour space. This is what
+        // target-colorspace-hint-mode=source does in a normal VO, done here
+        // because mpv owns no swapchain on this path and cannot do it itself.
+        // Recomputed from mpv's own video-params, so it changes with the file
+        // and nothing about any particular colour space is assumed.
+        (pipeline as? VkGlDisplayPipeline)?.vk?.let { vp ->
+            val m = mpv
+            if (m != null && presenter != null) {
+                val want = TargetColorSpace.forSource(
+                    m.cachedString("video-params/primaries"),
+                    m.cachedString("video-params/gamma"),
+                    presenter.offeredColorSpaces,
+                )
+                if (videoLog && frames % 600 == 0) {
+                    println(
+                        "video-params: prim=${m.cachedString("video-params/primaries")} " +
+                            "trc=${m.cachedString("video-params/gamma")} " +
+                            "peak=${m.cachedString("video-params/sig-peak")}",
+                    )
+                }
+                if (want != vp.targetColorSpace) {
+                    println(
+                        "video: source ${m.cachedString("video-params/primaries")}/" +
+                            "${m.cachedString("video-params/gamma")} -> target " +
+                            "prim=${want.primaries} trc=${want.transfer} vk=${want.vk}",
+                    )
+                    vp.targetColorSpace = want
+                    presenter.targetColorSpace = want.vk
+                }
+            }
+        }
         // The chrome takes no part in this loop: it is a compositor-layered
         // subsurface fed on the GLib thread. Keeping it (and every other
         // foreign concern) out of this window's GL and present cadence is

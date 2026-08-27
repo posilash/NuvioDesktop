@@ -130,6 +130,13 @@ class VideoPipelineVk(private val mpv: Mpv) {
 
     var sharedDevice: SharedDevice? = null
 
+    /**
+     * The colour space this pipeline renders for, set from the source by the
+     * host. Volatile because the video thread reads it while the host writes.
+     */
+    @Volatile
+    var targetColorSpace: TargetColorSpace = TargetColorSpace.SDR
+
     /** Runs [block] holding the shared queue lock, if there is one. */
     private inline fun <T> withQueue(block: () -> T): T {
         val l = sharedDevice?.queueLock ?: return block()
@@ -427,6 +434,7 @@ class VideoPipelineVk(private val mpv: Mpv) {
             // hands a *freshly wrapped* image over has no prior hold to pair
             // with. Harmless here: layout is UNDEFINED and nothing needs
             // preserving, so the unpaired release changes no behaviour.
+            val target = targetColorSpace
             val t = System.nanoTime()
             val (ret, outLayout) = mpv.renderVulkan(
                 Mpv.VulkanFrame(
@@ -440,6 +448,14 @@ class VideoPipelineVk(private val mpv: Mpv) {
                     layout = VK_IMAGE_LAYOUT_UNDEFINED,
                     outLayout = 0, // mpv picks and reports back
                     signalSemaphore = buf.semaphore,
+                    // What this target is, so mpv renders for it instead of
+                    // assuming sRGB and tone-mapping HDR away. Zero when the
+                    // file is SDR or the surface cannot carry its colour space,
+                    // which is exactly the old behaviour.
+                    primaries = target.primaries,
+                    transfer = target.transfer,
+                    minLuma = target.minLuma,
+                    maxLuma = target.maxLuma,
                 ),
             )
             renders++

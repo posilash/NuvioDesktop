@@ -161,6 +161,36 @@ class VkPresenter(private val window: Long) {
     private var queueFamily = 0
     private var queueCount = 1
     private var presentMode = KHRSurface.VK_PRESENT_MODE_FIFO_KHR
+
+    /** Colour spaces this surface offers; empty until the swapchain is built. */
+    var offeredColorSpaces: Set<Int> = emptySet()
+        private set
+
+    /** The colour space in force. */
+    var swapColorSpace = TargetColorSpace.VK_SRGB_NONLINEAR
+        private set
+
+    /**
+     * The colour space the swapchain should be in, set from the source.
+     *
+     * Assigning a different one rebuilds the swapchain, because a colour space
+     * is fixed at creation. Rare: it changes when a file does, not per frame.
+     */
+    var targetColorSpace = TargetColorSpace.VK_SRGB_NONLINEAR
+        set(value) {
+            if (field == value) return
+            field = value
+            colorSpaceDirty = true
+        }
+    private var colorSpaceDirty = false
+
+    /** Bits per colour channel, to prefer depth when a colour space needs it. */
+    private fun formatDepth(format: Int): Int = when (format) {
+        VK_FORMAT_R16G16B16A16_SFLOAT -> 16
+        // A2B10G10R10 / A2R10G10B10 packed.
+        64, 58 -> 10
+        else -> 8
+    }
     /**
      * Whether the host paces its own commits (vsync mode 2, the default). Read
      * here rather than passed so the swapchain and the loop cannot disagree.
@@ -483,6 +513,29 @@ class VkPresenter(private val window: Long) {
                     }
                 }
             }
+
+            // Which colour spaces this surface can carry, so the choice can be
+            // made against what actually exists rather than assumed.
+            offeredColorSpaces = (0 until fc.get(0))
+                .map { formats.get(it).colorSpace() }
+                .toSet()
+
+            // The colour space the file needs, if one was asked for. Prefer a
+            // format that pairs with it -- 8-bit cannot carry HDR usefully, so
+            // the deepest one offered with that space wins.
+            if (wanted == null && targetColorSpace != TargetColorSpace.VK_SRGB_NONLINEAR) {
+                var best: VkSurfaceFormatKHR? = null
+                for (i in 0 until fc.get(0)) {
+                    val f = formats.get(i)
+                    if (f.colorSpace() != targetColorSpace) continue
+                    if (best == null || formatDepth(f.format()) > formatDepth(best!!.format())) {
+                        best = f
+                    }
+                }
+                if (best != null) chosen = best!!
+            }
+            swapColorSpace = chosen.colorSpace()
+
             if (videoLog) {
                 val offered = (0 until fc.get(0)).joinToString(" ") {
                     "${formats.get(it).format()}/${formats.get(it).colorSpace()}"
@@ -547,7 +600,7 @@ class VkPresenter(private val window: Long) {
                 .surface(surface)
                 .minImageCount(minImages)
                 .imageFormat(swapFormat)
-                .imageColorSpace(chosen.colorSpace())
+                .imageColorSpace(swapColorSpace)
                 .imageArrayLayers(1)
                 // TRANSFER_DST because the frame arrives as a blit, not a draw.
                 .imageUsage(swapUsage)
@@ -1824,6 +1877,16 @@ class VkPresenter(private val window: Long) {
         if (gTargetImage == VK_NULL_HANDLE) return
         frameCounter++
         drainRetiredChrome()
+        // A colour space is fixed when the swapchain is created, so following
+        // the source means rebuilding when the source changes. Once per file,
+        // not per frame, and on the same path a resize already takes.
+        if (colorSpaceDirty) {
+            colorSpaceDirty = false
+            println("vk-colorspace: rebuilding for $targetColorSpace")
+            rebuild()
+            destroyGraphiteTarget()
+            createGraphiteTarget(swapWidth, swapHeight)
+        }
         // Skia's drawing runs first and on the same queue, so submission order
         // alone orders the blit after it. The lock is against mpv's render
         // thread, which submits to this same queue.
