@@ -1481,7 +1481,12 @@ fun main(args: Array<String>) {
                 // no longer costs a flash.
                 val key = when {
                     videoHost?.hasFile != true -> "none"
-                    prim == null && trc == null -> lastColorSourceKey
+                    // EITHER missing is an incomplete answer, not a new one.
+                    // These arrive separately, so a moment of "bt.2020/null"
+                    // read as a change and dropped the target out of HDR and
+                    // straight back -- eighteen swapchain rebuilds in one
+                    // session, invisible only because the handover hides them.
+                    prim == null || trc == null -> lastColorSourceKey
                     else -> "$prim/$trc"
                 }
                 if (key != lastColorSourceKey) {
