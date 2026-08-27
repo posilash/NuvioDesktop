@@ -1290,6 +1290,7 @@ fun main(args: Array<String>) {
                             srcWidth = pv.buffer.width,
                             srcHeight = pv.buffer.height,
                             generation = pv.buffer.generation,
+                            format = pv.buffer.format,
                             dst = pr,
                         )
                     }
@@ -1459,22 +1460,28 @@ fun main(args: Array<String>) {
         (pipeline as? VkGlDisplayPipeline)?.vk?.let { vp ->
             val m = mpv
             if (m != null && presenter != null) {
-                val want = TargetColorSpace.forSource(
-                    m.cachedString("video-params/primaries"),
-                    m.cachedString("video-params/gamma"),
-                    presenter.offeredColorSpaces,
-                )
+                val prim = m.cachedString("video-params/primaries")
+                val trc = m.cachedString("video-params/gamma")
+                // Unknown is not the same as SDR. These go null across a load
+                // or a seek, and treating that as "SDR" rebuilt the swapchain
+                // out of HDR and straight back a moment later -- a visible flap
+                // on every stream start. Hold the current answer until there is
+                // a real one; a file ending clears it back to SDR below.
+                val known = prim != null || trc != null
+                val want = when {
+                    videoHost?.hasFile != true -> TargetColorSpace.SDR
+                    !known -> vp.targetColorSpace
+                    else -> TargetColorSpace.forSource(prim, trc, presenter.offeredColorSpaces)
+                }
                 if (videoLog && frames % 600 == 0) {
                     println(
-                        "video-params: prim=${m.cachedString("video-params/primaries")} " +
-                            "trc=${m.cachedString("video-params/gamma")} " +
+                        "video-params: prim=$prim trc=$trc " +
                             "peak=${m.cachedString("video-params/sig-peak")}",
                     )
                 }
                 if (want != vp.targetColorSpace) {
                     println(
-                        "video: source ${m.cachedString("video-params/primaries")}/" +
-                            "${m.cachedString("video-params/gamma")} -> target " +
+                        "video: source $prim/$trc -> target " +
                             "prim=${want.primaries} trc=${want.transfer} vk=${want.vk}",
                     )
                     vp.targetColorSpace = want

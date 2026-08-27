@@ -1688,6 +1688,8 @@ class VkPresenter(private val window: Long) {
         srcWidth: Int,
         srcHeight: Int,
         generation: Int,
+        /** The buffer's own VkFormat -- it follows the target's depth. */
+        format: Int,
         dst: org.jetbrains.skia.Rect,
     ): Boolean {
         val rec = recorder ?: return false
@@ -1695,7 +1697,7 @@ class VkPresenter(private val window: Long) {
         val wrapped = videoImages[generation] ?: run {
             evictVideoWraps(generation)
             val info = org.jetbrains.skia.gpu.graphite.VulkanTextureInfo(
-                format = org.jetbrains.skia.gpu.graphite.VulkanFormat(VideoPipelineVk.FORMAT),
+                format = org.jetbrains.skia.gpu.graphite.VulkanFormat(format),
                 imageUsageFlags = org.jetbrains.skia.gpu.graphite.VulkanImageUsageFlags(
                     VideoPipelineVk.USAGE,
                 ),
