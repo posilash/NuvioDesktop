@@ -147,6 +147,9 @@ class VkPresenter(private val window: Long) {
     val featuresChain: Long get() = features2?.address() ?: 0L
     val deviceExtensions: List<String> get() = enabledExtensions
 
+    /** The format the scene must render into to be copyable to the target. */
+    val targetFormat: Int get() = swapFormat
+
     /** Whether [importDmabuf] can be used at all on this device. */
     var dmabufImportSupported = false
         private set
@@ -945,6 +948,17 @@ class VkPresenter(private val window: Long) {
         val surface: org.jetbrains.skia.Surface,
         val width: Int,
         val height: Int,
+        /**
+         * The VkFormat it was created with.
+         *
+         * Load-bearing: these are handed to the target by vkCmdCopyImage, which
+         * is a raw bit copy between size-compatible formats. A colour space
+         * change moves the swapchain from fp16 (64 bits per pixel) to
+         * A2B10G10R10 (32), and a buffer left at the old format then gets
+         * copied one into the other -- per-pixel noise and moiré, which reads
+         * as a colour bug and is not one.
+         */
+        val format: Int,
         val generation: Int,
     ) {
         /**
@@ -1070,7 +1084,7 @@ class VkPresenter(private val window: Long) {
             vkDestroyImage(device, image, null)
             return null
         }
-        return UiBuffer(image, memory, surface, w, h, ++uiBufferGeneration)
+        return UiBuffer(image, memory, surface, w, h, swapFormat, ++uiBufferGeneration)
     }
 
     fun destroyUiBuffer(b: UiBuffer) {

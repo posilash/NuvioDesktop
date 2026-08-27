@@ -482,7 +482,7 @@ class UiPipeline(
     ): VkPresenter.UiBuffer? = synchronized(lock) {
         for (b in vkBuffers) {
             if (b != null && b !== vkFront && b !== vkDisplayed &&
-                b.width == w && b.height == h
+                b.width == w && b.height == h && b.format == vkp.targetFormat
             ) {
                 return b
             }
