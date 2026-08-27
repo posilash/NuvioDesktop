@@ -25,6 +25,7 @@ import org.lwjgl.vulkan.VkExportSemaphoreCreateInfo
 import org.lwjgl.vulkan.VkExtensionProperties
 import org.lwjgl.vulkan.VkExternalMemoryImageCreateInfo
 import org.lwjgl.vulkan.VkFenceCreateInfo
+import org.lwjgl.vulkan.VkFormatProperties
 import org.lwjgl.vulkan.VkImageCreateInfo
 import org.lwjgl.vulkan.VkInstance
 import org.lwjgl.vulkan.VkInstanceCreateInfo
@@ -130,6 +131,22 @@ class VideoPipelineVk(private val mpv: Mpv) {
 
     var sharedDevice: SharedDevice? = null
 
+    /**
+     * The colour space this pipeline renders for, set from the source by the
+     * host. Volatile because the video thread reads it while the host writes.
+     */
+    @Volatile
+    var targetColorSpace: TargetColorSpace = TargetColorSpace.SDR
+        set(value) {
+            field = value
+            // Buffers reallocate on the next acquire.
+            val f = chooseRenderFormat(value)
+            if (f != renderFormat) {
+                println("vk-pipeline: render format $renderFormat -> $f for this target")
+                renderFormat = f
+            }
+        }
+
     /** Runs [block] holding the shared queue lock, if there is one. */
     private inline fun <T> withQueue(block: () -> T): T {
         val l = sharedDevice?.queueLock ?: return block()
@@ -199,6 +216,8 @@ class VideoPipelineVk(private val mpv: Mpv) {
         var outLayout = VK_IMAGE_LAYOUT_UNDEFINED
         var width = 0
         var height = 0
+        /** The VkFormat it was created with; the target's depth can change it. */
+        var format = 0
         /** Identity for consumer-side import caches; bumped on reallocation. */
         var generation = 0
         /** Consumer sets this after importing the fds, so the pipeline does
@@ -427,11 +446,12 @@ class VideoPipelineVk(private val mpv: Mpv) {
             // hands a *freshly wrapped* image over has no prior hold to pair
             // with. Harmless here: layout is UNDEFINED and nothing needs
             // preserving, so the unpaired release changes no behaviour.
+            val target = targetColorSpace
             val t = System.nanoTime()
             val (ret, outLayout) = mpv.renderVulkan(
                 Mpv.VulkanFrame(
                     image = buf.image,
-                    format = FORMAT,
+                    format = renderFormat,
                     w = w,
                     h = h,
                     usage = USAGE,
@@ -440,6 +460,14 @@ class VideoPipelineVk(private val mpv: Mpv) {
                     layout = VK_IMAGE_LAYOUT_UNDEFINED,
                     outLayout = 0, // mpv picks and reports back
                     signalSemaphore = buf.semaphore,
+                    // What this target is, so mpv renders for it instead of
+                    // assuming sRGB and tone-mapping HDR away. Zero when the
+                    // file is SDR or the surface cannot carry its colour space,
+                    // which is exactly the old behaviour.
+                    primaries = target.primaries,
+                    transfer = target.transfer,
+                    minLuma = target.minLuma,
+                    maxLuma = target.maxLuma,
                 ),
             )
             renders++
@@ -519,8 +547,42 @@ class VideoPipelineVk(private val mpv: Mpv) {
     }
 
     private fun needsRealloc(w: Int, h: Int): Boolean {
+        // Size only -- format is handled in acquireBuffer. Testing it here
+        // kept this true until every buffer cycled, rendering every pass.
         val f = synchronized(lock) { front ?: displayed }
         return f == null || f.width != w || f.height != h
+    }
+
+    /**
+     * The format mpv renders into. 8-bit bands visibly under PQ, so an HDR
+     * target gets 10-bit -- checked against the device, since STORAGE on a
+     * packed 10-bit format is optional in Vulkan.
+     */
+    @Volatile
+    var renderFormat = FORMAT
+        private set
+
+    private fun chooseRenderFormat(target: TargetColorSpace): Int {
+        if (!target.isHdr) return FORMAT
+        for (f in intArrayOf(VK_FORMAT_A2B10G10R10_UNORM_PACK32, VK_FORMAT_R16G16B16A16_SFLOAT)) {
+            if (supportsRenderFormat(f)) return f
+        }
+        return FORMAT
+    }
+
+    private fun supportsRenderFormat(format: Int): Boolean {
+        if (!::physicalDevice.isInitialized) return false
+        stackPush().use { s ->
+            val props = VkFormatProperties.calloc(s)
+            vkGetPhysicalDeviceFormatProperties(physicalDevice, format, props)
+            // TRANSFER_SRC/DST as format features are Vulkan 1.1.
+            val need = VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT or
+                VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT or
+                VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT or
+                VK11.VK_FORMAT_FEATURE_TRANSFER_SRC_BIT or
+                VK11.VK_FORMAT_FEATURE_TRANSFER_DST_BIT
+            return props.optimalTilingFeatures() and need == need
+        }
     }
 
     /** Pick the buffer that is neither published nor being displayed. */
@@ -542,7 +604,11 @@ class VideoPipelineVk(private val mpv: Mpv) {
             drainSemaphore(buf.semaphore)
             buf.signalPending = false
         }
-        if (buf.image == VK_NULL_HANDLE || buf.width != w || buf.height != h) {
+        // Format belongs here as much as size: a buffer left at the old one
+        // has mpv rendering into a format it was not told about.
+        if (buf.image == VK_NULL_HANDLE || buf.width != w || buf.height != h ||
+            buf.format != renderFormat
+        ) {
             releaseBuffer(buf)
             allocateBuffer(buf, w, h)
         }
@@ -779,7 +845,7 @@ class VideoPipelineVk(private val mpv: Mpv) {
                 .sType(VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO)
                 .pNext(ext.address())
                 .imageType(VK_IMAGE_TYPE_2D)
-                .format(FORMAT)
+                .format(renderFormat)
                 .mipLevels(1)
                 .arrayLayers(1)
                 .samples(VK_SAMPLE_COUNT_1_BIT)
@@ -855,6 +921,7 @@ class VideoPipelineVk(private val mpv: Mpv) {
 
             b.width = w
             b.height = h
+            b.format = renderFormat
             b.outLayout = VK_IMAGE_LAYOUT_UNDEFINED
             b.fdsOwnedByConsumer = false
             b.glDoneOwed = false

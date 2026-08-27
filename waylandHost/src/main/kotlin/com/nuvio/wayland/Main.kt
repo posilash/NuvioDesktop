@@ -241,6 +241,8 @@ fun main(args: Array<String>) {
     }
     // The grid the next commit is due on; 0 until the first frame anchors it.
     var nextSwapDueNs = 0L
+    /** The source description the target was last computed from. */
+    var lastColorSourceKey = "none"
     /** Set by the shutdown hook so a signal leaves through the normal teardown. */
     val quitRequested = java.util.concurrent.atomic.AtomicBoolean(false)
     val shutdownComplete = java.util.concurrent.CountDownLatch(1)
@@ -1290,6 +1292,7 @@ fun main(args: Array<String>) {
                             srcWidth = pv.buffer.width,
                             srcHeight = pv.buffer.height,
                             generation = pv.buffer.generation,
+                            format = pv.buffer.format,
                             dst = pr,
                         )
                     }
@@ -1450,6 +1453,48 @@ fun main(args: Array<String>) {
         // 24fps there are 40ms of them, and when the UI is heavier than that
         // it is the chrome that degrades, never the video.
         val videoChanged = videoFrameReady.getAndSet(false)
+
+        // Follow the source's colour space, per file.
+        (pipeline as? VkGlDisplayPipeline)?.vk?.let { vp ->
+            val m = mpv
+            // Not before the surface's offered list is known.
+            if (m != null && presenter != null && presenter.offeredColorSpaces.isNotEmpty()) {
+                val prim = m.cachedString("video-params/primaries")
+                val trc = m.cachedString("video-params/gamma")
+                // Keyed on the source, and recomputed only when the source
+                // changes. Deciding every frame let one momentary read flip the
+                // answer back, and since each flip rebuilds the swapchain the
+                // result was a hard flicker that outlived the stream -- the
+                // target follows the file, so it should only move when the file
+                // does. Unknown is not a change: these go null across a load or
+                // a seek and must not be read as "SDR".
+                // sRGB when there is no file: the UI is sRGB and is
+                // over-saturated in an HDR target. Either property missing is
+                // an incomplete reading, not a new one -- they arrive
+                // separately, and "bt.2020/null" used to flip it out of HDR.
+                val key = when {
+                    videoHost?.hasFile != true -> "none"
+                    prim == null || trc == null -> lastColorSourceKey
+                    else -> "$prim/$trc"
+                }
+                if (key != lastColorSourceKey) {
+                    lastColorSourceKey = key
+                    val want = if (key == "none") {
+                        TargetColorSpace.SDR
+                    } else {
+                        TargetColorSpace.forSource(prim, trc, presenter.offeredColorSpaces)
+                    }
+                    if (want != vp.targetColorSpace) {
+                        println(
+                            "video: source $key -> target " +
+                                "prim=${want.primaries} trc=${want.transfer} vk=${want.vk}",
+                        )
+                        vp.targetColorSpace = want
+                        presenter.targetColorSpace = want.vk
+                    }
+                }
+            }
+        }
         // The chrome takes no part in this loop: it is a compositor-layered
         // subsurface fed on the GLib thread. Keeping it (and every other
         // foreign concern) out of this window's GL and present cadence is

@@ -7,6 +7,7 @@ import java.lang.foreign.MemoryLayout
 import java.lang.foreign.MemorySegment
 import java.lang.foreign.SymbolLookup
 import java.lang.foreign.ValueLayout.ADDRESS
+import java.lang.foreign.ValueLayout.JAVA_FLOAT
 import java.lang.foreign.ValueLayout.JAVA_INT
 import java.lang.foreign.ValueLayout.JAVA_LONG
 import java.lang.invoke.MethodHandles
@@ -134,8 +135,9 @@ class Mpv private constructor(private val handle: MemorySegment, private val are
             ADDRESS.withName("queue_ctx"),         // @96
         )
 
-        // struct mpv_vulkan_fbo (fork mpv/render_vk.h) -- 64 bytes, no padding:
-        // the seven leading 4-byte fields end at 32, realigning the semaphores.
+        // struct mpv_vulkan_fbo (fork mpv/render_vk.h) -- 80 bytes, no padding:
+        // the seven leading 4-byte fields end at 32, realigning the semaphores,
+        // and the colour space tail is two ints then two floats.
         private val VULKAN_FBO: MemoryLayout = MemoryLayout.structLayout(
             JAVA_LONG.withName("image"),            // @0   VkImage (non-dispatchable, u64)
             JAVA_INT.withName("format"),            // @8   VkFormat
@@ -148,6 +150,13 @@ class Mpv private constructor(private val handle: MemorySegment, private val are
             JAVA_LONG.withName("signal_value"),     // @40  0 = binary semaphore
             JAVA_LONG.withName("wait_semaphore"),   // @48  optional
             JAVA_LONG.withName("wait_value"),       // @56
+            // What this target actually is, so mpv renders for it rather than
+            // assuming sRGB. Zeroed means "not stated" and mpv keeps its old
+            // behaviour. Same values --target-prim and --target-trc take.
+            JAVA_INT.withName("primaries"),         // @64  pl_color_primaries
+            JAVA_INT.withName("transfer"),          // @68  pl_color_transfer
+            JAVA_FLOAT.withName("min_luma"),        // @72  cd/m^2, 0 = unknown
+            JAVA_FLOAT.withName("max_luma"),        // @76
         )
 
         private val linker: Linker = Linker.nativeLinker()
@@ -522,6 +531,19 @@ class Mpv private constructor(private val handle: MemorySegment, private val are
         /** Optional: mpv waits on this before touching the image. */
         val waitSemaphore: Long = 0,
         val waitValue: Long = 0,
+        /**
+         * What this image's colour space actually is, so mpv renders for it.
+         *
+         * All zero means "not stated", and mpv treats the target as sRGB -- the
+         * behaviour before the fork carried these, and the reason HDR arrived
+         * tone-mapped to SDR whatever the source was. mpv owns no swapchain on
+         * this path, so target-colorspace-hint cannot reach anything; the host
+         * owns it and is the one that knows.
+         */
+        val primaries: Int = 0,
+        val transfer: Int = 0,
+        val minLuma: Float = 0f,
+        val maxLuma: Float = 0f,
     )
 
     /**
@@ -548,6 +570,10 @@ class Mpv private constructor(private val handle: MemorySegment, private val are
             fbo.set(JAVA_LONG, 40, frame.signalValue)
             fbo.set(JAVA_LONG, 48, frame.waitSemaphore)
             fbo.set(JAVA_LONG, 56, frame.waitValue)
+            fbo.set(JAVA_INT, 64, frame.primaries)
+            fbo.set(JAVA_INT, 68, frame.transfer)
+            fbo.set(JAVA_FLOAT, 72, frame.minLuma)
+            fbo.set(JAVA_FLOAT, 76, frame.maxLuma)
 
             val params = a.allocate(RENDER_PARAM, 2)
             params.set(JAVA_INT, 0, MPV_RENDER_PARAM_VULKAN_FBO)

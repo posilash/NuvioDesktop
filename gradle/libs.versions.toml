@@ -24,7 +24,12 @@ kotlinx-serialization = "1.8.1"
 atomicfu = "0.32.1"
 kmpalette = "4.0.0-beta02"
 ktor = "3.4.1"
-material3 = "1.11.0-alpha07"
+# Must track composeMultiplatform. material3 is compiled against a specific
+# foundation, and 1.11's was not 1.12's: foundation.style.CustomStyle gained an
+# applyStyle(CustomStyleScope) that 1.11's material3 does not implement, so
+# every screen with an OutlinedTextField threw AbstractMethodError out of
+# scene.draw -- the UI degrading on the way back from a stream.
+material3 = "1.12.10-alpha01+dev4686"
 androidx-media3 = "1.8.0"
 mpv-android-lib = "0.1.12"
 supabase = "3.4.1"

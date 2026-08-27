@@ -840,6 +840,13 @@ class WaylandVideoHost(
             // As STRING this arrives as the full JSON blob -- pushed by the
             // core only when tracks actually change, never polled.
             "track-list",
+            // The source's colour space. The target is derived from it, which
+            // is what target-colorspace-hint-mode=source means -- nothing is
+            // chosen here, it follows the file and changes with it.
+            // "gamma" is mpv's name for the transfer function; there is no
+            // video-params/transfer, and asking for one silently yields null.
+            "video-params/primaries", "video-params/gamma",
+            "video-params/sig-peak",
         )
     }
 }

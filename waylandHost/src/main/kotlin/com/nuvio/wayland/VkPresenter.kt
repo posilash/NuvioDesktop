@@ -147,6 +147,9 @@ class VkPresenter(private val window: Long) {
     val featuresChain: Long get() = features2?.address() ?: 0L
     val deviceExtensions: List<String> get() = enabledExtensions
 
+    /** The format the scene must render into to be copyable to the target. */
+    val targetFormat: Int get() = swapFormat
+
     /** Whether [importDmabuf] can be used at all on this device. */
     var dmabufImportSupported = false
         private set
@@ -161,6 +164,31 @@ class VkPresenter(private val window: Long) {
     private var queueFamily = 0
     private var queueCount = 1
     private var presentMode = KHRSurface.VK_PRESENT_MODE_FIFO_KHR
+
+    /** Colour spaces this surface offers; empty until the swapchain is built. */
+    var offeredColorSpaces: Set<Int> = emptySet()
+        private set
+
+    /** The colour space in force. */
+    var swapColorSpace = TargetColorSpace.VK_SRGB_NONLINEAR
+        private set
+
+    /** Assigning a different one rebuilds: colour space is fixed at creation. */
+    var targetColorSpace = TargetColorSpace.VK_SRGB_NONLINEAR
+        set(value) {
+            if (field == value) return
+            field = value
+            colorSpaceDirty = true
+        }
+    private var colorSpaceDirty = false
+
+    /** Bits per colour channel, to prefer depth when a colour space needs it. */
+    private fun formatDepth(format: Int): Int = when (format) {
+        VK_FORMAT_R16G16B16A16_SFLOAT -> 16
+        // A2B10G10R10 / A2R10G10B10 packed.
+        64, 58 -> 10
+        else -> 8
+    }
     /**
      * Whether the host paces its own commits (vsync mode 2, the default). Read
      * here rather than passed so the swapchain and the loop cannot disagree.
@@ -458,7 +486,11 @@ class VkPresenter(private val window: Long) {
         }
     }
 
-    private fun createSwapchain(width: Int, height: Int) {
+    /**
+     * @param oldSwapchain the swapchain being replaced, so the driver can hand
+     *   presentation over without a blank frame. VK_NULL_HANDLE on first build.
+     */
+    private fun createSwapchain(width: Int, height: Int, oldSwapchain: Long = VK_NULL_HANDLE) {
         stackPush().use { s ->
             val caps = VkSurfaceCapabilitiesKHR.calloc(s)
             check(
@@ -483,6 +515,27 @@ class VkPresenter(private val window: Long) {
                     }
                 }
             }
+
+            // What this surface can actually carry.
+            offeredColorSpaces = (0 until fc.get(0))
+                .map { formats.get(it).colorSpace() }
+                .toSet()
+
+            // Deepest format offered with the wanted space; 8-bit cannot
+            // carry HDR usefully.
+            if (wanted == null && targetColorSpace != TargetColorSpace.VK_SRGB_NONLINEAR) {
+                var best: VkSurfaceFormatKHR? = null
+                for (i in 0 until fc.get(0)) {
+                    val f = formats.get(i)
+                    if (f.colorSpace() != targetColorSpace) continue
+                    if (best == null || formatDepth(f.format()) > formatDepth(best!!.format())) {
+                        best = f
+                    }
+                }
+                if (best != null) chosen = best!!
+            }
+            swapColorSpace = chosen.colorSpace()
+
             if (videoLog) {
                 val offered = (0 until fc.get(0)).joinToString(" ") {
                     "${formats.get(it).format()}/${formats.get(it).colorSpace()}"
@@ -547,7 +600,7 @@ class VkPresenter(private val window: Long) {
                 .surface(surface)
                 .minImageCount(minImages)
                 .imageFormat(swapFormat)
-                .imageColorSpace(chosen.colorSpace())
+                .imageColorSpace(swapColorSpace)
                 .imageArrayLayers(1)
                 // TRANSFER_DST because the frame arrives as a blit, not a draw.
                 .imageUsage(swapUsage)
@@ -556,7 +609,7 @@ class VkPresenter(private val window: Long) {
                 .compositeAlpha(KHRSurface.VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR)
                 .presentMode(presentMode)
                 .clipped(true)
-                .oldSwapchain(VK_NULL_HANDLE)
+                .oldSwapchain(oldSwapchain)
             sci.imageExtent().width(swapWidth).height(swapHeight)
 
             run {
@@ -892,6 +945,12 @@ class VkPresenter(private val window: Long) {
         val surface: org.jetbrains.skia.Surface,
         val width: Int,
         val height: Int,
+        /**
+         * The VkFormat it was created with. vkCmdCopyImage to the target is a
+         * raw bit copy, so a buffer left at fp16 (64bpp) while the target is
+         * A2B10G10R10 (32bpp) comes out as per-pixel noise.
+         */
+        val format: Int,
         val generation: Int,
     ) {
         /**
@@ -1017,7 +1076,7 @@ class VkPresenter(private val window: Long) {
             vkDestroyImage(device, image, null)
             return null
         }
-        return UiBuffer(image, memory, surface, w, h, ++uiBufferGeneration)
+        return UiBuffer(image, memory, surface, w, h, swapFormat, ++uiBufferGeneration)
     }
 
     fun destroyUiBuffer(b: UiBuffer) {
@@ -1635,6 +1694,8 @@ class VkPresenter(private val window: Long) {
         srcWidth: Int,
         srcHeight: Int,
         generation: Int,
+        /** The buffer's own VkFormat -- it follows the target's depth. */
+        format: Int,
         dst: org.jetbrains.skia.Rect,
     ): Boolean {
         val rec = recorder ?: return false
@@ -1642,7 +1703,7 @@ class VkPresenter(private val window: Long) {
         val wrapped = videoImages[generation] ?: run {
             evictVideoWraps(generation)
             val info = org.jetbrains.skia.gpu.graphite.VulkanTextureInfo(
-                format = org.jetbrains.skia.gpu.graphite.VulkanFormat(VideoPipelineVk.FORMAT),
+                format = org.jetbrains.skia.gpu.graphite.VulkanFormat(format),
                 imageUsageFlags = org.jetbrains.skia.gpu.graphite.VulkanImageUsageFlags(
                     VideoPipelineVk.USAGE,
                 ),
@@ -1824,6 +1885,14 @@ class VkPresenter(private val window: Long) {
         if (gTargetImage == VK_NULL_HANDLE) return
         frameCounter++
         drainRetiredChrome()
+        // Once per file, on the same path a resize takes.
+        if (colorSpaceDirty) {
+            colorSpaceDirty = false
+            println("vk-colorspace: rebuilding for $targetColorSpace")
+            rebuild()
+            destroyGraphiteTarget()
+            createGraphiteTarget(swapWidth, swapHeight)
+        }
         // Skia's drawing runs first and on the same queue, so submission order
         // alone orders the blit after it. The lock is against mpv's render
         // thread, which submits to this same queue.
@@ -1952,9 +2021,15 @@ class VkPresenter(private val window: Long) {
         destroyTarget()
         for (sem in renderFinished) vkDestroySemaphore(device, sem, null)
         renderFinished = LongArray(0)
-        KHRSwapchain.vkDestroySwapchainKHR(device, swapchain, null)
+        // Hand the old one over rather than destroying it first: starting
+        // presentation from nothing leaves a frame with no content, which the
+        // compositor shows as a flash.
+        val retiring = swapchain
         swapchain = VK_NULL_HANDLE
-        createSwapchain(ww, wh)
+        createSwapchain(ww, wh, retiring)
+        if (retiring != VK_NULL_HANDLE) {
+            KHRSwapchain.vkDestroySwapchainKHR(device, retiring, null)
+        }
         // The target matches the swapchain, so the blit is 1:1 and the scene is
         // laid out at the size actually being presented.
         createTarget(swapWidth, swapHeight)
