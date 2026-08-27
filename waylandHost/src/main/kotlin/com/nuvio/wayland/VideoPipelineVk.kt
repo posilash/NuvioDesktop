@@ -548,8 +548,11 @@ class VideoPipelineVk(private val mpv: Mpv) {
     }
 
     private fun needsRealloc(w: Int, h: Int): Boolean {
+        // Size only. A format change is handled where the buffer is picked, so
+        // testing it here just kept this true until every buffer had cycled --
+        // rendering on every pass rather than on new frames.
         val f = synchronized(lock) { front ?: displayed }
-        return f == null || f.width != w || f.height != h || f.format != renderFormat
+        return f == null || f.width != w || f.height != h
     }
 
     /**
@@ -610,7 +613,14 @@ class VideoPipelineVk(private val mpv: Mpv) {
             drainSemaphore(buf.semaphore)
             buf.signalPending = false
         }
-        if (buf.image == VK_NULL_HANDLE || buf.width != w || buf.height != h) {
+        // Format belongs here as much as size does. Without it a buffer kept
+        // its old 8-bit image while mpv was handed the new format in the fbo,
+        // so mpv rendered one thing into another -- and needsRealloc stayed
+        // true forever, which made the thread render on every pass instead of
+        // on new frames. That pair is the flicker, at double the source rate.
+        if (buf.image == VK_NULL_HANDLE || buf.width != w || buf.height != h ||
+            buf.format != renderFormat
+        ) {
             releaseBuffer(buf)
             allocateBuffer(buf, w, h)
         }
