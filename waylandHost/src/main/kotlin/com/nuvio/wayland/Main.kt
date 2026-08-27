@@ -1473,18 +1473,19 @@ fun main(args: Array<String>) {
                 // target follows the file, so it should only move when the file
                 // does. Unknown is not a change: these go null across a load or
                 // a seek and must not be read as "SDR".
+                // Leaving a stream changes nothing. Reverting to sRGB there
+                // rebuilds the swapchain for no one's benefit -- a flash on the
+                // way back to the UI, every time -- and the UI is correct in
+                // either space. The target only moves when a file needs a
+                // different one, so an SDR file after an HDR one still switches.
                 val key = when {
-                    videoHost?.hasFile != true -> "none"
+                    videoHost?.hasFile != true -> lastColorSourceKey
                     prim == null && trc == null -> lastColorSourceKey
                     else -> "$prim/$trc"
                 }
                 if (key != lastColorSourceKey) {
                     lastColorSourceKey = key
-                    val want = if (key == "none") {
-                        TargetColorSpace.SDR
-                    } else {
-                        TargetColorSpace.forSource(prim, trc, presenter.offeredColorSpaces)
-                    }
+                    val want = TargetColorSpace.forSource(prim, trc, presenter.offeredColorSpaces)
                     if (want != vp.targetColorSpace) {
                         println(
                             "video: source $key -> target " +
