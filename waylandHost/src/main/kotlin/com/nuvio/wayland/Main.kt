@@ -1454,15 +1454,10 @@ fun main(args: Array<String>) {
         // it is the chrome that degrades, never the video.
         val videoChanged = videoFrameReady.getAndSet(false)
 
-        // Follow the source's colour space. This is what
-        // target-colorspace-hint-mode=source does in a normal VO, done here
-        // because mpv owns no swapchain on this path and cannot do it itself.
-        // Recomputed from mpv's own video-params, so it changes with the file
-        // and nothing about any particular colour space is assumed.
+        // Follow the source's colour space, per file.
         (pipeline as? VkGlDisplayPipeline)?.vk?.let { vp ->
             val m = mpv
-            // Only once the surface's own list is known -- deciding against an
-            // empty one answers "no HDR here" for the wrong reason.
+            // Not before the surface's offered list is known.
             if (m != null && presenter != null && presenter.offeredColorSpaces.isNotEmpty()) {
                 val prim = m.cachedString("video-params/primaries")
                 val trc = m.cachedString("video-params/gamma")
@@ -1473,19 +1468,12 @@ fun main(args: Array<String>) {
                 // target follows the file, so it should only move when the file
                 // does. Unknown is not a change: these go null across a load or
                 // a seek and must not be read as "SDR".
-                // Back to sRGB when there is no file. The UI is drawn as sRGB
-                // and is only correct in an sRGB target -- left in an HDR one
-                // it comes out over-saturated, which is exactly what playing an
-                // SDR video afterwards fixes, by switching the target back.
-                // The rebuild that does it hands the old swapchain over, so it
-                // no longer costs a flash.
+                // sRGB when there is no file: the UI is sRGB and is
+                // over-saturated in an HDR target. Either property missing is
+                // an incomplete reading, not a new one -- they arrive
+                // separately, and "bt.2020/null" used to flip it out of HDR.
                 val key = when {
                     videoHost?.hasFile != true -> "none"
-                    // EITHER missing is an incomplete answer, not a new one.
-                    // These arrive separately, so a moment of "bt.2020/null"
-                    // read as a change and dropped the target out of HDR and
-                    // straight back -- eighteen swapchain rebuilds in one
-                    // session, invisible only because the handover hides them.
                     prim == null || trc == null -> lastColorSourceKey
                     else -> "$prim/$trc"
                 }

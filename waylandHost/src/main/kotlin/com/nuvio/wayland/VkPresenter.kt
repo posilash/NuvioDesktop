@@ -173,12 +173,7 @@ class VkPresenter(private val window: Long) {
     var swapColorSpace = TargetColorSpace.VK_SRGB_NONLINEAR
         private set
 
-    /**
-     * The colour space the swapchain should be in, set from the source.
-     *
-     * Assigning a different one rebuilds the swapchain, because a colour space
-     * is fixed at creation. Rare: it changes when a file does, not per frame.
-     */
+    /** Assigning a different one rebuilds: colour space is fixed at creation. */
     var targetColorSpace = TargetColorSpace.VK_SRGB_NONLINEAR
         set(value) {
             if (field == value) return
@@ -521,15 +516,13 @@ class VkPresenter(private val window: Long) {
                 }
             }
 
-            // Which colour spaces this surface can carry, so the choice can be
-            // made against what actually exists rather than assumed.
+            // What this surface can actually carry.
             offeredColorSpaces = (0 until fc.get(0))
                 .map { formats.get(it).colorSpace() }
                 .toSet()
 
-            // The colour space the file needs, if one was asked for. Prefer a
-            // format that pairs with it -- 8-bit cannot carry HDR usefully, so
-            // the deepest one offered with that space wins.
+            // Deepest format offered with the wanted space; 8-bit cannot
+            // carry HDR usefully.
             if (wanted == null && targetColorSpace != TargetColorSpace.VK_SRGB_NONLINEAR) {
                 var best: VkSurfaceFormatKHR? = null
                 for (i in 0 until fc.get(0)) {
@@ -953,14 +946,9 @@ class VkPresenter(private val window: Long) {
         val width: Int,
         val height: Int,
         /**
-         * The VkFormat it was created with.
-         *
-         * Load-bearing: these are handed to the target by vkCmdCopyImage, which
-         * is a raw bit copy between size-compatible formats. A colour space
-         * change moves the swapchain from fp16 (64 bits per pixel) to
-         * A2B10G10R10 (32), and a buffer left at the old format then gets
-         * copied one into the other -- per-pixel noise and moiré, which reads
-         * as a colour bug and is not one.
+         * The VkFormat it was created with. vkCmdCopyImage to the target is a
+         * raw bit copy, so a buffer left at fp16 (64bpp) while the target is
+         * A2B10G10R10 (32bpp) comes out as per-pixel noise.
          */
         val format: Int,
         val generation: Int,
@@ -1897,9 +1885,7 @@ class VkPresenter(private val window: Long) {
         if (gTargetImage == VK_NULL_HANDLE) return
         frameCounter++
         drainRetiredChrome()
-        // A colour space is fixed when the swapchain is created, so following
-        // the source means rebuilding when the source changes. Once per file,
-        // not per frame, and on the same path a resize already takes.
+        // Once per file, on the same path a resize takes.
         if (colorSpaceDirty) {
             colorSpaceDirty = false
             println("vk-colorspace: rebuilding for $targetColorSpace")
@@ -2035,12 +2021,9 @@ class VkPresenter(private val window: Long) {
         destroyTarget()
         for (sem in renderFinished) vkDestroySemaphore(device, sem, null)
         renderFinished = LongArray(0)
-        // Hand the old swapchain over instead of destroying it first. Starting
-        // presentation from nothing leaves the surface with no content for a
-        // frame, which the compositor shows as a flash -- visible every time
-        // the colour space changes on leaving a stream. oldSwapchain is what
-        // that handover is for; the old one is destroyed once the new one
-        // exists.
+        // Hand the old one over rather than destroying it first: starting
+        // presentation from nothing leaves a frame with no content, which the
+        // compositor shows as a flash.
         val retiring = swapchain
         swapchain = VK_NULL_HANDLE
         createSwapchain(ww, wh, retiring)

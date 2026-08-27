@@ -139,8 +139,7 @@ class VideoPipelineVk(private val mpv: Mpv) {
     var targetColorSpace: TargetColorSpace = TargetColorSpace.SDR
         set(value) {
             field = value
-            // The depth mpv renders at follows the target: the buffers are
-            // reallocated on the next frame because needsRealloc sees it.
+            // Buffers reallocate on the next acquire.
             val f = chooseRenderFormat(value)
             if (f != renderFormat) {
                 println("vk-pipeline: render format $renderFormat -> $f for this target")
@@ -548,24 +547,16 @@ class VideoPipelineVk(private val mpv: Mpv) {
     }
 
     private fun needsRealloc(w: Int, h: Int): Boolean {
-        // Size only. A format change is handled where the buffer is picked, so
-        // testing it here just kept this true until every buffer had cycled --
-        // rendering on every pass rather than on new frames.
+        // Size only -- format is handled in acquireBuffer. Testing it here
+        // kept this true until every buffer cycled, rendering every pass.
         val f = synchronized(lock) { front ?: displayed }
         return f == null || f.width != w || f.height != h
     }
 
     /**
-     * The format mpv renders into.
-     *
-     * 8-bit is enough for an SDR target and is what this always used, but it
-     * is not enough for an HDR one: PQ spends its code points on the low end,
-     * and eight bits of it bands visibly in dark scenes. A standalone
-     * gpu-next window uses rgb10a2 for exactly this reason.
-     *
-     * Chosen against what the device actually supports for [USAGE] rather than
-     * assumed -- STORAGE on a packed 10-bit format is optional in Vulkan, and
-     * asking for an unsupported combination fails image creation.
+     * The format mpv renders into. 8-bit bands visibly under PQ, so an HDR
+     * target gets 10-bit -- checked against the device, since STORAGE on a
+     * packed 10-bit format is optional in Vulkan.
      */
     @Volatile
     var renderFormat = FORMAT
@@ -613,11 +604,8 @@ class VideoPipelineVk(private val mpv: Mpv) {
             drainSemaphore(buf.semaphore)
             buf.signalPending = false
         }
-        // Format belongs here as much as size does. Without it a buffer kept
-        // its old 8-bit image while mpv was handed the new format in the fbo,
-        // so mpv rendered one thing into another -- and needsRealloc stayed
-        // true forever, which made the thread render on every pass instead of
-        // on new frames. That pair is the flicker, at double the source rate.
+        // Format belongs here as much as size: a buffer left at the old one
+        // has mpv rendering into a format it was not told about.
         if (buf.image == VK_NULL_HANDLE || buf.width != w || buf.height != h ||
             buf.format != renderFormat
         ) {
