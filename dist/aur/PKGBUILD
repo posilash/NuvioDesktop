@@ -20,7 +20,7 @@ provides=("${pkgname}")
 # answers NOT_IMPLEMENTED; an mpv without the colour space fields builds and
 # then silently gives SDR. Installed here so it goes with the package.
 source=("${pkgname}::git+${url}.git#branch=render-api-vulkan"
-        "mpv::git+https://github.com/posilash/mpv.git#branch=render-target-colorspace")
+        "mpv::git+https://github.com/posilash/mpv.git#branch=master")
 sha256sums=('SKIP'
             'SKIP')
 
