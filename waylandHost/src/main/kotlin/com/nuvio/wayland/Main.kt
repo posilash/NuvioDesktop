@@ -241,6 +241,8 @@ fun main(args: Array<String>) {
     }
     // The grid the next commit is due on; 0 until the first frame anchors it.
     var nextSwapDueNs = 0L
+    /** The source description the target was last computed from. */
+    var lastColorSourceKey = "none"
     /** Set by the shutdown hook so a signal leaves through the normal teardown. */
     val quitRequested = java.util.concurrent.atomic.AtomicBoolean(false)
     val shutdownComplete = java.util.concurrent.CountDownLatch(1)
@@ -1459,33 +1461,38 @@ fun main(args: Array<String>) {
         // and nothing about any particular colour space is assumed.
         (pipeline as? VkGlDisplayPipeline)?.vk?.let { vp ->
             val m = mpv
-            if (m != null && presenter != null) {
+            // Only once the surface's own list is known -- deciding against an
+            // empty one answers "no HDR here" for the wrong reason.
+            if (m != null && presenter != null && presenter.offeredColorSpaces.isNotEmpty()) {
                 val prim = m.cachedString("video-params/primaries")
                 val trc = m.cachedString("video-params/gamma")
-                // Unknown is not the same as SDR. These go null across a load
-                // or a seek, and treating that as "SDR" rebuilt the swapchain
-                // out of HDR and straight back a moment later -- a visible flap
-                // on every stream start. Hold the current answer until there is
-                // a real one; a file ending clears it back to SDR below.
-                val known = prim != null || trc != null
-                val want = when {
-                    videoHost?.hasFile != true -> TargetColorSpace.SDR
-                    !known -> vp.targetColorSpace
-                    else -> TargetColorSpace.forSource(prim, trc, presenter.offeredColorSpaces)
+                // Keyed on the source, and recomputed only when the source
+                // changes. Deciding every frame let one momentary read flip the
+                // answer back, and since each flip rebuilds the swapchain the
+                // result was a hard flicker that outlived the stream -- the
+                // target follows the file, so it should only move when the file
+                // does. Unknown is not a change: these go null across a load or
+                // a seek and must not be read as "SDR".
+                val key = when {
+                    videoHost?.hasFile != true -> "none"
+                    prim == null && trc == null -> lastColorSourceKey
+                    else -> "$prim/$trc"
                 }
-                if (videoLog && frames % 600 == 0) {
-                    println(
-                        "video-params: prim=$prim trc=$trc " +
-                            "peak=${m.cachedString("video-params/sig-peak")}",
-                    )
-                }
-                if (want != vp.targetColorSpace) {
-                    println(
-                        "video: source $prim/$trc -> target " +
-                            "prim=${want.primaries} trc=${want.transfer} vk=${want.vk}",
-                    )
-                    vp.targetColorSpace = want
-                    presenter.targetColorSpace = want.vk
+                if (key != lastColorSourceKey) {
+                    lastColorSourceKey = key
+                    val want = if (key == "none") {
+                        TargetColorSpace.SDR
+                    } else {
+                        TargetColorSpace.forSource(prim, trc, presenter.offeredColorSpaces)
+                    }
+                    if (want != vp.targetColorSpace) {
+                        println(
+                            "video: source $key -> target " +
+                                "prim=${want.primaries} trc=${want.transfer} vk=${want.vk}",
+                        )
+                        vp.targetColorSpace = want
+                        presenter.targetColorSpace = want.vk
+                    }
                 }
             }
         }
