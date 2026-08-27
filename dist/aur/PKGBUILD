@@ -13,7 +13,7 @@ license=('GPL-3.0-or-later')
 depends=('mpv' 'libwpe' 'wpebackend-fdo' 'wpewebkit' 'wayland' 'libglvnd'
          'gcc-libs' 'libx11' 'libxext' 'libxi' 'libxrender' 'libxtst')
 makedepends=('git' 'java-environment>=17' 'gcc' 'meson' 'ninja' 'pkgconf'
-             'vulkan-headers')
+             'vulkan-headers' 'luajit')
 provides=("${pkgname}")
 # The fork carries the render API this host needs: a Vulkan backend, a
 # non-blocking render(), and the target colour space fields. Stock libmpv
@@ -68,7 +68,7 @@ build() {
 		-Dlibmpv=true \
 		-Dcplayer=false \
 		-Dmanpage-build=disabled \
-		-Dlua=disabled \
+		-Dlua=enabled \
 		-Djavascript=disabled
 	meson compile -C build
 
