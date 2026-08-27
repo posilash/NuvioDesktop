@@ -73,7 +73,8 @@ build() {
 		-Dgl=enabled \
 		-Dvulkan=enabled \
 		-Dwayland=enabled \
-		-Dx11=enabled
+		-Dx11=enabled \
+		-Dlibbluray=disabled
 	meson compile -C build
 
 	cd "${srcdir}/${pkgname}"
