@@ -491,7 +491,11 @@ class VkPresenter(private val window: Long) {
         }
     }
 
-    private fun createSwapchain(width: Int, height: Int) {
+    /**
+     * @param oldSwapchain the swapchain being replaced, so the driver can hand
+     *   presentation over without a blank frame. VK_NULL_HANDLE on first build.
+     */
+    private fun createSwapchain(width: Int, height: Int, oldSwapchain: Long = VK_NULL_HANDLE) {
         stackPush().use { s ->
             val caps = VkSurfaceCapabilitiesKHR.calloc(s)
             check(
@@ -612,7 +616,7 @@ class VkPresenter(private val window: Long) {
                 .compositeAlpha(KHRSurface.VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR)
                 .presentMode(presentMode)
                 .clipped(true)
-                .oldSwapchain(VK_NULL_HANDLE)
+                .oldSwapchain(oldSwapchain)
             sci.imageExtent().width(swapWidth).height(swapHeight)
 
             run {
@@ -2031,9 +2035,18 @@ class VkPresenter(private val window: Long) {
         destroyTarget()
         for (sem in renderFinished) vkDestroySemaphore(device, sem, null)
         renderFinished = LongArray(0)
-        KHRSwapchain.vkDestroySwapchainKHR(device, swapchain, null)
+        // Hand the old swapchain over instead of destroying it first. Starting
+        // presentation from nothing leaves the surface with no content for a
+        // frame, which the compositor shows as a flash -- visible every time
+        // the colour space changes on leaving a stream. oldSwapchain is what
+        // that handover is for; the old one is destroyed once the new one
+        // exists.
+        val retiring = swapchain
         swapchain = VK_NULL_HANDLE
-        createSwapchain(ww, wh)
+        createSwapchain(ww, wh, retiring)
+        if (retiring != VK_NULL_HANDLE) {
+            KHRSwapchain.vkDestroySwapchainKHR(device, retiring, null)
+        }
         // The target matches the swapchain, so the blit is 1:1 and the scene is
         // laid out at the size actually being presented.
         createTarget(swapWidth, swapHeight)
