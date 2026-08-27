@@ -8,33 +8,23 @@ pkgdesc="A modern media hub desktop application (git)"
 arch=('x86_64')
 url="https://github.com/posilash/NuvioDesktop"
 license=('GPL-3.0-or-later')
-# No Java dependency: the Compose distributable bundles its own jlink runtime.
-# mpv is here for the bundled libmpv's own dependencies; the WPE stack backs
-# the player chrome where the AWT build uses webkit2gtk; wayland and libglvnd
-# are what the GLFW window and the isolated fdo display use. Xi, Xrender and
-# Xtst stay: the host still runs AWT's event queue, which loads the X11
-# toolkit.
+# No Java: the Compose distributable bundles its own jlink runtime. The X libs
+# stay because the host still runs AWT's event queue.
 depends=('mpv' 'libwpe' 'wpebackend-fdo' 'wpewebkit' 'wayland' 'libglvnd'
          'gcc-libs' 'libx11' 'libxext' 'libxi' 'libxrender' 'libxtst')
 makedepends=('git' 'java-environment>=17' 'gcc' 'meson' 'ninja' 'pkgconf'
              'vulkan-headers')
 provides=("${pkgname}")
-# The fork carries the render API this host is written against: a gpu-next
-# backend ("opengl-next"), a Vulkan backend, a render() that does not block
-# without advanced control, and the target colour space fields the host uses to
-# say what it presents in. Stock libmpv answers NOT_IMPLEMENTED and the host
-# falls back to the legacy GL renderer, which is not what this is for; an mpv
-# without the colour space fields builds fine and then silently gives SDR,
-# because mpv assumes an sRGB target and tone-maps HDR away. Built and
-# installed here so it is removed with the package rather than left behind as a
-# system mpv nobody remembers replacing.
+# The fork carries the render API this host needs: a Vulkan backend, a
+# non-blocking render(), and the target colour space fields. Stock libmpv
+# answers NOT_IMPLEMENTED; an mpv without the colour space fields builds and
+# then silently gives SDR. Installed here so it goes with the package.
 source=("${pkgname}::git+${url}.git#branch=render-api-vulkan"
         "mpv::git+https://github.com/posilash/mpv.git#branch=render-target-colorspace")
 sha256sums=('SKIP'
             'SKIP')
 
-# Backend client config. Anon credentials, compiled into the binary as Kotlin
-# constants, so they are the same in every build; sign-in fails when unset.
+# Anon credentials, compiled in. Sign-in fails when unset.
 _supabase_url="https://api.nuvio.tv"
 _supabase_anon_key="eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJyb2xlIjoiYW5vbiIsImlzcyI6InN1cGFiYXNlIiwiaWF0IjoxNzgxNTIxMzQ2LCJleHAiOjE5MzkyMDEzNDZ9.tmQaj682pwzehpqlgCDMnySOqiUvpgRbrE43T4VJpDI"
 _supabase_fallback_url="https://api-two.nuvioapp.space"
@@ -58,12 +48,9 @@ TRAKT_CLIENT_ID=
 TRAKT_CLIENT_SECRET=
 EOF
 
-	# Skia's GrGLMakeNativeInterface() on Linux is GLX-based and returns null
-	# when glXGetCurrentContext() does, which under Wayland is always: the
-	# context is EGL. The host then dies at DirectContext.makeGL before showing
-	# a window. The entry points are fine -- libglvnd's glXGetProcAddress
-	# returns dispatch stubs that route to whatever context is current -- so
-	# only the guard is wrong.
+	# Skia's GrGLMakeNativeInterface() checks glXGetCurrentContext(), which is
+	# always null under Wayland, and the host dies at DirectContext.makeGL.
+	# Only the guard is wrong; the entry points resolve fine.
 	cat >"${srcdir}/glxshim.c" <<'EOF'
 void *glXGetCurrentContext(void) { return (void *) 1; }
 EOF
@@ -72,8 +59,7 @@ EOF
 build() {
 	gcc -shared -fPIC -o "${srcdir}/libglxshim.so" "${srcdir}/glxshim.c"
 
-	# libmpv only: the player binary, its scripting and its own windowing are
-	# all dead weight here.
+	# libmpv only.
 	cd "${srcdir}/mpv"
 	meson setup build \
 		--prefix=/usr \
@@ -97,17 +83,14 @@ package() {
 	cp -Rp "waylandHost/build/compose/binaries/main-release/app/Nuvio/." \
 		"${pkgdir}/opt/${_pkgname}/"
 
-	# Beside the runtime, where the host finds libmpv by walking out of its own
-	# jar rather than being told where it is.
+	# Beside the runtime: the host finds libmpv relative to its own jar.
 	install -Dm755 "${srcdir}/mpv/build/libmpv.so.2" \
 		"${pkgdir}/opt/${_pkgname}/lib/libmpv.so.2"
 	install -Dm755 "${srcdir}/libglxshim.so" \
 		"${pkgdir}/opt/${_pkgname}/lib/libglxshim.so"
 
-	# Wrapper rather than a symlink: the launcher resolves the bundled runtime
-	# and the player bridge relative to the application image. LD_PRELOAD is
-	# the one thing this build adds, and the one thing no jpackage java-option
-	# can express -- it has to be set before the JVM starts.
+	# Wrapper, not a symlink: the launcher resolves the runtime relative to the
+	# app image, and LD_PRELOAD has to be set before the JVM starts.
 	install -Dm755 /dev/stdin "${pkgdir}/usr/bin/${_pkgname}" <<'EOF'
 #!/bin/sh
 export LD_LIBRARY_PATH="/opt/nuvio/lib:/opt/nuvio/lib/runtime/lib:${LD_LIBRARY_PATH}"
