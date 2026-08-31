@@ -97,6 +97,7 @@ import kotlinx.coroutines.sync.withPermit
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.yield
 import com.nuvio.app.features.home.components.continueWatchingHeroViewportReserveHeight
+import com.nuvio.app.features.home.components.homeCatalogPreviewLimitForWidth
 import com.nuvio.app.features.home.components.homeSectionHorizontalPaddingForWidth
 import com.nuvio.app.features.home.components.rememberContinueWatchingLayout
 import kotlinx.coroutines.CancellationException
@@ -825,6 +826,16 @@ fun HomeScreen(
         val homeSectionPadding = homeSectionHorizontalPaddingForWidth(maxWidth.value)
         val continueWatchingLayout = rememberContinueWatchingLayout(maxWidth.value)
         val posterCardStyle = rememberPosterCardStyleUiState()
+        val homeCatalogPreviewLimit = if (isDesktop) {
+            homeCatalogPreviewLimitForWidth(
+                maxWidthDp = maxWidth.value,
+                sectionPadding = homeSectionPadding,
+                basePosterWidthDp = posterCardStyle.widthDp,
+                useLandscapeMode = posterCardStyle.catalogLandscapeModeEnabled,
+            )
+        } else {
+            HOME_CATALOG_PREVIEW_LIMIT
+        }
         val nativeBottomNavigationOverlayHeight =
             if (LocalNuvioBottomNavigationOverlayPadding.current > 0.dp) {
                 nuvioSafeBottomPadding()
@@ -915,7 +926,9 @@ fun HomeScreen(
                     )
                     item {
                         HomeEmptyStateCard(
-                            modifier = Modifier.padding(horizontal = 16.dp),
+                            modifier = Modifier.padding(
+                                horizontal = if (isDesktop) homeSectionPadding else 16.dp,
+                            ),
                             title = stringResource(Res.string.compose_search_empty_no_active_addons_title),
                             message = stringResource(Res.string.home_empty_no_active_addons_message),
                         )
@@ -938,7 +951,9 @@ fun HomeScreen(
                     )
                     items(3) {
                         HomeSkeletonRow(
-                            modifier = Modifier.padding(horizontal = 16.dp),
+                            modifier = Modifier.padding(
+                                horizontal = if (isDesktop) homeSectionPadding else 16.dp,
+                            ),
                         )
                     }
                 }
@@ -950,7 +965,9 @@ fun HomeScreen(
                         if (networkStatusUiState.isOfflineLike) {
                             NuvioNetworkOfflineCard(
                                 condition = networkStatusUiState.condition,
-                                modifier = Modifier.padding(horizontal = 16.dp),
+                                modifier = Modifier.padding(
+                                    horizontal = if (isDesktop) homeSectionPadding else 16.dp,
+                                ),
                                 onRetry = {
                                     NetworkStatusRepository.requestRefresh(force = true)
                                     HomeRepository.refresh(addonsUiState.addons.enabledAddons(), force = true)
@@ -958,7 +975,9 @@ fun HomeScreen(
                             )
                         } else {
                             HomeEmptyStateCard(
-                                modifier = Modifier.padding(horizontal = 16.dp),
+                                modifier = Modifier.padding(
+                                    horizontal = if (isDesktop) homeSectionPadding else 16.dp,
+                                ),
                                 title = stringResource(Res.string.home_empty_no_rows_title),
                                 message = homeUiState.errorMessage
                                     ?: stringResource(Res.string.home_empty_no_rows_message),
@@ -1003,10 +1022,16 @@ fun HomeScreen(
                                 item(key = keyedSettingsItem.lazyKey) {
                                     HomeCatalogRowSection(
                                         section = section,
-                                        entries = section.items.take(HOME_CATALOG_PREVIEW_LIMIT),
+                                        entries = if (isDesktop) {
+                                            // The row is lazy, so desktop can expose the fetched catalog without
+                                            // composing every poster up front. Mobile keeps its compact preview.
+                                            section.items
+                                        } else {
+                                            section.items.take(homeCatalogPreviewLimit)
+                                        },
                                         modifier = Modifier.padding(bottom = 12.dp),
                                         sectionPadding = homeSectionPadding,
-                                        onViewAllClick = if (section.canOpenCatalog(HOME_CATALOG_PREVIEW_LIMIT)) {
+                                        onViewAllClick = if (section.canOpenCatalog(homeCatalogPreviewLimit)) {
                                             onCatalogClick?.let { { it(section) } }
                                         } else {
                                             null
