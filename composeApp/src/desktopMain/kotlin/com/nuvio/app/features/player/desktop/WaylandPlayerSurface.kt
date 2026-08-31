@@ -216,14 +216,12 @@ internal fun WaylandPlayerSurface(
                         }
                     }
                     "toggleFullscreen" -> com.nuvio.app.core.ui.toggleFullscreenAction()
+                    // The chrome sends a level, not a percentage: 1.0 is 100% and
+                    // the boosted half of the slider runs to 2.0.
                     "volumeChange" ->
-                        bridge.setVolumeFraction(
-                            (if (value > 1.0) value / 100.0 else value).toFloat(),
-                        )
+                        bridge.setVolumeFraction(value.toFloat().coerceDesktopPlayerVolumeLevel())
                     "volumeChangeTemporary" ->
-                        bridge.setVolumeFraction(
-                            (if (value > 1.0) value / 100.0 else value).toFloat(),
-                        )
+                        bridge.setVolumeFraction(value.toFloat().coerceDesktopPlayerVolumeLevel())
                     else -> {
                         // Stock's full chain (handlePlayerEvent): the raw
                         // event first, then the PlayerControlsAction mapping,
@@ -365,7 +363,11 @@ private fun handleWaylandFallbackAction(
         com.nuvio.app.features.player.PlayerControlsAction.KeyboardSeekForward ->
             bridge.seekBy(10_000L)
         com.nuvio.app.features.player.PlayerControlsAction.KeyboardVolumeDown ->
-            bridge.setVolumeFraction(((bridge.snapshot().volumeLevel ?: 1f) - 0.05f).coerceIn(0f, 1f))
+            bridge.setVolumeFraction(
+                ((bridge.snapshot().volumeLevel ?: 1f) - 0.05f).coerceDesktopPlayerVolumeLevel(),
+            )
+        // Keyboard stops at 100%, as the chrome's own key handler does; the
+        // boosted range is reachable from the slider.
         com.nuvio.app.features.player.PlayerControlsAction.KeyboardVolumeUp ->
             bridge.setVolumeFraction(((bridge.snapshot().volumeLevel ?: 1f) + 0.05f).coerceIn(0f, 1f))
         else -> Unit

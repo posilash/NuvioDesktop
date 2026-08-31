@@ -28,6 +28,9 @@ import org.lwjgl.opengl.GL30
  * underneath the UI layer. The scene is never rasterized on account of a video
  * frame -- that separation is the point of the design.
  */
+// Matches the chrome's maxVolumeLevel and mpv's volume-max: 1.0 is 100%.
+private const val MAX_VOLUME_LEVEL = 2f
+
 class WaylandVideoHost(
     private val mpv: Mpv,
     private val pipeline: DisplayPipeline,
@@ -544,12 +547,13 @@ class WaylandVideoHost(
 
     override fun audioLevel(): com.nuvio.app.features.player.PlayerAudioLevel =
         com.nuvio.app.features.player.PlayerAudioLevel(
-            fraction = ((mpv.cachedDouble("volume") ?: 100.0) / 100.0).toFloat().coerceIn(0f, 1f),
+            fraction = ((mpv.cachedDouble("volume") ?: 100.0) / 100.0).toFloat()
+                .coerceIn(0f, MAX_VOLUME_LEVEL),
             isMuted = mpv.cachedBoolean("mute") ?: false,
         )
 
     override fun setVolumeFraction(fraction: Float) {
-        mpv.setProperty("volume", (fraction.coerceIn(0f, 1f) * 100.0).toString())
+        mpv.setProperty("volume", (fraction.coerceIn(0f, MAX_VOLUME_LEVEL) * 100.0).toString())
     }
 
     override fun seekTo(positionMs: Long) {

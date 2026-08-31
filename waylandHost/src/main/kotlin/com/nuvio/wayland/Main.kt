@@ -371,6 +371,9 @@ fun main(args: Array<String>) {
             setOption("force-window", "no")
             setOption("idle", "yes")
             setOption("save-position-on-quit", "no")
+            // The chrome's volume slider runs to 200%, so mpv's default ceiling
+            // of 100 would silently clamp the boosted half of its range.
+            setOption("volume-max", "200")
             // The host presents only when something changed, so when the UI
             // is static mpv's swap feedback sees frame-rate cadence, not
             // vsync cadence. Left to estimate the display rate from that,
