@@ -58,7 +58,6 @@ import dev.chrisbanes.haze.HazeInputScale
 import com.nuvio.app.core.ui.nuvioBackdropEffect
 import com.nuvio.app.core.ui.nuvioBackdropSource
 import com.nuvio.app.core.ui.rememberNuvioBackdropState
-import com.nuvio.app.isDesktop
 import dev.chrisbanes.haze.hazeEffect
 import dev.chrisbanes.haze.hazeSource
 import dev.chrisbanes.haze.rememberHazeState
@@ -113,6 +112,9 @@ internal fun TabletStreamsLayout(
         return
     }
 
+    // Desktop-only body (non-desktop returned above), and haze's blur reaches a
+    // Compose internal this build does not have, so the backdrop does it here.
+    val backdrop = rememberNuvioBackdropState()
     val hazeState = rememberHazeState()
     val opacity = com.nuvio.app.core.ui.NuvioTokens.Opacity
     val tabletBackdrop = remember(background, poster) {
@@ -163,7 +165,8 @@ internal fun TabletStreamsLayout(
             modifier = Modifier
                 .fillMaxSize()
                 .background(if (useWideArtworkFrame) wideFadeColor else colorScheme.background)
-                .hazeSource(state = hazeState),
+                .hazeSource(state = hazeState)
+                .nuvioBackdropSource(backdrop),
         ) {
             if (tabletBackdrop != null) {
                 AsyncImage(
@@ -248,11 +251,11 @@ internal fun TabletStreamsLayout(
                 modifier = Modifier
                     .fillMaxSize()
                     .clip(RoundedCornerShape(24.dp))
-                    .hazeEffect(state = hazeState) {
-                        inputScale = HazeInputScale.Fixed(0.66f)
-                        blurRadius = 56.dp
-                    }
-                    .background(Color.Black.copy(alpha = 0.36f)),
+                    .nuvioBackdropEffect(
+                        state = backdrop,
+                        blurRadius = 56.dp,
+                        tint = Color.Black.copy(alpha = 0.36f),
+                    ),
             ) {
                 Column(
                     modifier = Modifier
