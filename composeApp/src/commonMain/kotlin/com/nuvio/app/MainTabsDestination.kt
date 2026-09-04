@@ -236,6 +236,7 @@ internal fun MainTabsDestination(
                         navBarStyleSetting = navBarStyleSetting,
                         isHeroEnabled = homeCatalogSettingsUiState.heroEnabled,
                         hazeState = navBarHazeState,
+                        backdrop = navBarBackdrop,
                         scrollState = navBarScrollState,
                         windowWidth = screenWidth,
                     )

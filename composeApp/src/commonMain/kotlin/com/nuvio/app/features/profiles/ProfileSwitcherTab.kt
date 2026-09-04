@@ -83,6 +83,9 @@ import androidx.compose.ui.window.PopupProperties
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import dev.chrisbanes.haze.HazeState
 import dev.chrisbanes.haze.hazeEffect
+import com.nuvio.app.core.ui.NuvioBackdropState
+import com.nuvio.app.core.ui.nuvioBackdropEffect
+import com.nuvio.app.isDesktop
 import com.nuvio.app.core.ui.NuvioAsyncImage as AsyncImage
 import com.nuvio.app.core.ui.NuvioTokens
 import com.nuvio.app.core.ui.nuvio
@@ -106,6 +109,7 @@ fun ProfileSwitcherTab(
     onPopupStateChanged: ((Boolean) -> Unit)? = null,
     avatarSize: Int = 28,
     hazeState: HazeState? = null,
+    backdrop: NuvioBackdropState? = null,
     popupAlignment: Alignment = Alignment.BottomCenter,
     modifier: Modifier = Modifier,
 ) {
@@ -292,7 +296,15 @@ fun ProfileSwitcherTab(
                             translationY = popupTranslateY.value
                         }
                         .then(
-                            if (hasHaze) {
+                            if (isDesktop && backdrop != null) {
+                                Modifier
+                                    .clip(tokens.shapes.sheet)
+                                    .nuvioBackdropEffect(
+                                        state = backdrop,
+                                        blurRadius = 24.dp,
+                                        tint = Color(0xFF1C1C1E).copy(alpha = 0.55f),
+                                    )
+                            } else if (hasHaze && !isDesktop) {
                                 Modifier
                                     .clip(tokens.shapes.sheet)
                                     .hazeEffect(state = hazeState) {
