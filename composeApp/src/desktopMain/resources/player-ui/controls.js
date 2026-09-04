@@ -2895,19 +2895,17 @@ volumeSlider.addEventListener("input", () => {
 
 let preMuteVolumeLevel = 1.0;
 
-if (volumeButton) {
-  volumeButton.addEventListener("click", () => {
-    noteChromeActivity();
-    if (state.volumeLevel > 0) {
-      preMuteVolumeLevel = state.volumeLevel;
-      state.volumeLevel = 0;
-    } else {
-      state.volumeLevel = preMuteVolumeLevel > 0 ? preMuteVolumeLevel : 1.0;
-    }
-    syncVolumeControl();
-    send("volumeChangeTemporary", state.volumeLevel);
-  });
-}
+volumeButton.addEventListener("click", () => {
+  noteChromeActivity();
+  if (state.volumeLevel > 0) {
+    preMuteVolumeLevel = state.volumeLevel;
+    state.volumeLevel = 0;
+  } else {
+    state.volumeLevel = preMuteVolumeLevel > 0 ? preMuteVolumeLevel : 1.0;
+  }
+  syncVolumeControl();
+  send("volumeChangeTemporary", state.volumeLevel);
+});
 
 window.playerUpdate = update => {
   const durationMs = Math.round((Number(update.duration) || 0) * 1000);
