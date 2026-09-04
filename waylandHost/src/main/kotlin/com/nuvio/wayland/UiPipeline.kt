@@ -148,6 +148,7 @@ class UiPipeline(
     @Volatile private var maxRenderNanos = 0L
     @Volatile private var lastGeneration = 0
     @Volatile private var renderErrors = 0L
+    @Volatile private var firstRenderError: String? = null
 
     /** Cap on scene frames per second; animations need a steady clock, not a spin. */
     private val frameIntervalNs: Long =
@@ -247,7 +248,7 @@ class UiPipeline(
         val fns = flushNanos; flushNanos = 0
         val mx = maxRenderNanos; maxRenderNanos = 0
         val avgMs = if (r > 0) ns / 1e6 / r else 0.0
-        return (
+        val line = (
             "ui: scenes/s=%.0f sceneAvg=%.1fms compose=%.1fms flush=%.1fms " +
                 "sceneMax=%.1fms size=%dx%d gen=%d errs=%d"
             ).format(
@@ -256,6 +257,12 @@ class UiPipeline(
             if (r > 0) fns / 1e6 / r else 0.0,
             mx / 1e6, targetWidth, targetHeight, lastGeneration, renderErrors,
         )
+        // A black UI and a live host look the same; errs=N alone reads past.
+        if (renderErrors > 0) {
+            return "$line\n!! UI NOT DRAWING: $renderErrors scene render failures -- " +
+                "first was: $firstRenderError"
+        }
+        return line
     }
 
     // ---- the UI thread ----
@@ -384,6 +391,7 @@ class UiPipeline(
                 scene.draw(surface.canvas.asComposeCanvas())
             } catch (t: Throwable) {
                 if (renderErrors++ == 0L) {
+                    firstRenderError = "${t::class.simpleName}: ${t.message}"
                     System.err.println("[wayland-ui] scene.render failed (first occurrence)")
                     t.printStackTrace()
                 }
@@ -447,6 +455,7 @@ class UiPipeline(
             scene.draw(target.surface.canvas.asComposeCanvas())
         } catch (err: Throwable) {
             if (renderErrors++ == 0L) {
+                firstRenderError = "${err::class.simpleName}: ${err.message}"
                 System.err.println("[wayland-ui] scene.render failed (first occurrence)")
                 err.printStackTrace()
             }
