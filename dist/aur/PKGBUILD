@@ -33,7 +33,10 @@ pkgver() {
 	cd "${srcdir}/${pkgname}"
 	local ver
 	ver=$(grep -oP '(?<=^VERSION_NAME=).*' composeApp/Configuration/DesktopVersion.properties)
-	printf "%s.r%s.g%s" "${ver//-/_}" "$(git rev-list --count HEAD)" "$(git rev-parse --short HEAD)"
+	# The bundled libmpv's revision too: a fork-only change must bump the
+	# version, or makepkg reinstalls the old package instead of building.
+	printf "%s.r%s.%s.g%s" "${ver//-/_}" "$(git rev-list --count HEAD)" \
+		"$(git -C "${srcdir}/mpv" rev-list --count HEAD)" "$(git rev-parse --short HEAD)"
 }
 
 prepare() {
