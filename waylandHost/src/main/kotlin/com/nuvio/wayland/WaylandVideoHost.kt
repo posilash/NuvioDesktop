@@ -419,14 +419,15 @@ class WaylandVideoHost(
         }
         val duration = mpv.cachedDouble("duration") ?: 0.0
         val position = mpv.cachedDouble("time-pos") ?: 0.0
+        val volumeLevel = ((mpv.cachedDouble("volume") ?: 100.0) / 100.0).coerceIn(0.0, MAX_VOLUME_LEVEL.toDouble())
         val paused = mpv.cachedBoolean("pause") ?: false
         val loading = isLoadingNow()
         val (audio, subs) = cachedTracksJson.split("],[").let {
             if (it.size == 2) Pair(it[0] + "]", "[" + it[1]) else Pair("[]", "[]")
         }
         val script =
-            "window.playerUpdate&&window.playerUpdate({duration:%.3f,position:%.3f,paused:%s,loading:%s,audioTracks:%s,subtitleTracks:%s})"
-                .format(java.util.Locale.ROOT, duration, position, paused, loading, audio, subs.removeSuffix(","))
+            "window.playerUpdate&&window.playerUpdate({duration:%.3f,position:%.3f,volumeLevel:%.3f,paused:%s,loading:%s,audioTracks:%s,subtitleTracks:%s})"
+                .format(java.util.Locale.ROOT, duration, position, volumeLevel, paused, loading, audio, subs.removeSuffix(","))
         if (updatePushes++ % 10 == 0L &&
             System.getProperty("nuvio.wayland.videoLog")?.toBoolean() == true
         ) {
@@ -613,21 +614,17 @@ class WaylandVideoHost(
     }
 
     override fun setResizeMode(mode: com.nuvio.app.features.player.PlayerResizeMode) {
-        // mpv's own scaling knobs: keepaspect governs stretch, panscan crops
-        // to fill. The render target is the punched rect, so these behave
-        // exactly as in standalone mpv.
-        when (mode) {
-            com.nuvio.app.features.player.PlayerResizeMode.Fit -> {
-                mpv.setProperty("keepaspect", "yes"); mpv.setProperty("panscan", "0")
-            }
-            com.nuvio.app.features.player.PlayerResizeMode.Zoom -> {
-                mpv.setProperty("keepaspect", "yes"); mpv.setProperty("panscan", "1")
-            }
+        // Same mapping as the stock bridges: Fill and Zoom both crop, only
+        // Stretch drops the aspect ratio.
+        val (keepAspect, panscan) = when (mode) {
+            com.nuvio.app.features.player.PlayerResizeMode.Fit -> "yes" to "0.0"
             com.nuvio.app.features.player.PlayerResizeMode.Fill,
-            com.nuvio.app.features.player.PlayerResizeMode.Stretch -> {
-                mpv.setProperty("keepaspect", "no"); mpv.setProperty("panscan", "0")
-            }
+            com.nuvio.app.features.player.PlayerResizeMode.Zoom -> "yes" to "1.0"
+            com.nuvio.app.features.player.PlayerResizeMode.Stretch -> "no" to "0.0"
         }
+        mpv.setProperty("keepaspect", keepAspect)
+        mpv.setProperty("panscan", panscan)
+        mpv.setProperty("video-unscaled", "no")
     }
 
     /**
