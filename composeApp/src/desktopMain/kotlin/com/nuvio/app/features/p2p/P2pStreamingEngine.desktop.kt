@@ -152,6 +152,11 @@ actual object P2pStreamingEngine {
         scheduleStop(stopBinary = true)
     }
 
+    // What the shutdown hook does, for hosts that exit without running hooks.
+    internal fun shutdownNow() {
+        runBlocking { stopStreamNow(stopBinary = true) }
+    }
+
     private fun scheduleStop(stopBinary: Boolean) {
         val hash = detachActiveStream()
         val previousCleanup = cleanupJob

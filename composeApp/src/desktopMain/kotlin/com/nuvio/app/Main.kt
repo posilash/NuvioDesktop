@@ -264,11 +264,19 @@ fun desktopControlsPageUrl(): String = NativePlayerBridge.controlsPageUrl()
  * icon.
  */
 fun startDesktopRuntimeWithoutWindow(args: Array<String>) {
+    SentryInitializer.start()
     configureDesktopQuickJsLibrary()
     installDesktopOpenUriHandler()
     handleDesktopLaunchArgs(args)
     ProfileRepository.loadCachedProfiles()
     DiscordPresenceManager.start()
+}
+
+/** main()'s close sequence, blocking, for hosts that exit without shutdown hooks. */
+fun stopDesktopRuntime() {
+    P2pStreamingEngine.shutdownNow()
+    DiscordPresenceManager.shutdown()
+    SentryInitializer.close()
 }
 
 // application {} applies Compose's Swing globals, which on Linux include Skiko's

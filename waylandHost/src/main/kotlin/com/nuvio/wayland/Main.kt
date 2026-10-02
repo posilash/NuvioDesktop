@@ -1905,6 +1905,9 @@ fun main(args: Array<String>) {
                 }
                 mpv?.close()
                 if (videoLog) println("[teardown] mpv closed")
+                // exitNow skips shutdown hooks, and P2P's is what stops TorrServer.
+                if (runRealApp) runCatching { com.nuvio.app.stopDesktopRuntime() }
+                if (videoLog) println("[teardown] runtime stopped")
                 java.awt.EventQueue.invokeAndWait {
                     // uiLayer's wrappers live in the window context, so they
                     // go here, not with the UI thread's own objects.
