@@ -13,3 +13,4 @@ internal actual val isDesktop: Boolean = false
 internal actual val isWindows: Boolean = false
 internal actual val usesNativePlayerChrome: Boolean = false
 
+internal actual val supportsPosterNavigationMotion: Boolean = false

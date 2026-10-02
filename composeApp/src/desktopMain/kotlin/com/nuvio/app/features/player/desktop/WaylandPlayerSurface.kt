@@ -305,6 +305,24 @@ private class WaylandPlayerController(
         bridge.selectAudioTrack(id)
     }
 
+    // Same matching as the stock controller: the first preference any track
+    // satisfies wins, by exact language or a regional variant of it.
+    override fun applyAudioLanguagePreferences(languages: List<String>) {
+        val preferred = languages.map(String::trim).filter(String::isNotEmpty).map(String::lowercase)
+        if (preferred.isEmpty()) return
+        val tracks = getAudioTracks()
+        for (language in preferred) {
+            val index = tracks.indexOfFirst { track ->
+                val trackLanguage = track.language?.lowercase() ?: return@indexOfFirst false
+                trackLanguage == language || trackLanguage.startsWith("$language-")
+            }
+            if (index >= 0) {
+                selectAudioTrack(index)
+                return
+            }
+        }
+    }
+
     override fun selectSubtitleTrack(index: Int) {
         if (index < 0) return bridge.selectSubtitleTrack(-1)
         val id = bridge.subtitleTracks().getOrNull(index)?.id?.toIntOrNull() ?: return

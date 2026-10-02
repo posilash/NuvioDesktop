@@ -7,6 +7,7 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.asPaddingValues
@@ -142,6 +143,8 @@ fun NuvioNavigationBar(
     hazeState: HazeState? = null,
     backdrop: NuvioBackdropState? = null,
     navBarStyle: NavBarStyle = NavBarStyle.ADAPTIVE,
+    contentPadding: PaddingValues = floatingNavigationBarPadding(),
+    compactSize: Boolean = false,
     content: @Composable NuvioNavigationBarScope.() -> Unit,
 ) {
     val targetLabelFraction = when (navBarStyle) {
@@ -158,9 +161,6 @@ fun NuvioNavigationBar(
         label = "nav_label_alpha",
     )
 
-    val navigationBarInsets = nuvioBottomNavigationBarInsets()
-    val bottomSafePadding = navigationBarInsets.asPaddingValues().calculateBottomPadding()
-
     // Dynamic horizontal padding: pill shrinks when labels are hidden — driven by same labelFraction
     val expandedHorizontalPadding = 28.dp
     val collapsedHorizontalPadding = 58.dp
@@ -170,7 +170,7 @@ fun NuvioNavigationBar(
     Box(
         modifier = modifier
             .fillMaxWidth()
-            .padding(bottom = bottomSafePadding + nuvioBottomNavigationExtraVerticalPadding + NuvioTokens.Space.s8),
+            .padding(contentPadding),
         contentAlignment = Alignment.BottomCenter,
     ) {
         // The floating pill
@@ -213,6 +213,7 @@ fun NuvioNavigationBar(
                 NuvioNavigationBarScopeImpl(
                     rowScope = this,
                     labelFraction = labelFraction,
+                    compactSize = compactSize,
                 ).content()
             }
         }
@@ -253,7 +254,10 @@ interface NuvioNavigationBarScope {
 private class NuvioNavigationBarScopeImpl(
     private val rowScope: androidx.compose.foundation.layout.RowScope,
     private val labelFraction: Float,
+    private val compactSize: Boolean,
 ) : NuvioNavigationBarScope {
+    private val iconSize = if (compactSize) 24.dp else 28.dp
+    private val itemVerticalPadding = if (compactSize) 4.dp else NuvioTokens.Space.s6
 
     @Composable
     override fun NavItem(
@@ -265,7 +269,7 @@ private class NuvioNavigationBarScopeImpl(
         label: String?,
     ) {
         val tokens = MaterialTheme.nuvio
-        val palette = ThemeColors.getColorPalette(MaterialTheme.appTheme)
+        val palette = MaterialTheme.themePalette
         val iconColor by animateColorAsState(
             targetValue = if (selected) tokens.colors.accent else tokens.colors.textMuted,
             label = "nav_icon_color",
@@ -289,18 +293,18 @@ private class NuvioNavigationBarScopeImpl(
                         role = Role.Tab,
                         onClick = onClick,
                     )
-                    .padding(vertical = NuvioTokens.Space.s6),
+                    .padding(vertical = itemVerticalPadding),
                 horizontalAlignment = Alignment.CenterHorizontally,
             ) {
                 Icon(
                     modifier = Modifier
-                        .size(28.dp)
+                        .size(iconSize)
                         .then(if (selected) Modifier.gradientMask(palette.accentBrush()) else Modifier),
                     imageVector = icon,
                     contentDescription = contentDescription,
                     tint = if (selected) Color.White else iconColor,
                 )
-                NavItemLabel(label = label, labelFraction = labelFraction, iconColor = iconColor, selected = selected)
+                NavItemLabel(label = label, labelFraction = labelFraction, iconColor = iconColor, selected = selected, compactSize = compactSize)
             }
         }
     }
@@ -315,7 +319,7 @@ private class NuvioNavigationBarScopeImpl(
         label: String?,
     ) {
         val tokens = MaterialTheme.nuvio
-        val palette = ThemeColors.getColorPalette(MaterialTheme.appTheme)
+        val palette = MaterialTheme.themePalette
         val iconColor by animateColorAsState(
             targetValue = if (selected) tokens.colors.accent else tokens.colors.textMuted,
             label = "nav_icon_color",
@@ -338,18 +342,18 @@ private class NuvioNavigationBarScopeImpl(
                         role = Role.Tab,
                         onClick = onClick,
                     )
-                    .padding(vertical = NuvioTokens.Space.s6),
+                    .padding(vertical = itemVerticalPadding),
                 horizontalAlignment = Alignment.CenterHorizontally,
             ) {
                 Icon(
                     modifier = Modifier
-                        .size(28.dp)
+                        .size(iconSize)
                         .then(if (selected) Modifier.gradientMask(palette.accentBrush()) else Modifier),
                     painter = painterResource(icon),
                     contentDescription = contentDescription,
                     tint = if (selected) Color.White else iconColor,
                 )
-                NavItemLabel(label = label, labelFraction = labelFraction, iconColor = iconColor, selected = selected)
+                NavItemLabel(label = label, labelFraction = labelFraction, iconColor = iconColor, selected = selected, compactSize = compactSize)
             }
         }
     }
@@ -385,11 +389,15 @@ private class NuvioNavigationBarScopeImpl(
                         role = Role.Tab,
                         onClick = onClick,
                     )
-                    .padding(vertical = NuvioTokens.Space.s6),
+                    .padding(vertical = itemVerticalPadding),
                 horizontalAlignment = Alignment.CenterHorizontally,
             ) {
-                content()
-                NavItemLabel(label = label, labelFraction = labelFraction, iconColor = iconColor, selected = selected)
+                if (compactSize) {
+                    Box(Modifier.size(iconSize), contentAlignment = Alignment.Center) { content() }
+                } else {
+                    content()
+                }
+                NavItemLabel(label = label, labelFraction = labelFraction, iconColor = iconColor, selected = selected, compactSize = compactSize)
             }
         }
     }
@@ -401,9 +409,10 @@ private fun NavItemLabel(
     labelFraction: Float,
     iconColor: Color,
     selected: Boolean,
+    compactSize: Boolean,
 ) {
     if (label == null || labelFraction <= 0f) return
-    Spacer(modifier = Modifier.height(NuvioTokens.Space.s3 * labelFraction))
+    Spacer(modifier = Modifier.height((if (compactSize) 2.dp else NuvioTokens.Space.s3) * labelFraction))
     Box(
         modifier = Modifier
             .height(NuvioTokens.Space.s14 * labelFraction)
@@ -465,7 +474,7 @@ private class NuvioClassicNavigationBarScopeImpl(
         label: String?,
     ) {
         val tokens = MaterialTheme.nuvio
-        val palette = ThemeColors.getColorPalette(MaterialTheme.appTheme)
+        val palette = MaterialTheme.themePalette
         val iconColor by animateColorAsState(
             targetValue = if (selected) tokens.colors.accent else tokens.colors.textMuted,
             label = "classic_nav_icon_color",
@@ -503,7 +512,7 @@ private class NuvioClassicNavigationBarScopeImpl(
         label: String?,
     ) {
         val tokens = MaterialTheme.nuvio
-        val palette = ThemeColors.getColorPalette(MaterialTheme.appTheme)
+        val palette = MaterialTheme.themePalette
         val iconColor by animateColorAsState(
             targetValue = if (selected) tokens.colors.accent else tokens.colors.textMuted,
             label = "classic_nav_icon_color",

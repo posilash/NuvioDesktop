@@ -2,6 +2,7 @@ package com.nuvio.app.features.details.components
 
 import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.tween
+import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.layout.Arrangement
@@ -16,6 +17,7 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.shape.CircleShape
@@ -27,6 +29,7 @@ import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material.icons.filled.CheckCircleOutline
+import androidx.compose.material.icons.filled.Shuffle
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
@@ -48,10 +51,13 @@ import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.graphics.painter.Painter
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.layout.onSizeChanged
+import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
+import com.nuvio.app.core.build.AppFeaturePolicy
 import com.nuvio.app.core.ui.NuvioAsyncImage as AsyncImage
 import com.nuvio.app.core.ui.NuvioDesktopImageScaling
 import com.nuvio.app.core.ui.NuvioTokens
@@ -70,8 +76,14 @@ import nuvio.composeapp.generated.resources.Res
 import nuvio.composeapp.generated.resources.detail_logo_content_description
 import nuvio.composeapp.generated.resources.hero_add_to_library
 import nuvio.composeapp.generated.resources.hero_mark_unwatched
+import nuvio.composeapp.generated.resources.playback_unavailable
+import nuvio.composeapp.generated.resources.random_episode_title
+import nuvio.composeapp.generated.resources.shuffle_stop
 import nuvio.composeapp.generated.resources.hero_mark_watched
 import nuvio.composeapp.generated.resources.hero_remove_from_library
+import nuvio.composeapp.generated.resources.rating_imdb
+import nuvio.composeapp.generated.resources.source_imdb
+import org.jetbrains.compose.resources.painterResource
 import org.jetbrains.compose.resources.stringResource
 
 @Composable
@@ -186,7 +198,10 @@ fun DesktopDetailBackdrop(
 @Composable
 fun DesktopDetailHero(
     meta: MetaDetails,
+    showOverallRatings: Boolean,
+    isMdbListActive: Boolean,
     playButtonLabel: String,
+    isPrimaryPlayEnabled: Boolean,
     isSaved: Boolean,
     isWatched: Boolean,
     onHeightChanged: (Int) -> Unit,
@@ -196,6 +211,8 @@ fun DesktopDetailHero(
     onHeroTrailerMuteToggle: () -> Unit,
     onPlayClick: () -> Unit,
     onPlayLongClick: (() -> Unit)?,
+    onShuffleClick: (() -> Unit)?,
+    shuffleEnabled: Boolean,
     onWatchedClick: () -> Unit,
     onSaveClick: () -> Unit,
     onSaveLongClick: (() -> Unit)?,
@@ -255,8 +272,8 @@ fun DesktopDetailHero(
                 )
             }
             Spacer(modifier = Modifier.height(space.s20))
-            DesktopHeroMetaRow(meta = meta)
-            if (meta.externalRatings.isNotEmpty()) {
+            DesktopHeroMetaRow(meta = meta, showOverallRatings = showOverallRatings && !isMdbListActive)
+            if (isMdbListActive && meta.externalRatings.isNotEmpty()) {
                 Spacer(modifier = Modifier.height(space.s12))
                 DetailRatingsRow(
                     ratings = meta.externalRatings,
@@ -292,11 +309,22 @@ fun DesktopDetailHero(
                 )
             }
             Spacer(modifier = Modifier.height(space.s28))
+            val shuffleAction = onShuffleClick?.let { onClick ->
+                DetailSecondaryAction(
+                    label = stringResource(if (shuffleEnabled) Res.string.shuffle_stop else Res.string.random_episode_title),
+                    icon = Icons.Default.Shuffle,
+                    isActive = shuffleEnabled,
+                    onClick = onClick,
+                )
+            }
             DetailActionButtons(
                 modifier = Modifier.widthIn(max = 520.dp),
-                playLabel = playButtonLabel,
-                secondaryActions = listOf(
-                    DetailSecondaryAction(
+                playLabel = if (isPrimaryPlayEnabled) playButtonLabel else stringResource(Res.string.playback_unavailable),
+                playEnabled = isPrimaryPlayEnabled,
+                pinnedAction = shuffleAction?.takeIf { shuffleEnabled },
+                secondaryActions = buildList {
+                    if (!shuffleEnabled) shuffleAction?.let(::add)
+                    add(DetailSecondaryAction(
                         label = if (isWatched) {
                             stringResource(Res.string.hero_mark_unwatched)
                         } else {
@@ -309,8 +337,8 @@ fun DesktopDetailHero(
                         },
                         isActive = isWatched,
                         onClick = onWatchedClick,
-                    ),
-                    DetailSecondaryAction(
+                    ))
+                    add(DetailSecondaryAction(
                         label = if (isSaved) {
                             stringResource(Res.string.hero_remove_from_library)
                         } else {
@@ -324,8 +352,8 @@ fun DesktopDetailHero(
                         isActive = isSaved,
                         onClick = onSaveClick,
                         onLongClick = onSaveLongClick,
-                    ),
-                ),
+                    ))
+                },
                 isTablet = true,
                 onPlayClick = onPlayClick,
                 onPlayLongClick = onPlayLongClick,
@@ -338,6 +366,7 @@ fun DesktopDetailHero(
                 enabled = heroTrailerReady,
                 modifier = Modifier
                     .align(Alignment.TopEnd)
+                    .statusBarsPadding()
                     .padding(
                         top = space.s32,
                         end = actionHorizontalInset + if (isFullscreenActionSupported) 60.dp else 0.dp,
@@ -369,6 +398,7 @@ fun DesktopDetailHero(
             FullscreenActionButton(
                 modifier = Modifier
                     .align(Alignment.TopEnd)
+                    .statusBarsPadding()
                     .padding(top = space.s32, end = actionHorizontalInset),
                 buttonSize = 48.dp,
                 iconSize = 24.dp,
@@ -380,7 +410,7 @@ fun DesktopDetailHero(
 }
 
 @Composable
-private fun DesktopHeroMetaRow(meta: MetaDetails) {
+private fun DesktopHeroMetaRow(meta: MetaDetails, showOverallRatings: Boolean) {
     val colorScheme = MaterialTheme.colorScheme
     val space = NuvioTokens.Space
     val opacity = NuvioTokens.Opacity
@@ -389,6 +419,8 @@ private fun DesktopHeroMetaRow(meta: MetaDetails) {
         desktopSeasonCountLabel(meta)?.let(::add)
         formatRuntimeForDisplay(meta.runtime)?.let(::add)
     }
+    val validImdbRating = meta.imdbRating
+        ?.takeIf { raw -> raw.toDoubleOrNull()?.let { it > 0.0 } == true }
     Row(
         verticalAlignment = Alignment.CenterVertically,
         horizontalArrangement = Arrangement.spacedBy(space.s16),
@@ -426,5 +458,48 @@ private fun DesktopHeroMetaRow(meta: MetaDetails) {
                 )
             }
         }
+        if (validImdbRating != null && showOverallRatings) {
+            val imdbTextStyle = MaterialTheme.typography.titleSmall.copy(
+                fontWeight = FontWeight.Bold,
+                letterSpacing = 0.sp,
+            )
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                ImdbRatingSourceLabel(
+                    storeTextStyle = imdbTextStyle,
+                    storeTextColor = ImdbYellow,
+                )
+                Spacer(modifier = Modifier.width(4.dp))
+                Text(
+                    text = validImdbRating,
+                    style = imdbTextStyle,
+                    color = ImdbYellow,
+                )
+            }
+        }
     }
 }
+
+@Composable
+private fun ImdbRatingSourceLabel(
+    storeTextStyle: TextStyle,
+    storeTextColor: Color,
+) {
+    if (AppFeaturePolicy.imdbRatingLogoEnabled) {
+        Image(
+            painter = painterResource(Res.drawable.rating_imdb),
+            contentDescription = stringResource(Res.string.source_imdb),
+            modifier = Modifier.size(width = 30.dp, height = 16.dp),
+        )
+    } else {
+        Text(
+            text = stringResource(Res.string.source_imdb),
+            style = storeTextStyle,
+            color = storeTextColor,
+            maxLines = 1,
+        )
+    }
+}
+
+private val ImdbYellow = Color(0xFFF5C518)

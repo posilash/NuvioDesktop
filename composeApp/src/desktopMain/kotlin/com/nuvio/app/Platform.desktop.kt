@@ -17,3 +17,4 @@ internal actual val usesNativePlayerChrome: Boolean
     get() = !com.nuvio.app.features.player.desktop.WaylandVideoBridge.isAvailable ||
         com.nuvio.app.features.player.desktop.WaylandVideoBridge.webChromeActive
 
+internal actual val supportsPosterNavigationMotion: Boolean = false

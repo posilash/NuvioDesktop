@@ -22,3 +22,4 @@ internal expect val isWindows: Boolean
  */
 internal expect val usesNativePlayerChrome: Boolean
 
+internal expect val supportsPosterNavigationMotion: Boolean
