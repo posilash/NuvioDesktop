@@ -1751,6 +1751,10 @@ fun main(args: Array<String>) {
             glfwSwapBuffers(window)
         }
         timings.add("swap", System.nanoTime() - t)
+        // With the scene on its own thread the owed repaint is this present of
+        // the published layer. Only the in-loop scene clears it otherwise, so
+        // left set it re-presented every vblank on an idle screen.
+        if (ui == null) forceRepaint = false
         // Vsync feedback: with ADVANCED_CONTROL this is the clock mpv times
         // against, and its contract is one call per swap -- what a real VO gets
         // from its swapchain. Reporting only when a video frame changed made
