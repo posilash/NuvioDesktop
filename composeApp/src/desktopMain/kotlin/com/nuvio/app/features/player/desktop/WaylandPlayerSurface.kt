@@ -20,6 +20,7 @@ import com.nuvio.app.features.player.PlayerPlaybackSnapshot
 import com.nuvio.app.features.player.PlayerResizeMode
 import com.nuvio.app.features.player.SubtitleStyleState
 import com.nuvio.app.features.player.SubtitleTrack
+import com.nuvio.app.features.player.findPreferredAudioTrackIndex
 import kotlinx.coroutines.delay
 
 /**
@@ -308,19 +309,8 @@ private class WaylandPlayerController(
     // Same matching as the stock controller: the first preference any track
     // satisfies wins, by exact language or a regional variant of it.
     override fun applyAudioLanguagePreferences(languages: List<String>) {
-        val preferred = languages.map(String::trim).filter(String::isNotEmpty).map(String::lowercase)
-        if (preferred.isEmpty()) return
-        val tracks = getAudioTracks()
-        for (language in preferred) {
-            val index = tracks.indexOfFirst { track ->
-                val trackLanguage = track.language?.lowercase() ?: return@indexOfFirst false
-                trackLanguage == language || trackLanguage.startsWith("$language-")
-            }
-            if (index >= 0) {
-                selectAudioTrack(index)
-                return
-            }
-        }
+        val index = findPreferredAudioTrackIndex(getAudioTracks(), languages)
+        if (index >= 0) selectAudioTrack(index)
     }
 
     override fun selectSubtitleTrack(index: Int) {

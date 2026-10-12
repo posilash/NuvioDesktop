@@ -21,6 +21,18 @@ internal actual object PlayerSettingsStorage {
     private const val playbackBrightnessKey = "playback_brightness"
     private const val useLegacyPlayerLayoutKey = "use_legacy_player_layout"
     private const val autoSkipMovieCreditsKey = "auto_skip_movie_credits"
+    private const val preloadNextEpisodeSourcesKey = "preload_next_episode_sources"
+    private const val exoNativeMemoryEnabledKey = "exo_native_memory_enabled"
+    private const val vodCacheEnabledKey = "vod_cache_enabled"
+    private const val vodCacheSizeModeKey = "vod_cache_size_mode"
+    private const val vodCacheSizeMbKey = "vod_cache_size_mb"
+    private const val bufferEngineEnabledKey = "buffer_engine_enabled"
+    private const val minBufferMsKey = "min_buffer_ms"
+    private const val maxBufferMsKey = "max_buffer_ms"
+    private const val bufferForPlaybackMsKey = "buffer_for_playback_ms"
+    private const val bufferForPlaybackAfterRebufferMsKey = "buffer_for_playback_after_rebuffer_ms"
+    private const val backBufferDurationMsKey = "back_buffer_duration_ms"
+    private const val targetBufferSizeMbKey = "target_buffer_size_mb"
     private const val autoSkipPostCreditsKey = "auto_skip_post_credits"
     private const val showLoadingOverlayKey = "show_loading_overlay"
     private const val showPlayerLoadingStatusKey = "show_player_loading_status"
@@ -143,6 +155,18 @@ internal actual object PlayerSettingsStorage {
         streamAutoPlayTimeoutSecondsKey,
         skipIntroEnabledKey,
         autoSkipSegmentTypesKey,
+        preloadNextEpisodeSourcesKey,
+        exoNativeMemoryEnabledKey,
+        vodCacheEnabledKey,
+        vodCacheSizeModeKey,
+        vodCacheSizeMbKey,
+        bufferEngineEnabledKey,
+        minBufferMsKey,
+        maxBufferMsKey,
+        bufferForPlaybackMsKey,
+        bufferForPlaybackAfterRebufferMsKey,
+        backBufferDurationMsKey,
+        targetBufferSizeMbKey,
         autoSkipMovieCreditsKey,
         autoSkipPostCreditsKey,
         animeSkipEnabledKey,
@@ -180,6 +204,30 @@ internal actual object PlayerSettingsStorage {
     actual fun savePlaybackBrightness(level: Float) = saveFloat(playbackBrightnessKey, level)
     actual fun loadUseLegacyPlayerLayout(): Boolean? = loadBoolean(useLegacyPlayerLayoutKey)
     actual fun saveUseLegacyPlayerLayout(enabled: Boolean) = saveBoolean(useLegacyPlayerLayoutKey, enabled)
+    actual fun loadPreloadNextEpisodeSources(): Boolean? = loadBoolean(preloadNextEpisodeSourcesKey)
+    actual fun savePreloadNextEpisodeSources(enabled: Boolean) = saveBoolean(preloadNextEpisodeSourcesKey, enabled)
+    actual fun loadExoNativeMemoryEnabled(): Boolean? = loadBoolean(exoNativeMemoryEnabledKey)
+    actual fun saveExoNativeMemoryEnabled(enabled: Boolean) = saveBoolean(exoNativeMemoryEnabledKey, enabled)
+    actual fun loadVodCacheEnabled(): Boolean? = loadBoolean(vodCacheEnabledKey)
+    actual fun saveVodCacheEnabled(enabled: Boolean) = saveBoolean(vodCacheEnabledKey, enabled)
+    actual fun loadVodCacheSizeMode(): String? = loadString(vodCacheSizeModeKey)
+    actual fun saveVodCacheSizeMode(mode: String) = saveString(vodCacheSizeModeKey, mode)
+    actual fun loadVodCacheSizeMb(): Int? = loadInt(vodCacheSizeMbKey)
+    actual fun saveVodCacheSizeMb(sizeMb: Int) = saveInt(vodCacheSizeMbKey, sizeMb)
+    actual fun loadBufferEngineEnabled(): Boolean? = loadBoolean(bufferEngineEnabledKey)
+    actual fun saveBufferEngineEnabled(enabled: Boolean) = saveBoolean(bufferEngineEnabledKey, enabled)
+    actual fun loadMinBufferMs(): Int? = loadInt(minBufferMsKey)
+    actual fun saveMinBufferMs(value: Int) = saveInt(minBufferMsKey, value)
+    actual fun loadMaxBufferMs(): Int? = loadInt(maxBufferMsKey)
+    actual fun saveMaxBufferMs(value: Int) = saveInt(maxBufferMsKey, value)
+    actual fun loadBufferForPlaybackMs(): Int? = loadInt(bufferForPlaybackMsKey)
+    actual fun saveBufferForPlaybackMs(value: Int) = saveInt(bufferForPlaybackMsKey, value)
+    actual fun loadBufferForPlaybackAfterRebufferMs(): Int? = loadInt(bufferForPlaybackAfterRebufferMsKey)
+    actual fun saveBufferForPlaybackAfterRebufferMs(value: Int) = saveInt(bufferForPlaybackAfterRebufferMsKey, value)
+    actual fun loadBackBufferDurationMs(): Int? = loadInt(backBufferDurationMsKey)
+    actual fun saveBackBufferDurationMs(value: Int) = saveInt(backBufferDurationMsKey, value)
+    actual fun loadTargetBufferSizeMb(): Int? = loadInt(targetBufferSizeMbKey)
+    actual fun saveTargetBufferSizeMb(value: Int) = saveInt(targetBufferSizeMbKey, value)
     actual fun loadAutoSkipMovieCredits(): Boolean? = loadBoolean(autoSkipMovieCreditsKey)
     actual fun saveAutoSkipMovieCredits(enabled: Boolean) = saveBoolean(autoSkipMovieCreditsKey, enabled)
     actual fun loadAutoSkipPostCredits(): Boolean? = loadBoolean(autoSkipPostCreditsKey)
@@ -398,6 +446,7 @@ internal actual object PlayerSettingsStorage {
         loadStreamAutoPlayRegex()?.let { put(streamAutoPlayRegexKey, encodeSyncString(it)) }
         loadStreamAutoPlayTimeoutSeconds()?.let { put(streamAutoPlayTimeoutSecondsKey, encodeSyncInt(it)) }
         loadSkipIntroEnabled()?.let { put(skipIntroEnabledKey, encodeSyncBoolean(it)) }
+        loadPreloadNextEpisodeSources()?.let { put(preloadNextEpisodeSourcesKey, encodeSyncBoolean(it)) }
         loadAutoSkipMovieCredits()?.let { put(autoSkipMovieCreditsKey, encodeSyncBoolean(it)) }
         loadAutoSkipPostCredits()?.let { put(autoSkipPostCreditsKey, encodeSyncBoolean(it)) }
         loadAutoSkipSegmentTypes()?.let { put(autoSkipSegmentTypesKey, encodeSyncStringSet(it)) }
@@ -479,6 +528,7 @@ internal actual object PlayerSettingsStorage {
         payload.decodeSyncString(streamAutoPlayRegexKey)?.let(::saveStreamAutoPlayRegex)
         payload.decodeSyncInt(streamAutoPlayTimeoutSecondsKey)?.let(::saveStreamAutoPlayTimeoutSeconds)
         payload.decodeSyncBoolean(skipIntroEnabledKey)?.let(::saveSkipIntroEnabled)
+        payload.decodeSyncBoolean(preloadNextEpisodeSourcesKey)?.let(::savePreloadNextEpisodeSources)
         payload.decodeSyncBoolean(autoSkipMovieCreditsKey)?.let(::saveAutoSkipMovieCredits)
         payload.decodeSyncBoolean(autoSkipPostCreditsKey)?.let(::saveAutoSkipPostCredits)
         payload.decodeSyncStringSet(autoSkipSegmentTypesKey)?.let(::saveAutoSkipSegmentTypes)

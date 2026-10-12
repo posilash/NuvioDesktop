@@ -41,7 +41,7 @@ internal fun PlayerScreenRuntime.desktopPlayerInput(modifier: Modifier): Modifie
         runCatching { focusRequester.requestFocus() }
     }
 
-    val gestureController = rememberPlayerGestureController()
+    val gestureController = rememberPlayerGestureController(restoreBrightness = false)
     fun adjustVolume(delta: Float) {
         val controller = gestureController ?: return
         val current = controller.currentVolume()?.fraction ?: return

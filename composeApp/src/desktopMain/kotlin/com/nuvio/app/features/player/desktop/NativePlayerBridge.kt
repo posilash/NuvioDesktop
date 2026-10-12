@@ -48,9 +48,14 @@ internal object NativePlayerBridge {
 
     external fun dispose(handle: Long)
     external fun updateControls(handle: Long, controlsJson: String)
+
+    /** macOS only: title, episode line, and poster for the system now-playing widget (Control Center). */
+    external fun setNowPlayingMetadata(handle: Long, title: String, subtitle: String, artworkUrl: String)
     external fun requestFocus(handle: Long)
     external fun beginWindowDrag(handle: Long)
     external fun setWindowResizable(windowHwnd: Long, enabled: Boolean)
+    external fun setWindowAspectRatio(windowHwnd: Long, ratio: Float)
+    external fun layoutNativeSubviews(handle: Long)
     private external fun reparentSurfaceNative(handle: Long, hostViewPtr: Long)
 
     fun reparentSurface(handle: Long, hostViewPtr: Long): Boolean =
@@ -127,14 +132,15 @@ internal object NativePlayerBridge {
             ) {
                 runCatching { warmupWebView2(controlsPage.url) }
             }
+            if (DesktopHostOs.current == DesktopHostOs.WINDOWS) {
+                runCatching { shutdownWebView2Warmup() }
+            }
         }.apply {
             name = "nuvio-native-player-preload"
             isDaemon = true
             start()
         }
-        if (DesktopHostOs.current == DesktopHostOs.WINDOWS ||
-            DesktopHostOs.current == DesktopHostOs.LINUX
-        ) {
+        if (DesktopHostOs.current == DesktopHostOs.LINUX) {
             Runtime.getRuntime().addShutdownHook(
                 Thread {
                     runCatching { shutdownWebView2Warmup() }
@@ -169,14 +175,13 @@ internal object NativePlayerBridge {
             return
         }
 
-        val resource = "/native/$platformDir/$libraryName"
-        val files = buildMap {
-            put(libraryName, readResourceBytes(resource))
-            bundledRuntimeResourceNames(platformDir).forEach { name ->
-                resourceBytesOrNull("/native/$platformDir/$name")?.let { bytes -> put(name, bytes) }
+        val resources = (listOf(libraryName) + bundledRuntimeResourceNames(platformDir))
+            .mapNotNull { name ->
+                NativePlayerBridge::class.java.getResource("/native/$platformDir/$name")?.let { url -> name to url }
             }
-        }
-        val directory = DesktopCache.installVersionedFiles("native-player-bridge/$platformDir", files).toFile()
+            .toMap()
+        require(libraryName in resources) { "Missing native player resource: /native/$platformDir/$libraryName" }
+        val directory = DesktopCache.installVersionedResources("native-player-bridge/$platformDir", resources).toFile()
         loadNativeRuntimeDependencies(platform, directory)
         System.load(directory.resolve(libraryName).absolutePath)
     }
@@ -284,6 +289,7 @@ internal object NativePlayerBridge {
                 .replace("/* __NUVIO_PLAYER_FONT_FACES__ */", nativePlayerFontFaces())
                 .toByteArray(Charsets.UTF_8),
             "controls.js" to readResourceBytes("/player-ui/controls.js"),
+            "loading-indicator.js" to readResourceBytes("/player-ui/loading-indicator.js"),
             "fonts/jetbrains_sans_regular.ttf" to readResourceBytes(
                 "/composeResources/nuvio.composeapp.generated.resources/font/jetbrains_sans_regular.ttf",
             ),

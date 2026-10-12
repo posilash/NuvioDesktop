@@ -1909,7 +1909,7 @@ fun main(args: Array<String>) {
                 }
                 mpv?.close()
                 if (videoLog) println("[teardown] mpv closed")
-                // exitNow skips shutdown hooks, and P2P's is what stops TorrServer.
+                // exitNow skips shutdown hooks, and P2P's is what closes the engine.
                 if (runRealApp) runCatching { com.nuvio.app.stopDesktopRuntime() }
                 if (videoLog) println("[teardown] runtime stopped")
                 java.awt.EventQueue.invokeAndWait {
