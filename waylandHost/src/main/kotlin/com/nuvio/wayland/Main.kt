@@ -1155,6 +1155,11 @@ fun main(args: Array<String>) {
             // follows is the legacy in-loop consumer, which pays a full-frame
             // raster rebuild per frame and is exactly the cost the GPU path
             // exists to delete.
+            // The layer adopts, and acks, only inside a present. Over rolling
+            // video every vblank is one; paused or loading, a waiting frame has
+            // to ask for its own, or the page renders at whatever rate
+            // something else happens to present.
+            if (uiPipeline != null && chrome.hasPendingFrame) chromeChanged = true
             if (uiPipeline == null) {
                 chrome.takeShmFrame()?.let { frame ->
                     chromeImage?.close()
