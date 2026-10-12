@@ -3,11 +3,11 @@ package com.nuvio.wayland.wpe
 import java.lang.foreign.Arena
 import java.lang.foreign.FunctionDescriptor
 import java.lang.foreign.Linker
-import java.lang.foreign.MemoryLayout
 import java.lang.foreign.MemorySegment
 import java.lang.foreign.SymbolLookup
 import java.lang.foreign.ValueLayout.ADDRESS
 import java.lang.foreign.ValueLayout.JAVA_BOOLEAN
+import java.lang.foreign.ValueLayout.JAVA_DOUBLE
 import java.lang.foreign.ValueLayout.JAVA_INT
 import java.lang.foreign.ValueLayout.JAVA_LONG
 import java.lang.invoke.MethodHandles
@@ -20,21 +20,22 @@ import java.lang.invoke.MethodType
  * wl_subsurface variant -- a second commit stream -- made the chrome and the
  * video visibly fight whenever both were animating.)
  *
- * Two export paths, chosen by `-Dnuvio.wayland.chromeGpu` (default true):
+ * Built on WPEPlatform's headless display. WebKit 2.54 as Arch ships it has
+ * no libwpe/WPEBackend-fdo API left, and headless is the platform that draws
+ * nowhere on its own: every frame reaches [handleBuffer] through the view's
+ * render_buffer, which is overridden here (see [overrideRenderBuffer]).
  *
- * - GPU (`chromeGpu=true`): WebKit renders on the GPU and fdo hands over each
- *   frame as an EGLImage. Nothing is ever read back or copied; the UI thread
- *   binds the image as a texture and composites it. Per-frame CPU cost is
- *   then independent of the window's pixel area, which is the whole point --
- *   the SHM path's cost is a full-frame memcpy plus a raster upload, so it
- *   grows with area and turns fullscreen chrome into visible lag.
- * - SHM (`chromeGpu=false`): wpe_fdo_initialize_shm with WebKit forced off
- *   the GPU entirely. Exports are memcpy'd out on the GLib thread and handed
- *   to the consumer as [ShmFrame]s. Kept as the A/B reference and as the
- *   automatic fallback if the GPU path cannot initialise.
+ * Two buffer kinds, chosen by `-Dnuvio.wayland.chromeGpu` (default true):
  *
- * In BOTH paths the frame-complete ack fires when the consumer takes a frame,
- * so the page paces itself to the host's actual rate.
+ * - GPU: WebKit renders on [drmDevice] and each frame is a dmabuf. Nothing is
+ *   copied; the consumer imports it and composites it. Per-frame cost is then
+ *   independent of the window's pixel area.
+ * - SHM: WebKit is forced off the GPU and frames are shared-memory buffers,
+ *   copied out on the GLib thread and handed over as [ShmFrame]s. The A/B
+ *   reference, and what a run without the GPU path falls back to.
+ *
+ * In both, `wpe_view_buffer_rendered` -- WebKit's frame-done -- is sent when
+ * the consumer takes a frame, so the page paces itself to the host's rate.
  *
  * Threading: all WebKit calls happen on the GLib thread ([Glib.post]);
  * script messages arrive there and are forwarded verbatim to [onMessage].
@@ -44,17 +45,22 @@ class WpeChrome(
     private val height: Int,
     /**
      * False forces the SHM path even when the GPU one is available -- the
-     * legacy in-loop consumer has no GL context to import into.
+     * legacy in-loop consumer has nothing to import a dmabuf into.
      */
     private val allowGpu: Boolean = true,
+    /**
+     * Render node WebKit draws on. It has to be the GPU that presents: on a
+     * hybrid machine headless picks the first device it finds, and a buffer
+     * tiled for the iGPU cannot be imported by the discrete one.
+     */
+    private val drmDevice: String? = null,
     private val onMessage: (String) -> Unit,
 ) {
     private val linker = Linker.nativeLinker()
     private val arena = Arena.ofShared()
-    private lateinit var wpe: SymbolLookup
-    private lateinit var fdo: SymbolLookup
     private lateinit var webkit: SymbolLookup
-    private lateinit var gobject: SymbolLookup
+    private val gobject by lazy { SymbolLookup.libraryLookup("libgobject-2.0.so.0", arena) }
+    private val glib by lazy { SymbolLookup.libraryLookup("libglib-2.0.so.0", arena) }
 
     private fun fn(l: SymbolLookup, name: String, desc: FunctionDescriptor) =
         linker.downcallHandle(l.find(name).orElseThrow { UnsatisfiedLinkError(name) }, desc)
@@ -62,9 +68,9 @@ class WpeChrome(
     /** Whether the host is compositing the chrome right now (EDT writes). */
     @Volatile var visible: Boolean = true
 
-
-    private var exportable: MemorySegment = MemorySegment.NULL
     private var webView: MemorySegment = MemorySegment.NULL
+    private var view: MemorySegment = MemorySegment.NULL
+    private var toplevel: MemorySegment = MemorySegment.NULL
 
     @Volatile var framesExported = 0L
         private set
@@ -72,25 +78,14 @@ class WpeChrome(
         private set
 
     /**
-     * True once fdo is running on the isolated EGLDisplay and frames are
-     * expected as EGLImages. Read by the consumer to pick its import path;
-     * only meaningful after [start]'s init has run.
+     * True when frames are expected as dmabufs. Read by the consumer to pick
+     * its import path; it drops to false if WebKit hands over SHM instead.
      */
     @Volatile var gpuActive = false
         private set
 
     /** Woken on every export so the consumer's thread can pick the frame up. */
     @Volatile var onFrame: (() -> Unit)? = null
-
-    // fdo's own wayland connection and EGLDisplay. Deliberately NOT the
-    // display GLFW presents on: handing fdo that one froze every window
-    // present on NVIDIA (fdo binds the display for its nested compositor and
-    // the driver serialises the two uses against each other). fdo is the only
-    // thing that ever touches these.
-    private var wlDisplay: MemorySegment = MemorySegment.NULL
-    private var eglDisplay: MemorySegment = MemorySegment.NULL
-    private val wlClient by lazy { SymbolLookup.libraryLookup("libwayland-client.so.0", arena) }
-    private val eglLib by lazy { SymbolLookup.libraryLookup("libEGL.so.1", arena) }
 
     private var pageUri: String = ""
 
@@ -192,103 +187,63 @@ class WpeChrome(
     }
 
     private fun init(pageUri: String) {
-        wpe = SymbolLookup.libraryLookup("libwpe-1.0.so.1", arena)
-        fdo = SymbolLookup.libraryLookup("libWPEBackend-fdo-1.0.so.1", arena)
-
-        // libwpe resolves its backend through the loader; without this it
-        // hunts for a default and WebKit aborts on a missing backend.
-        fn(wpe, "wpe_loader_init", FunctionDescriptor.of(JAVA_BOOLEAN, ADDRESS))
-            .invokeExact(arena.allocateFrom("libWPEBackend-fdo-1.0.so.1")) as Boolean
-
-        // GPU first: fdo on its OWN EGLDisplay, so WebKit composites on the
-        // GPU and exports EGLImages we never read back. Any failure degrades
-        // to the software path rather than taking the app down.
-        gpuActive = allowGpu && runCatching { initEglDisplay() }.getOrElse {
-            lastError = "gpu init: $it"
-            println("[wpe] GPU path unavailable ($it) -- falling back to SHM")
-            false
-        }
-
-        if (!gpuActive) {
-            // Pure software WPE: the nested compositor offers only wl_shm and
-            // the WEBKIT_DISABLE_* env keeps the web process off GL entirely.
-            // This is what upstream's linux branch ships -- its
-            // player_bridge.cpp documents the same NVIDIA failure ("DMABUF
-            // renderer yields controls snapshots with degraded alpha ...
-            // fully opaque"). Those two variables used to be set
-            // unconditionally by the Gradle run task, which forced software
-            // WebKit even when nothing wanted it; they are set here instead,
-            // for the SHM path only, and still before any web process spawns.
+        if (!allowGpu) {
+            // Set before WebKit loads and before any web process is spawned;
+            // children inherit the environment at fork.
             setEnv("WEBKIT_DISABLE_DMABUF_RENDERER", "1")
             setEnv("WEBKIT_DISABLE_COMPOSITING_MODE", "1")
-            check(
-                fn(fdo, "wpe_fdo_initialize_shm", FunctionDescriptor.of(JAVA_BOOLEAN))
-                    .invokeExact() as Boolean,
-            ) { "wpe_fdo_initialize_shm failed" }
         }
-        println("[wpe] export path: ${if (gpuActive) "GPU (EGLImage, zero-copy)" else "SHM (software raster)"}")
-
-        // struct wpe_view_backend_exportable_fdo_egl_client:
-        //   [0] export_egl_image (legacy)  [1] export_fdo_egl_image  [2] shm  [3,4] reserved
-        // Slot ONE is the live EGL export; slot zero is the deprecated
-        // raw-EGLImage variant and filling it yields a silent black view.
-        val client = arena.allocate(MemoryLayout.sequenceLayout(5, ADDRESS))
-        val shmStub = linker.upcallStub(
-            MethodHandles.lookup().findStatic(
-                WpeCallbacks::class.java, "exportShmBuffer",
-                MethodType.methodType(Void.TYPE, MemorySegment::class.java, MemorySegment::class.java),
-            ),
-            FunctionDescriptor.ofVoid(ADDRESS, ADDRESS), arena,
-        )
-        // Filled even on the SHM path: harmless there (fdo never calls it),
-        // and it means a GPU-mode run that somehow still produces SHM buffers
-        // is handled rather than silently blank.
-        val eglStub = linker.upcallStub(
-            MethodHandles.lookup().findStatic(
-                WpeCallbacks::class.java, "exportEglImage",
-                MethodType.methodType(Void.TYPE, MemorySegment::class.java, MemorySegment::class.java),
-            ),
-            FunctionDescriptor.ofVoid(ADDRESS, ADDRESS), arena,
-        )
-        WpeCallbacks.owner = this
-        client.setAtIndex(ADDRESS, 0, MemorySegment.NULL)
-        client.setAtIndex(ADDRESS, 1, if (gpuActive) eglStub else MemorySegment.NULL)
-        client.setAtIndex(ADDRESS, 2, shmStub)
-        client.setAtIndex(ADDRESS, 3, MemorySegment.NULL)
-        client.setAtIndex(ADDRESS, 4, MemorySegment.NULL)
-
-        exportable = fn(fdo, "wpe_view_backend_exportable_fdo_egl_create",
-            FunctionDescriptor.of(ADDRESS, ADDRESS, ADDRESS, JAVA_INT, JAVA_INT))
-            .invokeExact(client, MemorySegment.NULL, width, height) as MemorySegment
-        viewBackend = fn(fdo, "wpe_view_backend_exportable_fdo_get_view_backend",
-            FunctionDescriptor.of(ADDRESS, ADDRESS))
-            .invokeExact(exportable) as MemorySegment
-
-        // The web process must never touch the NVIDIA driver: its GL->SHM
-        // readback garbles the alpha channel there (chrome became an opaque
-        // black sheet), and any GPU work it does contends with mpv's render
-        // thread. Compositing stays ON (that is what sizes buffers at
-        // logical*scale, the crisp path); it just runs on Mesa's software
-        // rasterizer. Set here -- after every NVIDIA context this process
-        // needs already exists, before the web process is spawned; children
-        // inherit the environment at fork.
         if (System.getProperty("nuvio.wayland.chromeSoftware")?.toBoolean() == true) {
             setEnv("LIBGL_ALWAYS_SOFTWARE", "1")
             setEnv("GALLIUM_DRIVER", "llvmpipe")
             setEnv("__EGL_VENDOR_LIBRARY_FILENAMES", "/usr/share/glvnd/egl_vendor.d/50_mesa.json")
         }
 
-        // WebKit only after the backend exists; its libraries pull in the
-        // loader state established above.
         webkit = SymbolLookup.libraryLookup("libWPEWebKit-2.0.so.1", arena)
-        gobject = SymbolLookup.libraryLookup("libgobject-2.0.so.0", arena)
+        overrideRenderBuffer()
 
-        val wkBackend = fn(webkit, "webkit_web_view_backend_new",
-            FunctionDescriptor.of(ADDRESS, ADDRESS, ADDRESS, ADDRESS))
-            .invokeExact(viewBackend, MemorySegment.NULL, MemorySegment.NULL) as MemorySegment
-        webView = fn(webkit, "webkit_web_view_new",
-            FunctionDescriptor.of(ADDRESS, ADDRESS))
-            .invokeExact(wkBackend) as MemorySegment
+        val display = Arena.ofConfined().use { a ->
+            val error = a.allocate(ADDRESS)
+            var display = MemorySegment.NULL
+            if (allowGpu && drmDevice != null) {
+                display = fn(webkit, "wpe_display_headless_new_for_device",
+                    FunctionDescriptor.of(ADDRESS, ADDRESS, ADDRESS))
+                    .invokeExact(a.allocateFrom(drmDevice), error) as MemorySegment
+                if (display.equals(MemorySegment.NULL)) {
+                    println("[wpe] $drmDevice unusable (${errorMessage(error)}); letting headless pick")
+                }
+            }
+            if (display.equals(MemorySegment.NULL)) {
+                display = fn(webkit, "wpe_display_headless_new", FunctionDescriptor.of(ADDRESS))
+                    .invokeExact() as MemorySegment
+            }
+            error.set(ADDRESS, 0, MemorySegment.NULL)
+            val connected = fn(webkit, "wpe_display_connect",
+                FunctionDescriptor.of(JAVA_INT, ADDRESS, ADDRESS))
+                .invokeExact(display, error) as Int
+            check(connected != 0) { "wpe_display_connect: ${errorMessage(error)}" }
+            display
+        }
+        gpuActive = allowGpu
+        println("[wpe] headless display on ${if (allowGpu) drmDevice ?: "default device" else "SHM"}")
+
+        val webViewType = fn(webkit, "webkit_web_view_get_type", FunctionDescriptor.of(JAVA_LONG))
+            .invokeExact() as Long
+        val gObjectNew = linker.downcallHandle(
+            gobject.find("g_object_new").orElseThrow(),
+            FunctionDescriptor.of(ADDRESS, JAVA_LONG, ADDRESS, ADDRESS, ADDRESS),
+            Linker.Option.firstVariadicArg(2),
+        )
+        webView = gObjectNew.invokeExact(
+            webViewType, arena.allocateFrom("display"), display, MemorySegment.NULL,
+        ) as MemorySegment
+        view = fn(webkit, "webkit_web_view_get_wpe_view", FunctionDescriptor.of(ADDRESS, ADDRESS))
+            .invokeExact(webView) as MemorySegment
+        toplevel = fn(webkit, "wpe_view_get_toplevel", FunctionDescriptor.of(ADDRESS, ADDRESS))
+            .invokeExact(view) as MemorySegment
+        check(!toplevel.equals(MemorySegment.NULL)) { "headless view came without a toplevel" }
+        resize(width, height)
+        fn(webkit, "wpe_view_focus_in", FunctionDescriptor.ofVoid(ADDRESS)).invokeExact(view)
 
         // The page's transport: webkit.messageHandlers.player.postMessage(...)
         // -- the same handler name and payload shape the stock GTK bridge
@@ -318,14 +273,13 @@ class WpeChrome(
 
         // Transparent background, or the view is an opaque wall: at launch it
         // blacked out the whole app, and in playback it sat as solid black
-        // between the video below and the chrome the page draws on top --
-        // "player UI works, no video, only sound". Stock builds its overlay
-        // window transparent for the same reason. WebKitColor = 4 gdoubles.
+        // between the video below and the chrome the page draws on top.
+        // WebKitColor = 4 gdoubles.
         Arena.ofConfined().use { a ->
-            val color = a.allocate(java.lang.foreign.ValueLayout.JAVA_DOUBLE, 4)
+            val color = a.allocate(JAVA_DOUBLE, 4)
             if (System.getProperty("nuvio.wayland.chromeBgRed")?.toBoolean() == true) {
-                color.setAtIndex(java.lang.foreign.ValueLayout.JAVA_DOUBLE, 0, 1.0)
-                color.setAtIndex(java.lang.foreign.ValueLayout.JAVA_DOUBLE, 3, 1.0)
+                color.setAtIndex(JAVA_DOUBLE, 0, 1.0)
+                color.setAtIndex(JAVA_DOUBLE, 3, 1.0)
             }
             // Statement position on purpose: a void invokeExact in a lambda's
             // tail is compiled expecting Object and throws
@@ -342,53 +296,43 @@ class WpeChrome(
     }
 
     /**
-     * Bring up fdo's own wayland connection and EGLDisplay and hand THAT to
-     * `wpe_fdo_initialize_for_egl_display`. Returns true when WebKit will
-     * export EGLImages.
+     * Take over WPEViewHeadless's render_buffer. Its own implementation acks
+     * on a fixed 60Hz timer and releases each buffer the moment the next one
+     * lands, which leaves a buffer we are still sampling free for WebKit to
+     * draw into. Owning the vfunc puts both back in the consumer's hands --
+     * the same contract fdo's exportable had.
      *
-     * The isolation is the load-bearing part. `wpe_fdo_initialize_for_egl_display`
-     * on the display GLFW presents on froze every window present on NVIDIA, so
-     * fdo gets a connection nothing else shares.
-     *
-     * That the resulting images are still importable from the window's GL
-     * context -- they belong to a different EGLDisplay, which the EGL spec does
-     * not promise is legal -- was verified against this driver before the path
-     * was written: two wayland connections, two EGLDisplays, an image created
-     * on one and bound with glEGLImageTargetTexture2DOES in a GL 3.3 core
-     * context on the other, read back with matching pixels. The consumer still
-     * checks at runtime and falls back rather than trusting that.
+     * The class is process-wide, but this process creates no other headless
+     * view.
      */
-    private fun initEglDisplay(): Boolean {
-        wlDisplay = fn(wlClient, "wl_display_connect", FunctionDescriptor.of(ADDRESS, ADDRESS))
-            .invokeExact(MemorySegment.NULL) as MemorySegment
-        check(!wlDisplay.equals(MemorySegment.NULL)) { "wl_display_connect(NULL) failed" }
-
-        // EGL_PLATFORM_WAYLAND_KHR. eglGetPlatformDisplay is EGL 1.5 core, and
-        // this driver reports 1.5, so no EXT/proc-address dance is needed.
-        eglDisplay = fn(eglLib, "eglGetPlatformDisplay",
-            FunctionDescriptor.of(ADDRESS, JAVA_INT, ADDRESS, ADDRESS))
-            .invokeExact(0x31D8, wlDisplay, MemorySegment.NULL) as MemorySegment
-        check(!eglDisplay.equals(MemorySegment.NULL)) { "eglGetPlatformDisplay failed" }
-
-        val initialised = Arena.ofConfined().use { a ->
-            val major = a.allocate(JAVA_INT)
-            val minor = a.allocate(JAVA_INT)
-            val ok = fn(eglLib, "eglInitialize",
-                FunctionDescriptor.of(JAVA_INT, ADDRESS, ADDRESS, ADDRESS))
-                .invokeExact(eglDisplay, major, minor) as Int
-            if (ok != 0) {
-                println("[wpe] fdo EGLDisplay ${major.get(JAVA_INT, 0)}.${minor.get(JAVA_INT, 0)} (isolated connection)")
-            }
-            ok != 0
+    private fun overrideRenderBuffer() {
+        val type = fn(webkit, "wpe_view_headless_get_type", FunctionDescriptor.of(JAVA_LONG))
+            .invokeExact() as Long
+        val klass = (fn(gobject, "g_type_class_ref", FunctionDescriptor.of(ADDRESS, JAVA_LONG))
+            .invokeExact(type) as MemorySegment).reinterpret(RENDER_BUFFER_OFFSET + ADDRESS.byteSize())
+        check(!klass.get(ADDRESS, RENDER_BUFFER_OFFSET).equals(MemorySegment.NULL)) {
+            "WPEViewClass.render_buffer is not where it was; the struct layout changed"
         }
-        check(initialised) { "eglInitialize on fdo's display failed" }
+        val stub = linker.upcallStub(
+            MethodHandles.lookup().findStatic(
+                WpeCallbacks::class.java, "renderBuffer",
+                MethodType.methodType(
+                    Int::class.java, MemorySegment::class.java, MemorySegment::class.java,
+                    MemorySegment::class.java, Int::class.java, MemorySegment::class.java,
+                ),
+            ),
+            FunctionDescriptor.of(JAVA_INT, ADDRESS, ADDRESS, ADDRESS, JAVA_INT, ADDRESS), arena,
+        )
+        WpeCallbacks.owner = this
+        klass.set(ADDRESS, RENDER_BUFFER_OFFSET, stub)
+    }
 
-        check(
-            fn(fdo, "wpe_fdo_initialize_for_egl_display",
-                FunctionDescriptor.of(JAVA_BOOLEAN, ADDRESS))
-                .invokeExact(eglDisplay) as Boolean,
-        ) { "wpe_fdo_initialize_for_egl_display failed" }
-        return true
+    private fun errorMessage(error: MemorySegment): String {
+        val e = error.get(ADDRESS, 0)
+        if (e.equals(MemorySegment.NULL)) return "unknown error"
+        val message = e.reinterpret(16).get(ADDRESS, 8)
+        return if (message.equals(MemorySegment.NULL)) "unknown error"
+        else message.reinterpret(Long.MAX_VALUE).getString(0)
     }
 
     /**
@@ -409,86 +353,157 @@ class WpeChrome(
 
     // ---- GLib-thread callbacks ----
 
-    private val wlServer by lazy { SymbolLookup.libraryLookup("libwayland-server.so.0", arena) }
-
-    /** A copied chrome frame: tightly packed BGRA (wl ARGB8888) pixels. */
+    /** A copied chrome frame: tightly packed BGRA (ARGB8888) pixels. */
     class ShmFrame(val width: Int, val height: Int, val pixels: java.nio.ByteBuffer)
 
     private val pendingShm = java.util.concurrent.atomic.AtomicReference<ShmFrame?>(null)
 
-    /** Newest exported EGLImage awaiting import (GPU path). */
-    private val pendingImage =
+    /** Newest dmabuf WPEBuffer awaiting import, holding a reference. */
+    private val pendingBuffer =
         java.util.concurrent.atomic.AtomicReference<MemorySegment?>(null)
 
-    // Ack conservation: dispatch_frame_complete is only ever valid as the
-    // answer to one export. Un-paired acks sent WPE into a render storm --
-    // one logged burst re-rendered the page 133k times in seconds.
-    private val ackOwed = java.util.concurrent.atomic.AtomicBoolean(false)
+    // Ack conservation: frame-done is only ever valid as the answer to one
+    // export. Un-paired acks sent WPE into a render storm -- one logged burst
+    // re-rendered the page 133k times in seconds. Holds a reference.
+    private val ackOwed = java.util.concurrent.atomic.AtomicReference<MemorySegment?>(null)
 
-    // Hot-path handles, resolved once. The SHM path rebuilds a downcall handle
-    // per call per frame; on the GPU path these run on every exported frame,
-    // so they are cached.
-    private val hGetEglImage by lazy {
-        fn(fdo, "wpe_fdo_egl_exported_image_get_egl_image", FunctionDescriptor.of(ADDRESS, ADDRESS))
+    private val hRef by lazy { fn(gobject, "g_object_ref", FunctionDescriptor.of(ADDRESS, ADDRESS)) }
+    private val hUnref by lazy { fn(gobject, "g_object_unref", FunctionDescriptor.ofVoid(ADDRESS)) }
+    private val hIsA by lazy {
+        fn(gobject, "g_type_check_instance_is_a", FunctionDescriptor.of(JAVA_INT, ADDRESS, JAVA_LONG))
     }
-    private val hImageWidth by lazy {
-        fn(fdo, "wpe_fdo_egl_exported_image_get_width", FunctionDescriptor.of(JAVA_INT, ADDRESS))
+    private val dmabufType by lazy {
+        fn(webkit, "wpe_buffer_dma_buf_get_type", FunctionDescriptor.of(JAVA_LONG)).invokeExact() as Long
     }
-    private val hImageHeight by lazy {
-        fn(fdo, "wpe_fdo_egl_exported_image_get_height", FunctionDescriptor.of(JAVA_INT, ADDRESS))
+    private val shmType by lazy {
+        fn(webkit, "wpe_buffer_shm_get_type", FunctionDescriptor.of(JAVA_LONG)).invokeExact() as Long
     }
-    private val hReleaseImage by lazy {
-        fn(fdo, "wpe_view_backend_exportable_fdo_egl_dispatch_release_exported_image",
-            FunctionDescriptor.ofVoid(ADDRESS, ADDRESS))
+    private val hRendered by lazy {
+        fn(webkit, "wpe_view_buffer_rendered", FunctionDescriptor.ofVoid(ADDRESS, ADDRESS))
     }
-    private val hFrameComplete by lazy {
-        fn(fdo, "wpe_view_backend_exportable_fdo_dispatch_frame_complete",
-            FunctionDescriptor.ofVoid(ADDRESS))
+    private val hReleased by lazy {
+        fn(webkit, "wpe_view_buffer_released", FunctionDescriptor.ofVoid(ADDRESS, ADDRESS))
+    }
+    private val hWidth by lazy { fn(webkit, "wpe_buffer_get_width", FunctionDescriptor.of(JAVA_INT, ADDRESS)) }
+    private val hHeight by lazy { fn(webkit, "wpe_buffer_get_height", FunctionDescriptor.of(JAVA_INT, ADDRESS)) }
+    private val hPlanes by lazy {
+        fn(webkit, "wpe_buffer_dma_buf_get_n_planes", FunctionDescriptor.of(JAVA_INT, ADDRESS))
+    }
+    private val hFd by lazy {
+        fn(webkit, "wpe_buffer_dma_buf_get_fd", FunctionDescriptor.of(JAVA_INT, ADDRESS, JAVA_INT))
+    }
+    private val hFormat by lazy {
+        fn(webkit, "wpe_buffer_dma_buf_get_format", FunctionDescriptor.of(JAVA_INT, ADDRESS))
+    }
+    private val hModifier by lazy {
+        fn(webkit, "wpe_buffer_dma_buf_get_modifier", FunctionDescriptor.of(JAVA_LONG, ADDRESS))
+    }
+    private val hStride by lazy {
+        fn(webkit, "wpe_buffer_dma_buf_get_stride", FunctionDescriptor.of(JAVA_INT, ADDRESS, JAVA_INT))
+    }
+    private val hOffset by lazy {
+        fn(webkit, "wpe_buffer_dma_buf_get_offset", FunctionDescriptor.of(JAVA_INT, ADDRESS, JAVA_INT))
+    }
+    private val hDup by lazy {
+        linker.downcallHandle(linker.defaultLookup().find("dup").orElseThrow(),
+            FunctionDescriptor.of(JAVA_INT, JAVA_INT))
     }
 
-    /**
-     * GPU export. Nothing is copied: the image is parked for the consumer,
-     * which binds it as a texture and releases it once its successor is bound.
-     *
-     * Frame-complete and buffer-release stay DISTINCT here, exactly as on the
-     * SHM path -- conflating them deadlocks after one frame. The ack is owed
-     * until the consumer takes the frame; the release is a separate lifetime
-     * question about the buffer's memory.
-     */
-    internal fun handleEglExport(image: MemorySegment) {
+    private fun isA(instance: MemorySegment, type: Long) =
+        (hIsA.invokeExact(instance, type) as Int) != 0
+
+    private fun ref(o: MemorySegment): MemorySegment = hRef.invokeExact(o) as MemorySegment
+
+    private fun unref(o: MemorySegment) { hUnref.invokeExact(o) }
+
+    /** WebKit's render_buffer; [buffer] is borrowed, so anything kept is ref'd. */
+    internal fun handleBuffer(buffer: MemorySegment) {
         framesExported++
-        ackOwed.set(true)
-        if (!visible && !priming) {
-            // Nothing will ever bind it, so it goes straight back. The slow
-            // trickle keeps the page's rAF logic alive at ~zero cost; an
-            // instant ack re-ran the renderer flat out.
-            releaseImage(image)
-            Glib.postDelayed(200) { dispatchFrameComplete() }
+        ackOwed.getAndSet(ref(buffer))?.let { unref(it) }
+        if (isA(buffer, dmabufType)) {
+            if (!visible && !priming) {
+                // Nothing will ever import it, so it goes straight back. The
+                // slow trickle keeps the page's rAF logic alive at ~zero cost;
+                // an instant ack re-ran the renderer flat out.
+                released(buffer)
+                Glib.postDelayed(200) { dispatchFrameComplete() }
+                return
+            }
+            // Newest wins. A predecessor still parked was never imported, so it
+            // goes back now; the one the consumer HAS imported is released by
+            // the consumer once its successor is on screen.
+            pendingBuffer.getAndSet(ref(buffer))?.let { release(it) }
+            onFrame?.invoke()
             return
         }
-        // Newest wins. A predecessor still sitting here was never bound by the
-        // consumer, so it is safe to hand back immediately; the one the
-        // consumer HAS bound is released by the consumer, after its successor
-        // is bound (an EGLImage released while still sampled is undefined).
-        pendingImage.getAndSet(image)?.let { releaseImage(it) }
-        onFrame?.invoke()
+        if (isA(buffer, shmType)) {
+            if (gpuActive) {
+                gpuActive = false
+                println("[wpe] WebKit is handing over SHM buffers; using the SHM path")
+            }
+            val handedOff = (visible || priming) && runCatching { copyShm(buffer) }
+                .onFailure { lastError = it.toString() }.getOrDefault(false)
+            released(buffer)
+            if (handedOff) onFrame?.invoke() else Glib.postDelayed(200) { dispatchFrameComplete() }
+            return
+        }
+        lastError = "unhandled WPEBuffer type"
+        released(buffer)
+        Glib.postDelayed(200) { dispatchFrameComplete() }
     }
 
-    /** Newest exported image for the consumer; caller must [releaseImageAsync] it. */
-    fun takeEglImage(): MemorySegment? =
-        pendingImage.getAndSet(null)?.also { framesTaken++ }
+    private fun copyShm(buffer: MemorySegment): Boolean {
+        val bytes = fn(webkit, "wpe_buffer_shm_get_data", FunctionDescriptor.of(ADDRESS, ADDRESS))
+            .invokeExact(buffer) as MemorySegment
+        if (bytes.equals(MemorySegment.NULL)) return false
+        val stride = fn(webkit, "wpe_buffer_shm_get_stride", FunctionDescriptor.of(JAVA_INT, ADDRESS))
+            .invokeExact(buffer) as Int
+        val w = hWidth.invokeExact(buffer) as Int
+        val h = hHeight.invokeExact(buffer) as Int
+        if (w <= 0 || h <= 0) return false
+        val data = Arena.ofConfined().use { a ->
+            val size = a.allocate(JAVA_LONG)
+            (fn(glib, "g_bytes_get_data", FunctionDescriptor.of(ADDRESS, ADDRESS, ADDRESS))
+                .invokeExact(bytes, size) as MemorySegment).reinterpret(size.get(JAVA_LONG, 0))
+        }
+        if (data.byteSize() < stride.toLong() * h) return false
+        val out = java.nio.ByteBuffer.allocateDirect(w * h * 4)
+        val outSeg = MemorySegment.ofBuffer(out)
+        if (stride == w * 4) {
+            MemorySegment.copy(data, 0, outSeg, 0, w.toLong() * h * 4)
+        } else {
+            for (row in 0 until h) {
+                MemorySegment.copy(data, row.toLong() * stride, outSeg, row.toLong() * w * 4, w.toLong() * 4)
+            }
+        }
+        pendingShm.set(ShmFrame(w, h, out))
+        return true
+    }
 
-    /** EGLImageKHR handle inside [image]; valid until the image is released. */
-    fun eglImageOf(image: MemorySegment): MemorySegment =
-        hGetEglImage.invokeExact(image) as MemorySegment
+    /** A frame is waiting to be taken, and with it the ack the page renders on. */
+    val hasPendingFrame: Boolean
+        get() = pendingBuffer.get() != null || pendingShm.get() != null
 
-    fun imageWidth(image: MemorySegment): Int = hImageWidth.invokeExact(image) as Int
+    /** Newest dmabuf frame for the consumer; caller must [releaseBufferAsync] it. */
+    fun takeBuffer(): MemorySegment? =
+        pendingBuffer.getAndSet(null)?.also { framesTaken++ }
 
-    fun imageHeight(image: MemorySegment): Int = hImageHeight.invokeExact(image) as Int
+    fun bufferWidth(buffer: MemorySegment): Int = hWidth.invokeExact(buffer) as Int
+
+    fun bufferHeight(buffer: MemorySegment): Int = hHeight.invokeExact(buffer) as Int
 
     /**
-     * What a dmabuf export describes. Single plane only, which is what WPE
-     * hands out for a rendered page -- [exportDmabuf] refuses anything else
+     * EGLImage for [buffer], for the GL consumer. Owned by the buffer and
+     * valid until it is released. It belongs to the headless display's own
+     * EGLDisplay, so binding it in the window's context is cross-display.
+     */
+    fun eglImageOf(buffer: MemorySegment): MemorySegment =
+        fn(webkit, "wpe_buffer_import_to_egl_image", FunctionDescriptor.of(ADDRESS, ADDRESS, ADDRESS))
+            .invokeExact(buffer, MemorySegment.NULL) as MemorySegment
+
+    /**
+     * What a dmabuf describes. Single plane only, which is what WebKit hands
+     * out on the presenting GPU -- [exportDmabuf] refuses anything else
      * rather than importing a plane and calling it a frame.
      *
      * [fd] is owned by the caller and must be closed once imported.
@@ -503,151 +518,48 @@ class WpeChrome(
         val height: Int,
     )
 
-    /**
-     * Export [image] as a DMABUF, for a consumer that is not GL.
-     *
-     * EGL_MESA_image_dma_buf_export is the only route out of an EGLImage that
-     * does not involve a readback, and it is an extension of fdo's own
-     * isolated display, which is the display this image belongs to. Null when
-     * the driver lacks it or the image is not single-plane.
-     */
-    fun exportDmabuf(image: MemorySegment): Dmabuf? {
-        val query = eglExportQuery ?: return null
-        val export = eglExport ?: return null
-        val egl = eglImageOf(image)
-        if (egl.equals(MemorySegment.NULL)) return null
-        return Arena.ofConfined().use { a ->
-            val fourcc = a.allocate(JAVA_INT)
-            val numPlanes = a.allocate(JAVA_INT)
-            val modifiers = a.allocate(JAVA_LONG)
-            val ok = query.invokeExact(eglDisplay, egl, fourcc, numPlanes, modifiers) as Int
-            if (ok == 0) {
-                if (!loggedExportFail) {
-                    loggedExportFail = true
-                    System.err.println("[wpe] eglExportDMABUFImageQueryMESA failed")
-                }
-                return@use null
+    private var loggedPlanes = false
+
+    /** [buffer] as a [Dmabuf], with its own duplicate of the fd. */
+    fun exportDmabuf(buffer: MemorySegment): Dmabuf? {
+        val planes = hPlanes.invokeExact(buffer) as Int
+        if (planes != 1) {
+            if (!loggedPlanes) {
+                loggedPlanes = true
+                System.err.println("[wpe] dmabuf has $planes planes; only 1 is handled")
             }
-            val planes = numPlanes.get(JAVA_INT, 0)
-            if (planes != 1) {
-                if (!loggedExportFail) {
-                    loggedExportFail = true
-                    System.err.println("[wpe] dmabuf export has $planes planes; only 1 is handled")
-                }
-                return@use null
-            }
-            val fds = a.allocate(JAVA_INT)
-            val strides = a.allocate(JAVA_INT)
-            val offsets = a.allocate(JAVA_INT)
-            val ok2 = export.invokeExact(eglDisplay, egl, fds, strides, offsets) as Int
-            if (ok2 == 0) {
-                if (!loggedExportFail) {
-                    loggedExportFail = true
-                    System.err.println("[wpe] eglExportDMABUFImageMESA failed")
-                }
-                return@use null
-            }
-            Dmabuf(
-                fd = fds.get(JAVA_INT, 0),
-                fourcc = fourcc.get(JAVA_INT, 0),
-                modifier = modifiers.get(JAVA_LONG, 0),
-                stride = strides.get(JAVA_INT, 0),
-                offset = offsets.get(JAVA_INT, 0),
-                width = imageWidth(image),
-                height = imageHeight(image),
-            )
+            return null
         }
+        val fd = hDup.invokeExact(hFd.invokeExact(buffer, 0) as Int) as Int
+        if (fd < 0) return null
+        return Dmabuf(
+            fd = fd,
+            fourcc = hFormat.invokeExact(buffer) as Int,
+            modifier = hModifier.invokeExact(buffer) as Long,
+            stride = hStride.invokeExact(buffer, 0) as Int,
+            offset = hOffset.invokeExact(buffer, 0) as Int,
+            width = bufferWidth(buffer),
+            height = bufferHeight(buffer),
+        )
     }
 
-    private var loggedExportFail = false
-
-    /** Both are extension entry points, so they come from eglGetProcAddress. */
-    private val eglExportQuery: java.lang.invoke.MethodHandle? by lazy { eglProc(
-        "eglExportDMABUFImageQueryMESA",
-        FunctionDescriptor.of(JAVA_INT, ADDRESS, ADDRESS, ADDRESS, ADDRESS, ADDRESS),
-    ) }
-    private val eglExport: java.lang.invoke.MethodHandle? by lazy { eglProc(
-        "eglExportDMABUFImageMESA",
-        FunctionDescriptor.of(JAVA_INT, ADDRESS, ADDRESS, ADDRESS, ADDRESS, ADDRESS),
-    ) }
-
-    private fun eglProc(name: String, desc: FunctionDescriptor): java.lang.invoke.MethodHandle? {
-        val getProc = fn(eglLib, "eglGetProcAddress", FunctionDescriptor.of(ADDRESS, ADDRESS))
-        val addr = Arena.ofConfined().use { a ->
-            getProc.invokeExact(a.allocateFrom(name)) as MemorySegment
-        }
-        if (addr.equals(MemorySegment.NULL)) return null
-        return linker.downcallHandle(addr, desc)
+    /** Hand a taken buffer back to WebKit. Safe from any thread. */
+    fun releaseBufferAsync(buffer: MemorySegment) {
+        Glib.post { release(buffer) }
     }
 
-    /** Hand an image back to WPE. Safe from any thread. */
-    fun releaseImageAsync(image: MemorySegment) {
-        Glib.post { releaseImage(image) }
+    /** Back to WebKit, dropping the reference [handleBuffer] took. */
+    private fun release(buffer: MemorySegment) {
+        released(buffer)
+        unref(buffer)
     }
 
-    private fun releaseImage(image: MemorySegment) {
-        hReleaseImage.invokeExact(exportable, image)
-    }
-
-    internal fun handleShmExport(buffer: MemorySegment) {
-        framesExported++
-        ackOwed.set(true)
-        var handedOff = false
-        runCatching {
-            if (!visible && !priming) return@runCatching // skip the copy entirely
-            val shm = fn(fdo, "wpe_fdo_shm_exported_buffer_get_shm_buffer",
-                FunctionDescriptor.of(ADDRESS, ADDRESS)).invokeExact(buffer) as MemorySegment
-            if (!shm.equals(MemorySegment.NULL)) {
-                fn(wlServer, "wl_shm_buffer_begin_access", FunctionDescriptor.ofVoid(ADDRESS))
-                    .invokeExact(shm)
-                val data = fn(wlServer, "wl_shm_buffer_get_data",
-                    FunctionDescriptor.of(ADDRESS, ADDRESS)).invokeExact(shm) as MemorySegment
-                val stride = fn(wlServer, "wl_shm_buffer_get_stride",
-                    FunctionDescriptor.of(JAVA_INT, ADDRESS)).invokeExact(shm) as Int
-                val w = fn(wlServer, "wl_shm_buffer_get_width",
-                    FunctionDescriptor.of(JAVA_INT, ADDRESS)).invokeExact(shm) as Int
-                val h = fn(wlServer, "wl_shm_buffer_get_height",
-                    FunctionDescriptor.of(JAVA_INT, ADDRESS)).invokeExact(shm) as Int
-                if (!data.equals(MemorySegment.NULL) && w > 0 && h > 0) {
-                    val out = java.nio.ByteBuffer.allocateDirect(w * h * 4)
-                    val outSeg = MemorySegment.ofBuffer(out)
-                    val src = data.reinterpret(stride.toLong() * h)
-                    if (stride == w * 4) {
-                        MemorySegment.copy(src, 0, outSeg, 0, w.toLong() * h * 4)
-                    } else {
-                        for (row in 0 until h) {
-                            MemorySegment.copy(
-                                src, row.toLong() * stride,
-                                outSeg, row.toLong() * w * 4, w.toLong() * 4,
-                            )
-                        }
-                    }
-                    pendingShm.set(ShmFrame(w, h, out))
-                    handedOff = true
-                }
-                fn(wlServer, "wl_shm_buffer_end_access", FunctionDescriptor.ofVoid(ADDRESS))
-                    .invokeExact(shm)
-            }
-        }.onFailure { lastError = it.toString() }
-        fn(fdo, "wpe_view_backend_exportable_fdo_dispatch_release_shm_exported_buffer",
-            FunctionDescriptor.ofVoid(ADDRESS, ADDRESS))
-            .invokeExact(exportable, buffer)
-        if (handedOff) {
-            // The ack comes when the consumer takes the frame: the page paces
-            // itself to the host's actual rate.
-            onFrame?.invoke()
-        } else {
-            // Hidden or inactive: a slow trickle, never instant -- an
-            // instant ack re-ran the renderer flat out (~90fps of CPU
-            // raster). 5fps keeps the page's rAF-driven logic alive so it
-            // can still react (reveal chrome, run its fade) at ~zero cost.
-            Glib.postDelayed(200) { dispatchFrameComplete() }
-        }
+    private fun released(buffer: MemorySegment) {
+        hReleased.invokeExact(view, buffer)
     }
 
     /** Newest chrome frame for the EDT; caller must [ackFrame] after use. */
     fun takeShmFrame(): ShmFrame? = pendingShm.getAndSet(null)?.also { framesTaken++ }
-
 
     internal fun handleMessage(jscValue: MemorySegment) {
         val json = fn(webkit, "jsc_value_to_json",
@@ -659,7 +571,7 @@ class WpeChrome(
     }
 
     /**
-     * Acknowledge the current frame so WPE renders the next one. The EDT
+     * Acknowledge the current frame so WebKit renders the next one. The EDT
      * calls this after consuming a frame; it is also the kick after
      * unhiding, and any other stall recovery.
      */
@@ -673,88 +585,96 @@ class WpeChrome(
     }
 
     private fun dispatchFrameComplete() {
-        if (!ackOwed.getAndSet(false)) return
-        hFrameComplete.invokeExact(exportable)
+        val buffer = ackOwed.getAndSet(null) ?: return
+        hRendered.invokeExact(view, buffer)
+        unref(buffer)
     }
 
     // ---- input, forwarded from the host's GLFW callbacks ----
-    // Layouts from wpe/input.h: pointer/axis are 7 ints; keyboard is
-    // 3 ints + bool + pad + int. key_code is an XKB keysym.
+    // Pointer coordinates are logical. Modifiers are WPEModifiers: keyboard
+    // bits 0-3, held buttons from 1<<8. Buttons are 1 left, 2 middle, 3 right.
 
-    private val pointerLayout = MemoryLayout.structLayout(
-        JAVA_INT, JAVA_INT, JAVA_INT, JAVA_INT, JAVA_INT, JAVA_INT, JAVA_INT,
-    )
+    private val hEvent by lazy { fn(webkit, "wpe_view_event", FunctionDescriptor.ofVoid(ADDRESS, ADDRESS)) }
+    private val hEventUnref by lazy { fn(webkit, "wpe_event_unref", FunctionDescriptor.ofVoid(ADDRESS)) }
+
+    private fun now(): Int = (System.nanoTime() / 1_000_000L).toInt()
+
+    private fun send(event: MemorySegment) {
+        if (event.equals(MemorySegment.NULL)) return
+        hEvent.invokeExact(view, event)
+        hEventUnref.invokeExact(event)
+    }
+
+    private fun viewReady() = !view.equals(MemorySegment.NULL)
 
     fun dispatchPointer(motion: Boolean, x: Int, y: Int, button: Int, pressed: Boolean, modifiers: Int) {
         Glib.post {
-            val backend = viewBackendOrNull() ?: return@post
-            Arena.ofConfined().use { a ->
-                val ev = a.allocate(pointerLayout)
-                ev.set(JAVA_INT, 0, if (motion) 1 else 2) // motion / button
-                ev.set(JAVA_INT, 4, (System.nanoTime() / 1_000_000L).toInt())
-                ev.set(JAVA_INT, 8, x)
-                ev.set(JAVA_INT, 12, y)
-                ev.set(JAVA_INT, 16, button)
-                ev.set(JAVA_INT, 20, if (pressed) 1 else 0)
-                ev.set(JAVA_INT, 24, modifiers)
-                fn(wpe, "wpe_view_backend_dispatch_pointer_event",
-                    FunctionDescriptor.ofVoid(ADDRESS, ADDRESS))
-                    .invokeExact(backend, ev)
-                Unit // see set_background_color note
+            if (!viewReady()) return@post
+            val time = now()
+            val event = if (motion) {
+                fn(webkit, "wpe_event_pointer_move_new", FunctionDescriptor.of(
+                    ADDRESS, JAVA_INT, ADDRESS, JAVA_INT, JAVA_INT, JAVA_INT,
+                    JAVA_DOUBLE, JAVA_DOUBLE, JAVA_DOUBLE, JAVA_DOUBLE,
+                )).invokeExact(
+                    EVENT_POINTER_MOVE, view, SOURCE_MOUSE, time, modifiers,
+                    x.toDouble(), y.toDouble(), 0.0, 0.0,
+                ) as MemorySegment
+            } else {
+                val pressCount = if (pressed) {
+                    fn(webkit, "wpe_view_compute_press_count", FunctionDescriptor.of(
+                        JAVA_INT, ADDRESS, JAVA_DOUBLE, JAVA_DOUBLE, JAVA_INT, JAVA_INT,
+                    )).invokeExact(view, x.toDouble(), y.toDouble(), button, time) as Int
+                } else {
+                    0
+                }
+                fn(webkit, "wpe_event_pointer_button_new", FunctionDescriptor.of(
+                    ADDRESS, JAVA_INT, ADDRESS, JAVA_INT, JAVA_INT, JAVA_INT,
+                    JAVA_INT, JAVA_DOUBLE, JAVA_DOUBLE, JAVA_INT,
+                )).invokeExact(
+                    if (pressed) EVENT_POINTER_DOWN else EVENT_POINTER_UP, view, SOURCE_MOUSE,
+                    time, modifiers, button, x.toDouble(), y.toDouble(), pressCount,
+                ) as MemorySegment
             }
+            send(event)
         }
     }
 
-    fun dispatchAxis(x: Int, y: Int, vertical: Boolean, value: Int) {
+    /** Wheel notches, positive up and left, as GLFW reports them. */
+    fun dispatchScroll(x: Int, y: Int, dx: Double, dy: Double) {
         Glib.post {
-            val backend = viewBackendOrNull() ?: return@post
-            Arena.ofConfined().use { a ->
-                val ev = a.allocate(pointerLayout) // same 7-int shape
-                ev.set(JAVA_INT, 0, 1) // motion
-                ev.set(JAVA_INT, 4, (System.nanoTime() / 1_000_000L).toInt())
-                ev.set(JAVA_INT, 8, x)
-                ev.set(JAVA_INT, 12, y)
-                ev.set(JAVA_INT, 16, if (vertical) 0 else 1) // axis
-                ev.set(JAVA_INT, 20, value)
-                ev.set(JAVA_INT, 24, 0)
-                fn(wpe, "wpe_view_backend_dispatch_axis_event",
-                    FunctionDescriptor.ofVoid(ADDRESS, ADDRESS))
-                    .invokeExact(backend, ev)
-                Unit // see set_background_color note
-            }
+            if (!viewReady()) return@post
+            val event = fn(webkit, "wpe_event_scroll_new", FunctionDescriptor.of(
+                ADDRESS, ADDRESS, JAVA_INT, JAVA_INT, JAVA_INT,
+                JAVA_DOUBLE, JAVA_DOUBLE, JAVA_INT, JAVA_INT, JAVA_DOUBLE, JAVA_DOUBLE,
+            )).invokeExact(
+                view, SOURCE_MOUSE, now(), 0, dx, dy, 0, 0, x.toDouble(), y.toDouble(),
+            ) as MemorySegment
+            send(event)
         }
     }
 
-    private val keyboardLayout = MemoryLayout.structLayout(
-        JAVA_INT, JAVA_INT, JAVA_INT, JAVA_BOOLEAN,
-        MemoryLayout.paddingLayout(3), JAVA_INT,
-    )
-
+    /** [keysym] is the XKB keysym; [hardware] the XKB keycode (evdev + 8). */
     fun dispatchKey(keysym: Int, hardware: Int, pressed: Boolean, modifiers: Int) {
         Glib.post {
-            val backend = viewBackendOrNull() ?: return@post
-            Arena.ofConfined().use { a ->
-                val ev = a.allocate(keyboardLayout)
-                ev.set(JAVA_INT, 0, (System.nanoTime() / 1_000_000L).toInt())
-                ev.set(JAVA_INT, 4, keysym)
-                ev.set(JAVA_INT, 8, hardware)
-                ev.set(JAVA_BOOLEAN, 12, pressed)
-                ev.set(JAVA_INT, 16, modifiers)
-                fn(wpe, "wpe_view_backend_dispatch_keyboard_event",
-                    FunctionDescriptor.ofVoid(ADDRESS, ADDRESS))
-                    .invokeExact(backend, ev)
-                Unit // see set_background_color note
-            }
+            if (!viewReady()) return@post
+            val event = fn(webkit, "wpe_event_keyboard_new", FunctionDescriptor.of(
+                ADDRESS, JAVA_INT, ADDRESS, JAVA_INT, JAVA_INT, JAVA_INT, JAVA_INT, JAVA_INT,
+            )).invokeExact(
+                if (pressed) EVENT_KEY_DOWN else EVENT_KEY_UP, view, SOURCE_KEYBOARD,
+                now(), modifiers, hardware, keysym,
+            ) as MemorySegment
+            send(event)
         }
     }
 
+    /** Logical size; WebKit rasters at size * [dispatchScale]. */
     fun dispatchSize(w: Int, h: Int) {
-        Glib.post {
-            val backend = viewBackendOrNull() ?: return@post
-            fn(wpe, "wpe_view_backend_dispatch_set_size",
-                FunctionDescriptor.ofVoid(ADDRESS, JAVA_INT, JAVA_INT))
-                .invokeExact(backend, w, h)
-        }
+        Glib.post { if (viewReady()) resize(w, h) }
+    }
+
+    private fun resize(w: Int, h: Int) {
+        fn(webkit, "wpe_toplevel_resize", FunctionDescriptor.of(JAVA_INT, ADDRESS, JAVA_INT, JAVA_INT))
+            .invokeExact(toplevel, w, h) as Int
     }
 
     /**
@@ -764,16 +684,11 @@ class WpeChrome(
      */
     fun dispatchScale(scale: Float) {
         Glib.post {
-            val backend = viewBackendOrNull() ?: return@post
-            fn(wpe, "wpe_view_backend_dispatch_set_device_scale_factor",
-                FunctionDescriptor.ofVoid(ADDRESS, java.lang.foreign.ValueLayout.JAVA_FLOAT))
-                .invokeExact(backend, scale)
+            if (!viewReady()) return@post
+            fn(webkit, "wpe_toplevel_scale_changed", FunctionDescriptor.ofVoid(ADDRESS, JAVA_DOUBLE))
+                .invokeExact(toplevel, scale.toDouble())
         }
     }
-
-    private var viewBackend: MemorySegment = MemorySegment.NULL
-    private fun viewBackendOrNull(): MemorySegment? =
-        viewBackend.takeIf { !it.equals(MemorySegment.NULL) }
 
     /** Push state into the page (stock evaluates scripts the same way). */
     fun evaluateJs(script: String) {
@@ -792,6 +707,35 @@ class WpeChrome(
             }
         }
     }
+
+    companion object {
+        /** offsetof(WPEViewClass, render_buffer): GObjectClass, then buffers_changed. */
+        private const val RENDER_BUFFER_OFFSET = 144L
+
+        private const val EVENT_POINTER_DOWN = 1
+        private const val EVENT_POINTER_UP = 2
+        private const val EVENT_POINTER_MOVE = 3
+        private const val EVENT_KEY_DOWN = 7
+        private const val EVENT_KEY_UP = 8
+        private const val SOURCE_MOUSE = 0
+        private const val SOURCE_KEYBOARD = 2
+
+        /** Held-button modifier for WPE button [button] (1 left, 2 middle, 3 right). */
+        fun buttonModifier(button: Int): Int = 1 shl (7 + button)
+
+        /** The render node of the PCI device with these ids, if there is one. */
+        fun renderNodeFor(vendorId: Int, deviceId: Int): String? {
+            val nodes = java.io.File("/sys/class/drm").listFiles { f -> f.name.startsWith("renderD") }
+                ?: return null
+            fun id(f: java.io.File) = runCatching {
+                Integer.decode(f.readText().trim())
+            }.getOrNull()
+            return nodes.sortedBy { it.name }.firstOrNull { node ->
+                id(java.io.File(node, "device/vendor")) == vendorId &&
+                    id(java.io.File(node, "device/device")) == deviceId
+            }?.let { "/dev/dri/${it.name}" }
+        }
+    }
 }
 
 /** FFM upcalls must target static methods. */
@@ -804,13 +748,17 @@ internal object WpeCallbacks {
         owner?.handleMessage(jscValue)
     }
 
+    // Always TRUE: on FALSE WebKit logs error->message without checking it,
+    // and nothing here sets a GError.
     @JvmStatic
-    fun exportShmBuffer(data: MemorySegment, buffer: MemorySegment) {
-        owner?.handleShmExport(buffer)
-    }
-
-    @JvmStatic
-    fun exportEglImage(data: MemorySegment, image: MemorySegment) {
-        owner?.handleEglExport(image)
+    fun renderBuffer(
+        view: MemorySegment,
+        buffer: MemorySegment,
+        damage: MemorySegment,
+        damageCount: Int,
+        error: MemorySegment,
+    ): Int {
+        runCatching { owner?.handleBuffer(buffer) }.onFailure { it.printStackTrace() }
+        return 1
     }
 }

@@ -198,6 +198,12 @@ class VkPresenter(private val window: Long) {
     private var separateQueues = false
     private var deviceName = "?"
 
+    /** PCI ids of the presenting GPU, so the chrome can render on the same one. */
+    var pciVendorId = 0
+        private set
+    var pciDeviceId = 0
+        private set
+
     private var surface = VK_NULL_HANDLE
     private var swapchain = VK_NULL_HANDLE
     private var swapImages = LongArray(0)
@@ -331,6 +337,8 @@ class VkPresenter(private val window: Long) {
             val props = VkPhysicalDeviceProperties.calloc(s)
             vkGetPhysicalDeviceProperties(physicalDevice, props)
             deviceName = props.deviceNameString()
+            pciVendorId = props.vendorID()
+            pciDeviceId = props.deviceID()
 
             val qc = s.mallocInt(1)
             vkGetPhysicalDeviceQueueFamilyProperties(physicalDevice, qc, null)

@@ -10,7 +10,7 @@ url="https://github.com/posilash/NuvioDesktop"
 license=('GPL-3.0-or-later')
 # No Java: the Compose distributable bundles its own jlink runtime. The X libs
 # stay because the host still runs AWT's event queue.
-depends=('mpv' 'libwpe' 'wpebackend-fdo' 'wpewebkit' 'wayland' 'libglvnd'
+depends=('mpv' 'wpewebkit>=2.54' 'wayland' 'libglvnd'
          'gcc-libs' 'libx11' 'libxext' 'libxi' 'libxrender' 'libxtst')
 makedepends=('git' 'java-environment>=17' 'gcc' 'meson' 'ninja' 'pkgconf'
              'vulkan-headers' 'luajit' 'mujs' 'wayland-protocols')

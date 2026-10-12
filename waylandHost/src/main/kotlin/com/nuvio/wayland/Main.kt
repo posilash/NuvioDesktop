@@ -849,10 +849,13 @@ fun main(args: Array<String>) {
         wpeChrome = com.nuvio.wayland.wpe.WpeChrome(
             width = INITIAL_WIDTH,
             height = INITIAL_HEIGHT,
-            // The GPU path needs a GL context to import the exported EGLImage
-            // into, and that context is the UI thread's. On the legacy in-loop
-            // path there is no such thread, so WPE stays on SHM.
+            // The GPU path needs something to import the dmabuf into, which
+            // the legacy in-loop path does not have, so WPE stays on SHM there.
             allowGpu = chromeGpuRequested && uiPipeline != null,
+            drmDevice = System.getProperty("nuvio.wayland.chromeDrmDevice")
+                ?: presenter?.let {
+                    com.nuvio.wayland.wpe.WpeChrome.renderNodeFor(it.pciVendorId, it.pciDeviceId)
+                },
             onMessage = { json ->
                 // {type,value} in either field order; value optional.
                 val type = Regex("\u0022type\u0022[ \t]*:[ \t]*\u0022([^\u0022]*)\u0022")
@@ -961,11 +964,8 @@ fun main(args: Array<String>) {
         input.onChromeInput = {
             chromeActiveUntilNs.set(System.nanoTime() + 2_000_000_000L)
         }
-        // With a device scale factor the page hit-tests in PHYSICAL pixels
-        // (Cog multiplies surface coords by the output scale the same way);
-        // InputRouter's cursor is already framebuffer pixels, so 1:1. On a
-        // compositor without viewporter the page runs at logical size and
-        // coordinates scale down instead.
+        // WPEPlatform hit-tests in logical pixels, whatever the scale factor;
+        // InputRouter turns its framebuffer-pixel cursor back into those.
         input.chromeScaleX = 1f
         input.chromeScaleY = 1f
     }

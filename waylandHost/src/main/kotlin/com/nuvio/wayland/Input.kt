@@ -64,7 +64,7 @@ class InputRouter(
     private var chromeButtons = 0
 
     private fun chromeXY(): Pair<Int, Int> =
-        Pair((cursorX * chromeScaleX).toInt(), (cursorY * chromeScaleY).toInt())
+        Pair((cursorX / scale * chromeScaleX).toInt(), (cursorY / scale * chromeScaleY).toInt())
 
     // Counted at both ends: what GLFW handed us, and what actually reached the
     // scene. If those diverge the events are being dropped between the two,
@@ -130,7 +130,7 @@ class InputRouter(
             }
             chrome?.let { c ->
                 // wpe buttons: 1=left 2=middle 3=right; button-held modifier
-                // bits start at 1<<20 (wpe_input_pointer_modifier_button1).
+                // bits start at 1<<8 (WPE_MODIFIER_POINTER_BUTTON1).
                 val wpeButton = when (button) {
                     GLFW_MOUSE_BUTTON_LEFT -> 1
                     GLFW_MOUSE_BUTTON_MIDDLE -> 2
@@ -138,7 +138,7 @@ class InputRouter(
                     else -> 0
                 }
                 if (wpeButton != 0) {
-                    val bit = 1 shl (19 + wpeButton)
+                    val bit = com.nuvio.wayland.wpe.WpeChrome.buttonModifier(wpeButton)
                     chromeButtons = if (action == GLFW_PRESS) chromeButtons or bit
                     else chromeButtons and bit.inv()
                     val (cx, cy) = chromeXY()
@@ -156,9 +156,9 @@ class InputRouter(
         glfwSetScrollCallback(window) { _, dx, dy ->
             chrome?.let { c ->
                 val (cx, cy) = chromeXY()
-                // Web wheel steps: ~53px per notch, sign as Wayland's.
-                if (dy != 0.0) c.dispatchAxis(cx, cy, vertical = true, value = (dy * 53).toInt())
-                if (dx != 0.0) c.dispatchAxis(cx, cy, vertical = false, value = (dx * 53).toInt())
+                // Notches, not pixels: WebKit scales a non-precise wheel by
+                // its own line step.
+                c.dispatchScroll(cx, cy, dx, dy)
                 // The wheel is the page's other volume control.
                 onChromeInput?.invoke()
             }

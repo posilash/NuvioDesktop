@@ -128,7 +128,7 @@ compose.desktop.application {
             "media", "libmpv", "hwdec", "realApp", "harness", "probe", "videoLog",
             "smokePlayer", "demoFrames", "uiScale", "resizeTest", "subTest", "mpvExtra", "webChrome", "chromePage", "chromeProbe", "chromeBgRed", "chromeNoBlit", "chromeInitOnly", "vk", "paced", "sceneHoldMs", "noPlayerUi", "sampled", "uiThread", "uiFps",
             // Zero-copy GPU chrome and its levers.
-            "chromeGpu", "chromeFps", "chromeSoftware", "chromeFlipGpu", "chromeFlipShm",
+            "chromeGpu", "chromeDrmDevice", "chromeFps", "chromeSoftware", "chromeFlipGpu", "chromeFlipShm",
             "chromeAlwaysOn", "chromeScaleMul",
             // Test lever: the window size the host asks for, so chrome cost
             // can be measured against pixel area without touching the compositor.

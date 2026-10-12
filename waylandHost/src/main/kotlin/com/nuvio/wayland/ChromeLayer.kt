@@ -24,8 +24,8 @@ import java.lang.foreign.ValueLayout.JAVA_INT
  * 3.7M-pixel fullscreen one was not.
  *
  * Here nothing per-frame is O(pixels) on the CPU:
- * - GPU path: the exported EGLImage is bound straight to a texture
- *   (glEGLImageTargetTexture2DOES). No copy at all, at any size.
+ * - GPU path: WebKit's dmabuf is imported as a VkImage (or, on the GL
+ *   path, as an EGLImage bound to a texture). No copy at all, at any size.
  * - SHM path: one glTexSubImage2D into a PERSISTENT texture. Still a copy --
  *   the software renderer gives us no choice -- but it is a single upload
  *   rather than three passes plus an allocation, and no Skia object churn.
@@ -126,9 +126,9 @@ class ChromeLayer(private val chrome: WpeChrome) {
      * NDC y=-1 is the canvas TOP, and sampling v=0 there draws the source's
      * row 0 at the top.
      *
-     * - SHM: wl_shm row 0 is the top of the page, uploaded straight through by
-     *   glTexSubImage2D, so texel row 0 is the page top. No flip.
-     * - GPU: WPE's exported EGLImage is a wayland buffer and follows the same
+     * - SHM: row 0 of the shared-memory buffer is the top of the page,
+     *   uploaded straight through by glTexSubImage2D. No flip.
+     * - GPU: WebKit's dmabufs are compositor buffers and follow the same
      *   top-down convention, NOT GL's bottom-left one. No flip. (Assuming it
      *   was GL-oriented is what produced the first upside-down build.)
      *
@@ -233,7 +233,7 @@ class ChromeLayer(private val chrome: WpeChrome) {
             // no chrome at all. Ack it on the same slow trickle WpeChrome
             // uses while hidden: the page keeps breathing at ~5fps, which
             // costs nothing and keeps it revealable.
-            var drained = chrome.takeEglImage()?.let { chrome.releaseImageAsync(it); true } ?: false
+            var drained = chrome.takeBuffer()?.let { chrome.releaseBufferAsync(it); true } ?: false
             if (chrome.takeShmFrame() != null) drained = true
             if (drained) chrome.ackFrameAfter(HIDDEN_ACK_MS)
             return dirty
@@ -313,9 +313,9 @@ class ChromeLayer(private val chrome: WpeChrome) {
     val hasVkContent: Boolean get() = vkImage != null
 
     /**
-     * Same handoff as [updateFromEglImage], one step longer: WPE's EGLImage is
-     * exported as a dmabuf and imported as a VkImage, because Skia is on
-     * Vulkan here and there is no GL context to target.
+     * Same handoff as [updateFromEglImage], on Vulkan: WebKit's dmabuf is
+     * imported as a VkImage, because Skia is on Vulkan here and there is no
+     * GL context to target.
      *
      * Imported per frame rather than cached. WPE cycles a small pool, so a
      * cache keyed on the image would be the faster thing -- and would be the
@@ -326,10 +326,10 @@ class ChromeLayer(private val chrome: WpeChrome) {
      */
     private fun updateFromDmabuf(): Boolean {
         val presenter = vk ?: return false
-        val image = chrome.takeEglImage() ?: return false
+        val image = chrome.takeBuffer() ?: return false
         val dmabuf = chrome.exportDmabuf(image)
         if (dmabuf == null) {
-            chrome.releaseImageAsync(image)
+            chrome.releaseBufferAsync(image)
             // Still ack, for the reason updateFromEglImage gives: an export
             // that goes unanswered stops the page rendering for good.
             chrome.ackFrameAfter(ackDelayMs)
@@ -338,7 +338,7 @@ class ChromeLayer(private val chrome: WpeChrome) {
         val imported = presenter.importChromeDmabuf(dmabuf)
         if (imported == null) {
             VideoPipelineVk.Posix.close(dmabuf.fd)
-            chrome.releaseImageAsync(image)
+            chrome.releaseBufferAsync(image)
             if (importErrors++ == 0L) {
                 System.err.println(
                     "[chrome] dmabuf import failed; re-run without " +
@@ -357,7 +357,7 @@ class ChromeLayer(private val chrome: WpeChrome) {
         // import dies with it, since the buffer behind it goes back to WPE.
         vkImage?.let { presenter.retireChromeImage(it) }
         vkImage = imported
-        displayedImage?.let { chrome.releaseImageAsync(it) }
+        displayedImage?.let { chrome.releaseBufferAsync(it) }
         displayedImage = image
         haveContent = true
         return true
@@ -385,7 +385,7 @@ class ChromeLayer(private val chrome: WpeChrome) {
     }
 
     private fun updateFromEglImage(): Boolean {
-        val image = chrome.takeEglImage() ?: return false
+        val image = chrome.takeBuffer() ?: return false
         ensureProgram()
         val tex = ensureTexture()
         GL11.glBindTexture(GL11.GL_TEXTURE_2D, tex)
@@ -397,17 +397,17 @@ class ChromeLayer(private val chrome: WpeChrome) {
 
         if (err != GL11.GL_NO_ERROR) {
             // The import is the one thing that could not be fully guaranteed
-            // ahead of time: the image belongs to fdo's isolated EGLDisplay,
+            // ahead of time: the image belongs to WPE's headless EGLDisplay,
             // not this context's. Say so plainly instead of drawing nothing
             // and leaving the cause to guesswork.
             if (importErrors++ == 0L) {
                 System.err.println(
                     "[chrome] glEGLImageTargetTexture2DOES failed (glError=0x${err.toString(16)}): " +
-                        "this driver will not import fdo's EGLImage into the UI context. " +
+                        "this driver will not import WPE's EGLImage into the UI context. " +
                         "Re-run with -Pnuvio.wayland.chromeGpu=false for the SHM path.",
                 )
             }
-            chrome.releaseImageAsync(image)
+            chrome.releaseBufferAsync(image)
             // Still ack: an export that goes unanswered stops the page
             // rendering for good, which would turn a recoverable import
             // failure into a permanently dead chrome.
@@ -415,8 +415,8 @@ class ChromeLayer(private val chrome: WpeChrome) {
             return false
         }
 
-        texW = chrome.imageWidth(image)
-        texH = chrome.imageHeight(image)
+        texW = chrome.bufferWidth(image)
+        texH = chrome.bufferHeight(image)
         backing = Backing.EGL_IMAGE
         if (!loggedImportOk) {
             loggedImportOk = true
@@ -424,7 +424,7 @@ class ChromeLayer(private val chrome: WpeChrome) {
         }
         // Only now is the predecessor safe to hand back: its successor is
         // bound, so nothing samples it any more.
-        displayedImage?.let { chrome.releaseImageAsync(it) }
+        displayedImage?.let { chrome.releaseBufferAsync(it) }
         displayedImage = image
         haveContent = true
         return true
@@ -586,7 +586,7 @@ class ChromeLayer(private val chrome: WpeChrome) {
         // Only worth a repaint if something was actually on screen.
         setComposited(false)
         haveContent = false
-        displayedImage?.let { chrome.releaseImageAsync(it) }
+        displayedImage?.let { chrome.releaseBufferAsync(it) }
         displayedImage = null
     }
 
@@ -627,7 +627,7 @@ class ChromeLayer(private val chrome: WpeChrome) {
     }
 
     fun close() {
-        displayedImage?.let { chrome.releaseImageAsync(it) }
+        displayedImage?.let { chrome.releaseBufferAsync(it) }
         displayedImage = null
         if (texture != 0) { GL11.glDeleteTextures(texture); texture = 0 }
         backing = Backing.NONE
