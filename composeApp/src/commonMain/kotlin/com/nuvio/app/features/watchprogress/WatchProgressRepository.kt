@@ -970,12 +970,22 @@ object WatchProgressRepository {
         metadataResolutionJob = null
     }
 
-    private fun resolveRemoteMetadata() {
+    /**
+     * Re-resolve metadata for continue-watching entries that already have it.
+     * Their stored artwork was captured with whatever enrichment applied at
+     * the time, and only entries missing metadata are resolved otherwise.
+     */
+    fun refreshContinueWatchingMetadata() {
+        if (!hasLoaded) return
+        resolveRemoteMetadata(refreshAll = true)
+    }
+
+    private fun resolveRemoteMetadata(refreshAll: Boolean = false) {
         val targetProfileId = currentProfileId
         val targetGeneration = profileGeneration
         val targetSource = activeSource
         val missingMetadataEntries = currentEntries()
-            .filter(WatchProgressEntry::needsRemoteMetadataEnrichment)
+            .filter { refreshAll || it.needsRemoteMetadataEnrichment() }
         val entriesToResolve = missingMetadataEntries.continueWatchingEntries(
             limit = WATCH_PROGRESS_METADATA_RESOLUTION_LIMIT,
         )

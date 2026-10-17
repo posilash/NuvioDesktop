@@ -3,6 +3,7 @@ package com.nuvio.app.features.tmdb
 import com.nuvio.app.features.details.MetaDetailsRepository
 import com.nuvio.app.features.profiles.ProfileRepository
 import com.nuvio.app.features.watchprogress.ContinueWatchingEnrichmentCache
+import com.nuvio.app.features.watchprogress.WatchProgressRepository
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -50,6 +51,7 @@ object TmdbSettingsRepository {
         enabled = value
         publish()
         TmdbSettingsStorage.saveEnabled(value)
+        invalidateMetadata()
     }
 
     fun setApiKey(value: String) {
@@ -69,6 +71,7 @@ object TmdbSettingsRepository {
         language = normalized
         publish()
         TmdbSettingsStorage.saveLanguage(normalized)
+        invalidateMetadata()
     }
 
     fun setUseTrailers(value: Boolean) = setBoolean(
@@ -159,11 +162,12 @@ object TmdbSettingsRepository {
         update(next)
         publish()
         persist(next)
+        invalidateMetadata()
     }
 
     private fun loadFromDisk() {
         val wasLoaded = hasLoaded
-        val previousApiKey = apiKey
+        val previous = _uiState.value
         hasLoaded = true
         enabled = TmdbSettingsStorage.loadEnabled() ?: false
         apiKey = TmdbSettingsStorage.loadApiKey()?.trim().orEmpty()
@@ -181,7 +185,9 @@ object TmdbSettingsRepository {
         useMoreLikeThis = TmdbSettingsStorage.loadUseMoreLikeThis() ?: true
         useCollections = TmdbSettingsStorage.loadUseCollections() ?: true
         publish()
-        if (wasLoaded && previousApiKey != apiKey) {
+        // A sync pull lands here too: any change in what enrichment does
+        // makes the cached and stored metadata stale, not only a new key.
+        if (wasLoaded && previous != _uiState.value) {
             invalidateMetadata()
         }
     }
@@ -208,6 +214,7 @@ object TmdbSettingsRepository {
     private fun invalidateMetadata() {
         MetaDetailsRepository.clear()
         ContinueWatchingEnrichmentCache.clearAll(ProfileRepository.activeProfileId)
+        WatchProgressRepository.refreshContinueWatchingMetadata()
     }
 }
 
