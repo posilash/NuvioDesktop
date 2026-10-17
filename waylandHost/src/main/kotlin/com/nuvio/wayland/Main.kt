@@ -248,7 +248,15 @@ fun main(args: Array<String>) {
     val shutdownComplete = java.util.concurrent.CountDownLatch(1)
     println("pace: vsyncMode=$vsyncMode vblank=${"%.2f".format(vblankNs / 1e6)}ms")
 
+    // The EDT owns glOwner's context for the life of the app, and AWT ends an
+    // EDT that sits idle for a second with no window open -- this host has
+    // none. Startup can pause that long before the loop starts feeding it,
+    // and the replacement thread cannot take a context still bound to the
+    // dead one: the next GL call aborted the JVM ("No context is current").
+    var glThread: Thread? = null
     java.awt.EventQueue.invokeAndWait {
+        glThread = Thread.currentThread()
+        javax.swing.Timer(250) { }.apply { isRepeats = true; start() }
         glfwMakeContextCurrent(glOwner)
         glfwSwapInterval(if (vsyncMode == 1) 1 else 0)
         GL.createCapabilities()
@@ -558,10 +566,9 @@ fun main(args: Array<String>) {
         }
     }
     java.awt.EventQueue.invokeAndWait {
-        // Current again rather than assumed from the block above: once, at
-        // launch, the EDT reached recreateSurface's bind with no context and
-        // the JVM aborted.
-        glfwMakeContextCurrent(glOwner)
+        check(Thread.currentThread() === glThread) {
+            "the EDT was replaced after it took the GL context; GL calls here would abort"
+        }
         recreateSurface()
     }
 
