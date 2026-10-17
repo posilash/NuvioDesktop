@@ -598,6 +598,18 @@ class WpeChrome(
         )
     }
 
+    /**
+     * An extra reference on [buffer], held by an import cache keyed on its
+     * address: as long as it is held the address cannot be reused by another
+     * buffer. Drop it with [dropBufferAsync].
+     */
+    fun retainBuffer(buffer: MemorySegment) { ref(buffer) }
+
+    /** Drop a [retainBuffer] reference. Finalization runs on the GLib thread. */
+    fun dropBufferAsync(buffer: MemorySegment) {
+        Glib.post { unref(buffer) }
+    }
+
     /** Hand a taken buffer back to WebKit. Safe from any thread. */
     fun releaseBufferAsync(buffer: MemorySegment) {
         Glib.post { release(buffer) }

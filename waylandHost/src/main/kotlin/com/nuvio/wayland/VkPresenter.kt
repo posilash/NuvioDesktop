@@ -1310,16 +1310,29 @@ class VkPresenter(private val window: Long) {
     // loss a few frames later, and it presents as the app vanishing mid-play.
     private val videoImages = HashMap<Int, org.jetbrains.skia.Image>()
     /**
-     * The web chrome's frame, imported from a dmabuf and wrapped for Skia.
-     * Owns its Vulkan objects; [destroyChromeImage] frees them.
+     * One of WebKit's buffers, imported once and reused for every frame it
+     * carries. Importing per frame meant a fresh vkAllocateMemory mapping and
+     * a free each frame -- up to ~90/s with the chrome animating -- and the
+     * driver began failing to map ("can't update VA space for mapping"), which
+     * took the app down. Owns its Vulkan objects; [retireChromeBuffer] frees
+     * them.
      */
-    class ChromeImage(
+    class ChromeBuffer(
         val vkImage: Long,
         val memory: Long,
-        val skia: org.jetbrains.skia.Image,
+        val format: Int,
         val width: Int,
         val height: Int,
     )
+
+    /** A frame of [buffer] wrapped for Skia; [retireChromeImage] closes the wrap only. */
+    class ChromeImage(
+        val buffer: ChromeBuffer,
+        val skia: org.jetbrains.skia.Image,
+    ) {
+        val width: Int get() = buffer.width
+        val height: Int get() = buffer.height
+    }
 
     /**
      * Import a WPE dmabuf as a sampleable VkImage and wrap it for Skia.
@@ -1333,9 +1346,8 @@ class VkPresenter(private val window: Long) {
      * The fd is consumed on success -- importing transfers ownership -- and
      * closed by the caller on failure.
      */
-    fun importChromeDmabuf(d: WpeChrome.Dmabuf): ChromeImage? {
+    fun importChromeBuffer(d: WpeChrome.Dmabuf): ChromeBuffer? {
         if (!dmabufImportSupported) return null
-        val rec = recorder ?: return null
         val format = drmFourccToVk(d.fourcc)
         if (format == 0) {
             if (!chromeImportFailed) {
@@ -1435,36 +1447,6 @@ class VkPresenter(private val window: Long) {
                 return null
             }
 
-            val info = org.jetbrains.skia.gpu.graphite.VulkanTextureInfo(
-                format = org.jetbrains.skia.gpu.graphite.VulkanFormat(format),
-                imageUsageFlags = org.jetbrains.skia.gpu.graphite.VulkanImageUsageFlags(
-                    VK_IMAGE_USAGE_SAMPLED_BIT,
-                ),
-            )
-            val tex = org.jetbrains.skia.gpu.graphite.BackendTexture.makeVulkan(
-                width = d.width,
-                height = d.height,
-                textureInfo = info,
-                // UNDEFINED, and left to Skia to transition when it samples.
-                // Doing it here means a submit and a queue wait per chrome
-                // frame, which stalls a queue the video is running at 165fps.
-                imageLayout = VK_IMAGE_LAYOUT_UNDEFINED,
-                queueFamilyIndex = queueFamily,
-                imagePtr = vkImage,
-            )
-            val skia = org.jetbrains.skia.Image.wrapBackendTexture(
-                recorder = rec,
-                backendTexture = tex,
-                // WebKit's output is premultiplied, same as Compose's.
-                alphaType = org.jetbrains.skia.ColorAlphaType.PREMUL,
-                colorSpace = null,
-                originTopLeft = true,
-            )
-            if (skia == null) {
-                vkFreeMemory(device, memory, null)
-                vkDestroyImage(device, vkImage, null)
-                return null
-            }
             if (lastChromeSize != (d.width shl 16 or d.height)) {
                 lastChromeSize = d.width shl 16 or d.height
                 println(
@@ -1473,12 +1455,52 @@ class VkPresenter(private val window: Long) {
                         " fourcc=0x${d.fourcc.toString(16)}",
                 )
             }
-            return ChromeImage(vkImage, memory, skia, d.width, d.height)
+            return ChromeBuffer(vkImage, memory, format, d.width, d.height)
         }
+    }
+
+    /**
+     * Wrap [b]'s current contents for Skia. Per frame, and cheap: no memory
+     * is allocated or mapped here.
+     */
+    fun wrapChromeBuffer(b: ChromeBuffer): ChromeImage? {
+        val rec = recorder ?: return null
+        val info = org.jetbrains.skia.gpu.graphite.VulkanTextureInfo(
+            format = org.jetbrains.skia.gpu.graphite.VulkanFormat(b.format),
+            imageUsageFlags = org.jetbrains.skia.gpu.graphite.VulkanImageUsageFlags(
+                VK_IMAGE_USAGE_SAMPLED_BIT,
+            ),
+        )
+        val tex = org.jetbrains.skia.gpu.graphite.BackendTexture.makeVulkan(
+            width = b.width,
+            height = b.height,
+            textureInfo = info,
+            // UNDEFINED, and left to Skia to transition when it samples.
+            // Doing it here means a submit and a queue wait per chrome
+            // frame, which stalls a queue the video is running at 165fps.
+            imageLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+            queueFamilyIndex = queueFamily,
+            imagePtr = b.vkImage,
+        )
+        val skia = org.jetbrains.skia.Image.wrapBackendTexture(
+            recorder = rec,
+            backendTexture = tex,
+            // WebKit's output is premultiplied, same as Compose's.
+            alphaType = org.jetbrains.skia.ColorAlphaType.PREMUL,
+            colorSpace = null,
+            originTopLeft = true,
+        ) ?: return null
+        return ChromeImage(b, skia)
     }
 
     private var frameCounter = 0L
     private val retiredChrome = ArrayDeque<Pair<Long, ChromeImage>>()
+    private val retiredChromeBuffers = ArrayDeque<Pair<Long, ChromeBuffer>>()
+
+    /** Free [b] once no frame still in flight can be sampling it. */
+    fun retireChromeBuffer(b: ChromeBuffer) {
+        retiredChromeBuffers.addLast(frameCounter to b)
+    }
 
     /**
      * Hand back a chrome frame the successor replaced.
@@ -1495,6 +1517,11 @@ class VkPresenter(private val window: Long) {
         while (retiredChrome.isNotEmpty() && frameCounter - retiredChrome.first().first > 3) {
             destroyChromeImage(retiredChrome.removeFirst().second)
         }
+        while (retiredChromeBuffers.isNotEmpty() && frameCounter - retiredChromeBuffers.first().first > 3) {
+            val b = retiredChromeBuffers.removeFirst().second
+            vkFreeMemory(device, b.memory, null)
+            vkDestroyImage(device, b.vkImage, null)
+        }
     }
 
     fun destroyChromeImage(c: ChromeImage) {
@@ -1504,8 +1531,6 @@ class VkPresenter(private val window: Long) {
         // A vkDeviceWaitIdle instead would stall the queue at chrome frame
         // rate -- on the queue the video is running at 165fps.
         c.skia.close()
-        vkFreeMemory(device, c.memory, null)
-        vkDestroyImage(device, c.vkImage, null)
     }
 
     /** Host thread only. See destroyUiBuffer for why that matters. */
@@ -2085,6 +2110,7 @@ class VkPresenter(private val window: Long) {
             // So: Skia surfaces, then the context that owns everything else,
             // and only then the Vulkan memory underneath.
             retiredChrome.clear()
+            retiredChromeBuffers.clear()
             videoImages.clear()
             wrappedSemaphores.clear()
             closeQuietly(gSurface)

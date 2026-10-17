@@ -313,6 +313,49 @@ class ChromeLayer(private val chrome: WpeChrome) {
     val hasVkContent: Boolean get() = vkImage != null
 
     /**
+     * WebKit's buffers, imported once each, keyed by WPEBuffer address. WebKit
+     * renders into a small fixed set and only replaces it on a resize, so this
+     * stays at two or three entries. Each holds a reference on its buffer, so
+     * the address cannot come back as a different one while it is cached.
+     */
+    private var importsTotal = 0L
+    private val importCache = LinkedHashMap<Long, Pair<MemorySegment, VkPresenter.ChromeBuffer>>()
+
+    private fun importedBuffer(presenter: VkPresenter, image: MemorySegment): VkPresenter.ChromeBuffer? {
+        val w = chrome.bufferWidth(image)
+        val h = chrome.bufferHeight(image)
+        importCache[image.address()]?.second?.let { if (it.width == w && it.height == h) return it }
+        // A new size means WebKit replaced its buffers; the old ones are done.
+        if (importCache.values.any { it.second.width != w || it.second.height != h }) evictImports(presenter)
+        val dmabuf = chrome.exportDmabuf(image) ?: return null
+        val buffer = presenter.importChromeBuffer(dmabuf)
+        if (buffer == null) {
+            VideoPipelineVk.Posix.close(dmabuf.fd)
+            return null
+        }
+        // The fd belongs to the driver now: importing transferred ownership.
+        chrome.retainBuffer(image)
+        importsTotal++
+        importCache[image.address()] = image to buffer
+        while (importCache.size > MAX_IMPORTS) {
+            val oldest = importCache.keys.first()
+            importCache.remove(oldest)?.let { (buf, b) ->
+                presenter.retireChromeBuffer(b)
+                chrome.dropBufferAsync(buf)
+            }
+        }
+        return buffer
+    }
+
+    private fun evictImports(presenter: VkPresenter) {
+        for ((buf, b) in importCache.values) {
+            presenter.retireChromeBuffer(b)
+            chrome.dropBufferAsync(buf)
+        }
+        importCache.clear()
+    }
+
+    /**
      * Same handoff as [updateFromEglImage], on Vulkan: WebKit's dmabuf is
      * imported as a VkImage, because Skia is on Vulkan here and there is no
      * GL context to target.
@@ -327,17 +370,9 @@ class ChromeLayer(private val chrome: WpeChrome) {
     private fun updateFromDmabuf(): Boolean {
         val presenter = vk ?: return false
         val image = chrome.takeBuffer() ?: return false
-        val dmabuf = chrome.exportDmabuf(image)
-        if (dmabuf == null) {
-            chrome.releaseBufferAsync(image)
-            // Still ack, for the reason updateFromEglImage gives: an export
-            // that goes unanswered stops the page rendering for good.
-            chrome.ackFrameAfter(ackDelayMs)
-            return false
-        }
-        val imported = presenter.importChromeDmabuf(dmabuf)
+        val buffer = importedBuffer(presenter, image)
+        val imported = buffer?.let { presenter.wrapChromeBuffer(it) }
         if (imported == null) {
-            VideoPipelineVk.Posix.close(dmabuf.fd)
             chrome.releaseBufferAsync(image)
             if (importErrors++ == 0L) {
                 System.err.println(
@@ -345,12 +380,13 @@ class ChromeLayer(private val chrome: WpeChrome) {
                         "-Pnuvio.wayland.vkGraphite, or with -Pnuvio.wayland.chromeGpu=false",
                 )
             }
+            // Still ack, for the reason updateFromEglImage gives: an export
+            // that goes unanswered stops the page rendering for good.
             chrome.ackFrameAfter(ackDelayMs)
             return false
         }
-        // The fd belongs to the driver now: importing transferred ownership.
-        texW = dmabuf.width
-        texH = dmabuf.height
+        texW = buffer.width
+        texH = buffer.height
         backing = Backing.EGL_IMAGE
 
         // Successor is bound, so the predecessor is safe to let go -- and its
@@ -588,6 +624,12 @@ class ChromeLayer(private val chrome: WpeChrome) {
         haveContent = false
         displayedImage?.let { chrome.releaseBufferAsync(it) }
         displayedImage = null
+        // The session is over; its buffers will not be seen again.
+        vk?.let { presenter ->
+            vkImage?.let { presenter.retireChromeImage(it) }
+            vkImage = null
+            evictImports(presenter)
+        }
     }
 
     /**
@@ -601,6 +643,9 @@ class ChromeLayer(private val chrome: WpeChrome) {
     private companion object {
         /** Hidden-page ack pacing, matching WpeChrome's own hidden trickle. */
         const val HIDDEN_ACK_MS = 200
+
+        /** WebKit cycles two or three buffers; more than this is stale. */
+        const val MAX_IMPORTS = 4
     }
 
     /** Per-second telemetry. This is where chrome cost is paid and reported. */
@@ -615,7 +660,7 @@ class ChromeLayer(private val chrome: WpeChrome) {
         val drawMs = if (u > 0) dn / 1e6 / u else 0.0
         return (
             "chrome: path=%s frames/s=%.1f adopt=%.2fms adoptMax=%.2fms blit=%.2fms " +
-                "size=%dx%d (%.2fMpx) perMpx=%.2fms copied=%.1fMB/s errs=%d"
+                "size=%dx%d (%.2fMpx) perMpx=%.2fms copied=%.1fMB/s errs=%d imports=%d"
             ).format(
             if (chrome.gpuActive) "gpu" else "shm",
             u / elapsedSeconds, avgMs, mx / 1e6, drawMs,
@@ -623,6 +668,7 @@ class ChromeLayer(private val chrome: WpeChrome) {
             if (mpx > 0) avgMs / mpx else 0.0,
             bytes / 1e6 / elapsedSeconds,
             importErrors,
+            importsTotal,
         )
     }
 
