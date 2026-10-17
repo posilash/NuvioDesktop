@@ -557,7 +557,13 @@ fun main(args: Array<String>) {
             ) ?: error("Surface.makeRenderTarget (UI layer) returned null")
         }
     }
-    java.awt.EventQueue.invokeAndWait { recreateSurface() }
+    java.awt.EventQueue.invokeAndWait {
+        // Current again rather than assumed from the block above: once, at
+        // launch, the EDT reached recreateSurface's bind with no context and
+        // the JVM aborted.
+        glfwMakeContextCurrent(glOwner)
+        recreateSurface()
+    }
 
     var frames by mutableStateOf(0)
     val probePixels = System.getProperty("nuvio.wayland.probe")?.toBoolean() ?: false
