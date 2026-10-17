@@ -87,6 +87,9 @@ class WpeChrome(
     /** Woken on every export so the consumer's thread can pick the frame up. */
     @Volatile var onFrame: (() -> Unit)? = null
 
+    /** The page's CSS cursor ("none", "pointer", ...), on the GLib thread. */
+    @Volatile var onCursor: ((String) -> Unit)? = null
+
     private var pageUri: String = ""
 
     /**
@@ -315,7 +318,7 @@ class WpeChrome(
         val type = fn(webkit, "wpe_view_headless_get_type", FunctionDescriptor.of(JAVA_LONG))
             .invokeExact() as Long
         val klass = (fn(gobject, "g_type_class_ref", FunctionDescriptor.of(ADDRESS, JAVA_LONG))
-            .invokeExact(type) as MemorySegment).reinterpret(RENDER_BUFFER_OFFSET + ADDRESS.byteSize())
+            .invokeExact(type) as MemorySegment).reinterpret(SET_CURSOR_FROM_NAME_OFFSET + ADDRESS.byteSize())
         check(!klass.get(ADDRESS, RENDER_BUFFER_OFFSET).equals(MemorySegment.NULL)) {
             "WPEViewClass.render_buffer is not where it was; the struct layout changed"
         }
@@ -331,6 +334,52 @@ class WpeChrome(
         )
         WpeCallbacks.owner = this
         klass.set(ADDRESS, RENDER_BUFFER_OFFSET, stub)
+
+        // Headless draws no cursor, so the page's went nowhere: no hand over
+        // buttons. WebKit reports it only on pointer moves, which is why the
+        // idle hide is the host's job (see Main) rather than the page's
+        // `cursor: none`.
+        val cursorStub = linker.upcallStub(
+            MethodHandles.lookup().findStatic(
+                WpeCallbacks::class.java, "setCursorFromName",
+                MethodType.methodType(Void.TYPE, MemorySegment::class.java, MemorySegment::class.java),
+            ),
+            FunctionDescriptor.ofVoid(ADDRESS, ADDRESS), arena,
+        )
+        klass.set(ADDRESS, SET_CURSOR_FROM_NAME_OFFSET, cursorStub)
+    }
+
+    /**
+     * Set by the host while it has the cursor hidden. Hiding it makes the
+     * compositor send a pointer position nobody moved to, and the page treats
+     * any pointermove as activity -- so the controls, and the cursor, came
+     * straight back. Until the pointer travels from where it was first seen
+     * after the hide, moves stay here.
+     */
+    @Volatile var cursorHidden = false
+        set(value) {
+            if (value && !field) hiddenAnchorX = Int.MIN_VALUE
+            field = value
+        }
+    private var hiddenAnchorX = Int.MIN_VALUE
+    private var hiddenAnchorY = 0
+
+    internal fun handleCursor(name: MemorySegment) {
+        if (name.equals(MemorySegment.NULL)) return
+        onCursor?.invoke(name.reinterpret(Long.MAX_VALUE).getString(0))
+    }
+
+    /** False for a move that only re-reports where a hidden cursor already is. */
+    private fun movedEnough(x: Int, y: Int): Boolean {
+        if (!cursorHidden) return true
+        if (hiddenAnchorX == Int.MIN_VALUE) {
+            hiddenAnchorX = x
+            hiddenAnchorY = y
+            return false
+        }
+        if (kotlin.math.abs(x - hiddenAnchorX) + kotlin.math.abs(y - hiddenAnchorY) < HIDDEN_CURSOR_SLOP) return false
+        cursorHidden = false
+        return true
     }
 
     private fun errorMessage(error: MemorySegment): String {
@@ -614,6 +663,7 @@ class WpeChrome(
     private fun viewReady() = !view.equals(MemorySegment.NULL)
 
     fun dispatchPointer(motion: Boolean, x: Int, y: Int, button: Int, pressed: Boolean, modifiers: Int) {
+        if (motion && !movedEnough(x, y)) return
         Glib.post {
             if (!viewReady()) return@post
             val time = now()
@@ -718,6 +768,12 @@ class WpeChrome(
         /** offsetof(WPEViewClass, render_buffer): GObjectClass, then buffers_changed. */
         private const val RENDER_BUFFER_OFFSET = 144L
 
+        /** offsetof(WPEViewClass, set_cursor_from_name): after lock/unlock_pointer. */
+        private const val SET_CURSOR_FROM_NAME_OFFSET = 168L
+
+        /** Logical px a hidden cursor has to travel before the page hears of it. */
+        private const val HIDDEN_CURSOR_SLOP = 8
+
         private const val EVENT_POINTER_DOWN = 1
         private const val EVENT_POINTER_UP = 2
         private const val EVENT_POINTER_MOVE = 3
@@ -752,6 +808,11 @@ internal object WpeCallbacks {
     @JvmStatic
     fun playerMessage(ucm: MemorySegment, jscValue: MemorySegment, data: MemorySegment) {
         owner?.handleMessage(jscValue)
+    }
+
+    @JvmStatic
+    fun setCursorFromName(view: MemorySegment, name: MemorySegment) {
+        runCatching { owner?.handleCursor(name) }.onFailure { it.printStackTrace() }
     }
 
     // Always TRUE: on FALSE WebKit logs error->message without checking it,

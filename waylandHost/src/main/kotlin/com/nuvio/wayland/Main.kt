@@ -771,6 +771,43 @@ fun main(args: Array<String>) {
             isFullscreen = { fullscreenApplied.get() },
         )
     }
+    // Cursor, applied on this thread: GLFW's cursor calls are main-thread only.
+    // The shape is the chrome's CSS cursor, which WebKit reports on the GLib
+    // thread. Visibility is ours: WebKit only reports a cursor on pointer
+    // moves, so the page's idle `cursor: none` never arrives while the mouse
+    // is still -- the one time it matters. The rule is the page's own: hidden
+    // while the controls are, during playback.
+    val pageCursor = java.util.concurrent.atomic.AtomicReference("default")
+    val cursorIdleHidden = java.util.concurrent.atomic.AtomicBoolean(false)
+    val cursorDirty = java.util.concurrent.atomic.AtomicBoolean(false)
+    val standardCursors = HashMap<Int, Long>()
+    fun applyCursor() {
+        if (!cursorDirty.getAndSet(false)) return
+        val name = when {
+            // Outside playback the page is not on screen; whatever it last
+            // asked for must not leave the app's own screens without a pointer.
+            videoHost?.hasFile != true -> "default"
+            cursorIdleHidden.get() -> "none"
+            else -> pageCursor.get()
+        }
+        if (name == "none") {
+            glfwSetInputMode(window, GLFW_CURSOR, GLFW_CURSOR_HIDDEN)
+            return
+        }
+        glfwSetInputMode(window, GLFW_CURSOR, GLFW_CURSOR_NORMAL)
+        val shape = when (name) {
+            "pointer", "grab", "grabbing" -> GLFW_POINTING_HAND_CURSOR
+            "text", "vertical-text" -> GLFW_IBEAM_CURSOR
+            "crosshair" -> GLFW_CROSSHAIR_CURSOR
+            "not-allowed", "no-drop" -> GLFW_NOT_ALLOWED_CURSOR
+            "ew-resize", "col-resize", "e-resize", "w-resize" -> GLFW_RESIZE_EW_CURSOR
+            "ns-resize", "row-resize", "n-resize", "s-resize" -> GLFW_RESIZE_NS_CURSOR
+            "move", "all-scroll" -> GLFW_RESIZE_ALL_CURSOR
+            else -> 0
+        }
+        val cursor = if (shape == 0) 0L else standardCursors.getOrPut(shape) { glfwCreateStandardCursor(shape) }
+        glfwSetCursor(window, cursor)
+    }
     fun applyFullscreenRequests() {
         while (true) {
             val latch = fullscreenRequests.poll() ?: return
@@ -935,6 +972,12 @@ fun main(args: Array<String>) {
             if (vkGraphite) it.vk = presenter
         }
         wpeChrome!!.onFrame = { glfwPostEmptyEvent() }
+        wpeChrome!!.onCursor = { name ->
+            if (pageCursor.getAndSet(name) != name) {
+                cursorDirty.set(true)
+                glfwPostEmptyEvent()
+            }
+        }
         if (runRealAppEarly) {
             com.nuvio.app.features.player.desktop.WaylandVideoBridge.webChromeActive = true
             println("web chrome: ACTIVE (stock controls.html via WPE)")
@@ -1111,6 +1154,9 @@ fun main(args: Array<String>) {
             if (wantChrome != chromeShown) {
                 chromeShown = wantChrome
                 chrome.visible = wantChrome
+                cursorIdleHidden.set(!wantChrome && videoHost?.hasFile == true)
+                chrome.cursorHidden = cursorIdleHidden.get()
+                cursorDirty.set(true)
                 // The session-start window is over either way: shown means the
                 // layer has what it was primed for, hidden means there is
                 // nothing worth keeping.
@@ -1871,6 +1917,7 @@ fun main(args: Array<String>) {
             // indefinite wait.
             if (presented) glfwPollEvents() else glfwWaitEventsTimeout(0.004)
             applyFullscreenRequests()
+            applyCursor()
             val afterPoll = System.nanoTime()
             timings.add("poll", afterPoll - beforePoll)
             java.awt.EventQueue.invokeAndWait {
