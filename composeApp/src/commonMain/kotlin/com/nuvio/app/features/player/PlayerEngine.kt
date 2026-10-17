@@ -188,6 +188,7 @@ data class PlayerControlsState(
     val themeTextSecondaryColor: String = "rgba(255, 255, 255, .72)",
     val themeTextMutedColor: String = "rgba(255, 255, 255, .60)",
     val themeBorderDefaultColor: String = "rgba(255, 255, 255, .12)",
+    val themeDangerColor: String = "#e5484d",
     val isPlaying: Boolean = false,
     val isLoading: Boolean = false,
     val isLocked: Boolean = false,
@@ -261,6 +262,7 @@ data class PlayerControlsState(
     val submitIntroSuccessToken: Long = 0L,
     val notificationMessage: String = "",
     val notificationToken: Long = 0L,
+    val party: PlayerControlPartyState = PlayerControlPartyState(),
 )
 
 data class PlayerControlFilterItem(

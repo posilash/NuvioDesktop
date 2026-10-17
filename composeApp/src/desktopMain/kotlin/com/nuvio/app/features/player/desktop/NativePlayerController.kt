@@ -5,6 +5,7 @@ import co.touchlab.kermit.Logger
 import com.nuvio.app.features.player.PlayerControlAddonSubtitleItem
 import com.nuvio.app.features.player.PlayerControlEpisodeItem
 import com.nuvio.app.features.player.PlayerControlFilterItem
+import com.nuvio.app.features.player.PlayerControlPartyState
 import com.nuvio.app.features.player.PlayerControlSeasonItem
 import com.nuvio.app.features.player.PlayerControlSourceItem
 import com.nuvio.app.features.player.PlayerControlSubtitleCueItem
@@ -97,6 +98,8 @@ internal class NativePlayerController(
     private var pendingSource: PendingSource? = null
     @Volatile
     private var releaseRequested: Boolean = false
+    val isReleasing: Boolean
+        get() = releaseRequested
     private val createsInFlight = mutableSetOf<Thread>()
     private var createWaitInFlight: Thread? = null
     private val releaseCallbacks = mutableListOf<ReleaseCallback>()
@@ -451,7 +454,15 @@ internal class NativePlayerController(
                 "speed=${stateWithVolume.playbackSpeedLabel} audioLabel=${stateWithVolume.audioLabel} " +
                 "subsLabel=${stateWithVolume.subtitlesLabel} fullscreen=$isFullscreen"
         }
-        NativePlayerBridge.updateControls(current, stateWithVolume.toControlsJson(isFullscreen))
+        NativePlayerBridge.updateControls(current, stateWithVolume.toControlsJson(isFullscreen, ::refreshControlsForImage))
+    }
+
+    private fun refreshControlsForImage() {
+        SwingUtilities.invokeLater {
+            if (releaseRequested) return@invokeLater
+            lastSentControlsStructureKey = null
+            updateControls(controlsState)
+        }
     }
 
     fun onDesktopFullscreenChanged() {
@@ -552,8 +563,8 @@ internal class NativePlayerController(
             "volumeChange" -> setFallbackVolume(value.toFloat())
             "volumeChangeTemporary" -> setTemporaryVolume(value.toFloat())
             "setPlaybackSpeed" -> {
-                val speed = value.toFloat()
-                setPlaybackSpeed(speed)
+                if (onEvent(type, value)) return
+                setPlaybackSpeed(value.toFloat())
             }
             else -> {
                 val eventHandled = onEvent(type, value)
@@ -1238,7 +1249,7 @@ private data class NativeControlsStructureKey(
     val isInPip: Boolean,
 )
 
-internal fun PlayerControlsState.toControlsJson(isFullscreen: Boolean): String =
+internal fun PlayerControlsState.toControlsJson(isFullscreen: Boolean, onImageReady: () -> Unit): String =
     buildString {
         append('{')
         appendJsonField("title", title)
@@ -1451,6 +1462,8 @@ internal fun PlayerControlsState.toControlsJson(isFullscreen: Boolean): String =
         append(',')
         appendJsonField("themeBorderDefaultColor", themeBorderDefaultColor)
         append(',')
+        appendJsonField("themeDangerColor", themeDangerColor)
+        append(',')
         appendJsonField("isPlaying", isPlaying)
         append(',')
         appendJsonField("isLoading", isLoading)
@@ -1613,8 +1626,15 @@ internal fun PlayerControlsState.toControlsJson(isFullscreen: Boolean): String =
         appendJsonField("notificationMessage", notificationMessage)
         append(',')
         appendJsonField("notificationToken", notificationToken)
+        append(",\"party\":")
+        append(partyJson.encodeToString(PlayerControlPartyState.serializer(), party.withWebviewImages(onImageReady)))
         append('}')
     }
+
+private val partyJson = Json { encodeDefaults = true }
+
+private fun PlayerControlPartyState.withWebviewImages(onImageReady: () -> Unit): PlayerControlPartyState =
+    copy(profile = profile.copy(imageUrl = if (active) "" else WebviewImages.resolve(profile.imageUrl, onImageReady)))
 
 internal fun PlayerControlsState.nativeControlsStructureKey(): PlayerControlsState =
     copy(

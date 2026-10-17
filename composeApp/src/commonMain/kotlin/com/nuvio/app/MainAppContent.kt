@@ -130,11 +130,11 @@ import com.nuvio.app.features.library.toMetaPreview
 import com.nuvio.app.features.membership.MemberAccessRepository
 import com.nuvio.app.features.notifications.EpisodeReleaseNotificationsRepository
 import com.nuvio.app.features.p2p.P2pSettingsRepository
-import com.nuvio.app.features.party.PartyEvent
 import com.nuvio.app.features.party.PartyMedia
 import com.nuvio.app.features.party.PartyRepository
 import com.nuvio.app.features.party.PartyScreen
 import com.nuvio.app.features.party.PartySync
+import com.nuvio.app.features.party.message
 import com.nuvio.app.features.player.ExternalPlayerIntentResult
 import com.nuvio.app.features.player.externalPlaybackSession
 import com.nuvio.app.features.player.infusePlaybackCallbacks
@@ -1140,17 +1140,7 @@ internal fun MainAppContent(
         LaunchedEffect(Unit) {
             if (!ownsAppRuntime) return@LaunchedEffect
             PartyRepository.events.collect { event ->
-                val message = when (event) {
-                    is PartyEvent.MemberJoined -> getString(Res.string.party_member_joined, event.name)
-                    is PartyEvent.MemberLeft -> getString(Res.string.party_member_left, event.name)
-                    PartyEvent.Removed -> getString(Res.string.party_removed)
-                    PartyEvent.Ended -> getString(Res.string.party_ended)
-                    is PartyEvent.MediaChanged -> getString(Res.string.party_media_changed, event.media.title)
-                    is PartyEvent.ControlChanged -> getString(
-                        if (event.hostOnly) Res.string.party_control_host_only else Res.string.party_control_everyone,
-                    )
-                }
-                NuvioToastController.show(message)
+                NuvioToastController.show(event.message())
             }
         }
 

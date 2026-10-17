@@ -251,6 +251,10 @@ internal class PlayerScreenRuntime(
     var showVideoSettingsModal by mutableStateOf(false)
     var showStreamInfo by mutableStateOf(false)
     var showPartyPanel by mutableStateOf(false)
+    var partyPanelToken by mutableStateOf(0L)
+    var partyMessage by mutableStateOf("")
+    var partyMessageToken by mutableStateOf(0L)
+    var copyPartyInvite: () -> Unit = {}
     var partyBehind by mutableStateOf(false)
     var partyBehindMs by mutableStateOf<Long?>(null)
     var partyRateNudge: Float? = null

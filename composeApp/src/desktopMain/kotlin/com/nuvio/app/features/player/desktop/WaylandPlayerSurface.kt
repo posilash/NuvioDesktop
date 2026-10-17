@@ -11,6 +11,7 @@ import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
+import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.getValue
 import androidx.compose.ui.Modifier
@@ -54,6 +55,10 @@ internal fun WaylandPlayerSurface(
     onError: (String?) -> Unit,
 ) {
     val bridge = WaylandVideoBridge.delegate
+    // The party panel's local profile picture is encoded off-thread
+    // (WebviewImages); when it lands the controls are pushed again with it.
+    var imagesReady by remember { mutableIntStateOf(0) }
+    val onImageReady: () -> Unit = { imagesReady++ }
 
     if (bridge == null) {
         // Should not happen: PlatformPlayerSurface only routes here when a
@@ -88,7 +93,7 @@ internal fun WaylandPlayerSurface(
         // effect below re-pushes the identical payload a dispatch later,
         // which is a no-op for the page but keeps the dedup honest.
         if (WaylandVideoBridge.webChromeActive) {
-            bridge.pushControlsJson(playerControlsState.withVolume(bridge).toControlsJson(fullscreenNow))
+            bridge.pushControlsJson(playerControlsState.withVolume(bridge).toControlsJson(fullscreenNow, onImageReady))
         }
         // The runtime tracks whether the resume position was actually applied
         // and re-requests it until told. open() passed it to mpv above.
@@ -202,8 +207,8 @@ internal fun WaylandPlayerSurface(
         // the page keeps whatever number it was first told.
         val stateWithVolume = playerControlsState.withVolume(bridge)
         val structureKey = stateWithVolume.nativeControlsStructureKey()
-        LaunchedEffect(structureKey, isFullscreen) {
-            bridge.pushControlsJson(stateWithVolume.toControlsJson(isFullscreen))
+        LaunchedEffect(structureKey, isFullscreen, imagesReady) {
+            bridge.pushControlsJson(stateWithVolume.toControlsJson(isFullscreen, onImageReady))
         }
         DisposableEffect(Unit) {
             WaylandVideoBridge.onChromeEvent = { type, value ->
@@ -217,8 +222,11 @@ internal fun WaylandPlayerSurface(
                         }
                     }
                     "toggleFullscreen" -> com.nuvio.app.core.ui.toggleFullscreenAction()
-                    // Hold-to-speed; stock's controller sets it directly too.
-                    "setPlaybackSpeed" -> bridge.setSpeed(value.toFloat())
+                    // Hold-to-speed, unless the runtime claims it (a watch
+                    // party syncs the speed), as in stock's controller.
+                    "setPlaybackSpeed" -> {
+                        if (!onPlayerControlsEvent(type, value)) bridge.setSpeed(value.toFloat())
+                    }
                     // The chrome sends a level, not a percentage: 1.0 is 100% and
                     // the boosted half of the slider runs to 2.0.
                     "volumeChange" ->
