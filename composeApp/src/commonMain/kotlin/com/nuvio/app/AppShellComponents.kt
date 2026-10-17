@@ -34,6 +34,7 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyListState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.DateRange
 import androidx.compose.material.icons.filled.Home
 import androidx.compose.material.icons.rounded.Settings
 import androidx.compose.material3.Icon
@@ -77,6 +78,7 @@ import com.nuvio.app.features.home.HomeScreen
 import com.nuvio.app.features.home.MetaPreview
 import com.nuvio.app.features.library.LibraryItem
 import com.nuvio.app.features.library.LibraryScreen
+import com.nuvio.app.features.calendar.CalendarEpisode
 import com.nuvio.app.features.calendar.CalendarScreen
 import com.nuvio.app.features.library.LibrarySection
 import com.nuvio.app.features.library.LibrarySortOption
@@ -105,6 +107,7 @@ import dev.chrisbanes.haze.hazeEffect
 import kotlinx.coroutines.flow.Flow
 import nuvio.composeapp.generated.resources.Res
 import nuvio.composeapp.generated.resources.app_brand_name
+import nuvio.composeapp.generated.resources.compose_nav_calendar
 import nuvio.composeapp.generated.resources.compose_nav_home
 import nuvio.composeapp.generated.resources.compose_nav_library
 import nuvio.composeapp.generated.resources.compose_nav_profile
@@ -170,6 +173,7 @@ internal data class AppTabActions(
     val onPosterClick: ((MetaPreview) -> Unit)? = null,
     val onPosterLongClick: ((MetaPreview) -> Unit)? = null,
     val onLibraryPosterClick: ((LibraryItem) -> Unit)? = null,
+    val onCalendarEpisodeClick: ((CalendarEpisode) -> Unit)? = null,
     val onLibraryPosterLongClick: ((LibraryItem, LibrarySection) -> Unit)? = null,
     val onLibrarySectionViewAllClick: ((LibrarySection, LibrarySortOption) -> Unit)? = null,
     val onCloudFilePlay: ((CloudLibraryItem, CloudLibraryFile) -> Unit)? = null,
@@ -290,18 +294,7 @@ internal fun AppTabHost(
                 CalendarScreen(
                     modifier = Modifier.fillMaxSize(),
                     topChromePadding = state.topChromePadding,
-                    onShowClick = { episode ->
-                        actions.onPosterClick?.invoke(
-                            MetaPreview(
-                                id = episode.showId,
-                                type = episode.showType,
-                                name = episode.showName,
-                                poster = episode.poster,
-                                banner = episode.backdrop,
-                                logo = episode.logo,
-                            ),
-                        )
-                    },
+                    onShowClick = { episode -> actions.onCalendarEpisodeClick?.invoke(episode) },
                 )
             }
 
@@ -886,6 +879,19 @@ internal fun DesktopHoverSidebar(
                     Icon(
                         painter = painterResource(Res.drawable.sidebar_library),
                         contentDescription = stringResource(Res.string.compose_nav_library),
+                        modifier = Modifier.size(DesktopSidebarIconSize),
+                        tint = color,
+                    )
+                }
+                DesktopSidebarItem(
+                    label = stringResource(Res.string.compose_nav_calendar),
+                    selected = selectedTab == AppScreenTab.Calendar,
+                    expanded = sidebarExpanded,
+                    onClick = { selectTab(AppScreenTab.Calendar) },
+                ) { color ->
+                    Icon(
+                        imageVector = Icons.Filled.DateRange,
+                        contentDescription = stringResource(Res.string.compose_nav_calendar),
                         modifier = Modifier.size(DesktopSidebarIconSize),
                         tint = color,
                     )

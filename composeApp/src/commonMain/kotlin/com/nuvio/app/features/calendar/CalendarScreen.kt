@@ -5,6 +5,7 @@ import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.ExperimentalLayoutApi
 import androidx.compose.foundation.layout.FlowRow
@@ -17,15 +18,18 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
+import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.KeyboardArrowLeft
 import androidx.compose.material.icons.automirrored.filled.KeyboardArrowRight
+import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
@@ -36,6 +40,7 @@ import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.compositionLocalOf
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
@@ -58,12 +63,20 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.nuvio.app.core.time.EpisodeReleaseDatePlatform
 import com.nuvio.app.core.time.isoEpochDay
 import com.nuvio.app.core.ui.NuvioAsyncImage
+import com.nuvio.app.features.watched.WatchedRepository
 import com.nuvio.app.features.watchprogress.CurrentDateProvider
 import kotlinx.coroutines.delay
 import nuvio.composeapp.generated.resources.*
 import org.jetbrains.compose.resources.stringResource
 
 private enum class CalendarView { Month, Agenda }
+
+private enum class EpisodeStatus { Watched, New }
+
+private val LocalEpisodeStatus = compositionLocalOf<(CalendarEpisode) -> EpisodeStatus?> { { null } }
+
+private val WatchedBg = Color(0xFF97C459)
+private val WatchedFg = Color(0xFF173404)
 
 private val TextStrong = Color(0xFFF4F5F7)
 private val TextSoft = Color(0xFFB7BDC4)
@@ -107,9 +120,18 @@ internal fun CalendarScreen(
         }
     }
 
+    val watchedState by WatchedRepository.uiState.collectAsStateWithLifecycle()
+    val statusOf: (CalendarEpisode) -> EpisodeStatus? = remember(state.episodes, watchedState, nowMs, todayIso) {
+        val cache = HashMap<CalendarEpisode, EpisodeStatus?>()
+        val lambda: (CalendarEpisode) -> EpisodeStatus? = { ep ->
+            if (ep in cache) cache[ep] else episodeStatus(ep, nowMs, todayIso).also { cache[ep] = it }
+        }
+        lambda
+    }
+
     // Nothing above this screen sets a content color, so unstyled text drew
     // in the default black: the title, month and show names all vanished.
-    CompositionLocalProvider(LocalContentColor provides TextStrong) {
+    CompositionLocalProvider(LocalContentColor provides TextStrong, LocalEpisodeStatus provides statusOf) {
         LazyColumn(
             modifier = modifier.fillMaxSize(),
             contentPadding = PaddingValues(
@@ -129,6 +151,12 @@ internal fun CalendarScreen(
                     onNextMonth = { monthOffset++ },
                     onRefresh = { CalendarRepository.refresh() },
                 )
+            }
+
+            if (state.isLoading && state.hasLoaded) {
+                item(key = "refreshing") {
+                    LinearProgressIndicator(modifier = Modifier.fillMaxWidth().height(2.dp))
+                }
             }
 
             if (state.isLoading && !state.hasLoaded) {
@@ -443,40 +471,83 @@ private fun DayCell(
     Column(
         modifier = modifier
             .height(DayCellHeight)
-            .alpha(if (isPast && !isSelected) 0.5f else 1f)
+            .alpha(if (isPast && !isSelected) 0.55f else 1f)
             .clip(shape)
             .background(if (isToday) accent.copy(alpha = 0.16f) else CellFill)
             .border(if (isToday || isSelected) 2.dp else 1.dp, ring, shape)
             .clickable(onClick = onClick)
             .padding(8.dp),
-        verticalArrangement = Arrangement.spacedBy(6.dp),
     ) {
-        Row(verticalAlignment = Alignment.CenterVertically) {
-            Text(
-                day.toString(),
-                color = if (isToday) accent else TextStrong,
-                fontSize = 15.sp,
-                fontWeight = FontWeight.Bold,
-            )
-            Spacer(Modifier.weight(1f))
-            if (shows.size > POSTERS_PER_DAY) {
-                Text("+${shows.size - POSTERS_PER_DAY}", color = TextSoft, fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
+        BoxWithConstraints(Modifier.fillMaxWidth()) {
+            // As many side by side as the cell's width allows; past that, a
+            // fanned stack, so a busy day still shows its shows at a glance.
+            val width = maxWidth
+            val sideBySide = ((width + PosterGap) / (MinPosterWidth + PosterGap)).toInt().coerceIn(1, MAX_SIDE_BY_SIDE)
+            val posterWidth = minOf((width - PosterGap * (sideBySide - 1)) / sideBySide, MaxPosterWidth)
+            val stacked = shows.size > sideBySide
+            val shown = if (stacked) minOf(shows.size, MAX_STACKED) else shows.size
+            Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text(
+                        day.toString(),
+                        color = if (isToday) accent else TextStrong,
+                        fontSize = 15.sp,
+                        fontWeight = FontWeight.Bold,
+                    )
+                    Spacer(Modifier.weight(1f))
+                    if (shows.size > shown) {
+                        Text("+${shows.size - shown}", color = TextSoft, fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
+                    }
+                }
+                if (stacked) {
+                    val step = (width - posterWidth) / (shown - 1)
+                    Box(Modifier.fillMaxWidth().height(posterWidth * 1.5f)) {
+                        shows.take(shown).forEachIndexed { index, episode ->
+                            CellPoster(episode, posterWidth, Modifier.offset(x = step * index))
+                        }
+                    }
+                } else {
+                    Row(horizontalArrangement = Arrangement.spacedBy(PosterGap)) {
+                        shows.forEach { CellPoster(it, posterWidth) }
+                    }
+                }
             }
         }
-        Row(horizontalArrangement = Arrangement.spacedBy(5.dp)) {
-            shows.take(POSTERS_PER_DAY).forEach { episode ->
-                NuvioAsyncImage(
-                    model = episode.poster,
-                    contentDescription = episode.showName,
-                    modifier = Modifier
-                        .weight(1f)
-                        .aspectRatio(2f / 3f)
-                        .clip(RoundedCornerShape(6.dp))
-                        .background(CardFill),
-                    contentScale = ContentScale.Crop,
-                )
+    }
+}
+
+@Composable
+private fun CellPoster(episode: CalendarEpisode, width: Dp, modifier: Modifier = Modifier) {
+    val status = LocalEpisodeStatus.current(episode)
+    Box(
+        modifier = modifier
+            .width(width)
+            .aspectRatio(2f / 3f)
+            .clip(RoundedCornerShape(6.dp))
+            .background(CardFill)
+            .border(1.dp, CellFill, RoundedCornerShape(6.dp)),
+    ) {
+        NuvioAsyncImage(
+            model = episode.poster,
+            contentDescription = episode.showName,
+            modifier = Modifier.fillMaxSize(),
+            contentScale = ContentScale.Crop,
+        )
+        when (status) {
+            EpisodeStatus.Watched -> {
+                Box(Modifier.fillMaxSize().background(Color.Black.copy(alpha = 0.45f)))
+                Box(
+                    Modifier.align(Alignment.Center).size(22.dp).clip(CircleShape).background(WatchedBg),
+                    contentAlignment = Alignment.Center,
+                ) {
+                    Icon(Icons.Filled.Check, contentDescription = null, tint = WatchedFg, modifier = Modifier.size(15.dp))
+                }
             }
-            repeat(POSTERS_PER_DAY - shows.take(POSTERS_PER_DAY).size) { Spacer(Modifier.weight(1f)) }
+            EpisodeStatus.New -> Box(
+                Modifier.align(Alignment.TopEnd).padding(4.dp).size(9.dp).clip(CircleShape)
+                    .background(MaterialTheme.colorScheme.primary),
+            )
+            null -> Unit
         }
     }
 }
@@ -570,7 +641,18 @@ private fun EpisodeRow(
                     overflow = TextOverflow.Ellipsis,
                 )
             }
-            Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) { EpisodeBadges(episode) }
+            Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                EpisodeBadges(episode)
+                when (LocalEpisodeStatus.current(episode)) {
+                    EpisodeStatus.Watched -> Chip(stringResource(Res.string.calendar_watched), WatchedBg, WatchedFg)
+                    EpisodeStatus.New -> Chip(
+                        stringResource(Res.string.calendar_new),
+                        MaterialTheme.colorScheme.primary,
+                        MaterialTheme.colorScheme.onPrimary,
+                    )
+                    null -> Unit
+                }
+            }
         }
     }
 }
@@ -733,6 +815,22 @@ private fun countdown(episode: CalendarEpisode, nowMs: Long, todayIso: String): 
 
 private val HeroHeight = 330.dp
 private val DayCellHeight = 150.dp
-private const val POSTERS_PER_DAY = 2
+private val PosterGap = 5.dp
+private val MinPosterWidth = 40.dp
+private val MaxPosterWidth = 72.dp
+private const val MAX_SIDE_BY_SIDE = 4
+private const val MAX_STACKED = 6
+private const val NEW_FOR_DAYS = 14
 private const val HERO_SIDE_ITEMS = 3
 private const val AIRING_GRACE_MS = 60L * 60 * 1000
+
+/** Watched once marked; New if it aired within two weeks unwatched; nothing before it airs. */
+private fun episodeStatus(episode: CalendarEpisode, nowMs: Long, todayIso: String): EpisodeStatus? {
+    val aired = episode.airEpochMs?.let { it <= nowMs } ?: (episode.date <= todayIso)
+    if (!aired) return null
+    if (WatchedRepository.isWatched(episode.showId, episode.showType, episode.season, episode.episode)) {
+        return EpisodeStatus.Watched
+    }
+    val daysAgo = isoEpochDay(todayIso) - isoEpochDay(episode.date)
+    return if (daysAgo <= NEW_FOR_DAYS) EpisodeStatus.New else null
+}

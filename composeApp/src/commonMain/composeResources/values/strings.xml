@@ -2557,4 +2557,6 @@
     <string name="calendar_empty_title">Follow some shows</string>
     <string name="calendar_empty_body">Series in your library and Continue Watching show up here when new episodes are scheduled.</string>
     <string name="calendar_loading">Loading your shows (%1$d of %2$d)</string>
+    <string name="calendar_watched">Watched</string>
+    <string name="calendar_new">New</string>
 </resources>

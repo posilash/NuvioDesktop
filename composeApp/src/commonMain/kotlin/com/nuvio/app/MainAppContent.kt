@@ -1445,6 +1445,17 @@ internal fun MainAppContent(
                                         DetailRoute(type = item.type, id = item.id, title = item.name),
                                     )
                                 },
+                                onCalendarEpisodeClick = { episode ->
+                                    navController.navigate(
+                                        DetailRoute(
+                                            type = episode.showType,
+                                            id = episode.showId,
+                                            title = episode.showName,
+                                            initialSeasonNumber = episode.season,
+                                            initialEpisodeNumber = episode.episode,
+                                        ),
+                                    )
+                                },
                                 onLibraryPosterLongClick = { item, section ->
                                     openPosterActions(
                                         PosterActionTarget(

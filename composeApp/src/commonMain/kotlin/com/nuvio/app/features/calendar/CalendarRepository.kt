@@ -1,6 +1,10 @@
 package com.nuvio.app.features.calendar
 
 import co.touchlab.kermit.Logger
+import com.nuvio.app.core.storage.ProfileScopedKey
+import com.nuvio.app.features.profiles.ProfileRepository
+import kotlinx.serialization.Serializable
+import kotlinx.serialization.json.Json
 import com.nuvio.app.core.time.EpisodeReleaseDatePlatform
 import com.nuvio.app.core.time.isoEpochDay
 import com.nuvio.app.core.time.parseEpisodeReleaseLocalDate
@@ -26,9 +30,11 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.sync.withPermit
 
+@Serializable
 enum class CalendarEpisodeKind { Regular, Premiere, Finale }
 
 /** One airing on the calendar. A same-day drop of a whole batch is one event. */
+@Serializable
 data class CalendarEpisode(
     val showId: String,
     val showType: String,
@@ -73,17 +79,56 @@ object CalendarRepository {
     private var buildJob: Job? = null
     private var builtForShows: Set<ShowKey> = emptySet()
     private var builtAtEpochMs = 0L
+    private var loadedProfileId: Int? = null
+    private val json = Json { ignoreUnknownKeys = true }
 
+    @Serializable
     private data class ShowKey(val type: String, val id: String)
 
-    /** Build if never built, if the followed shows changed, or if it is stale. */
+    @Serializable
+    private data class StoredCalendar(
+        val builtAtEpochMs: Long,
+        val shows: List<ShowKey>,
+        val episodes: List<CalendarEpisode>,
+    )
+
+    /**
+     * Show the saved calendar at once, then rebuild in the background if it is
+     * stale or the followed shows changed. The saved one stays on screen while
+     * that runs.
+     */
     fun ensureFresh() {
+        loadSaved()
         val shows = followedShows()
         val now = EpisodeReleaseDatePlatform.nowEpochMs()
         val stale = now - builtAtEpochMs > STALE_AFTER_MS
         if (buildJob?.isActive == true) return
         if (!stale && shows.keys == builtForShows && _uiState.value.hasLoaded) return
         build(shows)
+    }
+
+    private fun storageKey(profileId: Int) = ProfileScopedKey.of(STORAGE_KEY, profileId)
+
+    private fun loadSaved() {
+        val profileId = ProfileRepository.activeProfileId
+        if (loadedProfileId == profileId) return
+        buildJob?.cancel()
+        loadedProfileId = profileId
+        builtForShows = emptySet()
+        builtAtEpochMs = 0L
+        _uiState.value = CalendarUiState()
+        val saved = CalendarStorage.loadPayload(storageKey(profileId))
+            ?.let { runCatching { json.decodeFromString<StoredCalendar>(it) }.getOrNull() }
+            ?: return
+        builtForShows = saved.shows.toSet()
+        builtAtEpochMs = saved.builtAtEpochMs
+        _uiState.value = CalendarUiState(
+            episodes = saved.episodes,
+            loadedShows = saved.shows.size,
+            totalShows = saved.shows.size,
+            todayIso = CurrentDateProvider.todayIsoDate(),
+            hasLoaded = true,
+        )
     }
 
     fun refresh() {
@@ -108,6 +153,7 @@ object CalendarRepository {
 
     private fun build(shows: Map<ShowKey, Pair<String, String?>>) {
         val today = CurrentDateProvider.todayIsoDate()
+        val profileId = loadedProfileId ?: ProfileRepository.activeProfileId
         _uiState.update {
             it.copy(isLoading = true, loadedShows = 0, totalShows = shows.size, todayIso = today)
         }
@@ -115,7 +161,6 @@ object CalendarRepository {
             val todayDay = isoEpochDay(today)
             val window = (todayDay - PAST_DAYS)..(todayDay + FUTURE_DAYS)
             val semaphore = Semaphore(FETCH_CONCURRENCY)
-            var loaded = 0
             val episodes = coroutineScope {
                 shows.keys.map { key ->
                     async {
@@ -129,8 +174,7 @@ object CalendarRepository {
                                 null
                             }
                             val events = meta?.let { calendarEpisodesOf(it, key, window) }.orEmpty()
-                            loaded++
-                            _uiState.update { it.copy(loadedShows = loaded) }
+                            _uiState.update { it.copy(loadedShows = it.loadedShows + 1) }
                             events
                         }
                     }
@@ -141,8 +185,15 @@ object CalendarRepository {
                     .thenBy { it.airEpochMs ?: Long.MAX_VALUE }
                     .thenBy { it.showName.lowercase() },
             )
+            if (ProfileRepository.activeProfileId != profileId) return@launch
             builtForShows = shows.keys
             builtAtEpochMs = EpisodeReleaseDatePlatform.nowEpochMs()
+            runCatching {
+                CalendarStorage.savePayload(
+                    storageKey(profileId),
+                    json.encodeToString(StoredCalendar.serializer(), StoredCalendar(builtAtEpochMs, shows.keys.toList(), sorted)),
+                )
+            }.onFailure { log.w { "saving the calendar failed: ${it.message}" } }
             _uiState.value = CalendarUiState(
                 isLoading = false,
                 loadedShows = shows.size,
@@ -220,5 +271,6 @@ object CalendarRepository {
     private const val PAST_DAYS = 62L
     private const val FUTURE_DAYS = 400L
     private const val BATCH_MIN = 3
+    private const val STORAGE_KEY = "calendar_payload"
     private const val STALE_AFTER_MS = 6L * 60 * 60 * 1000
 }
