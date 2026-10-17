@@ -19,6 +19,10 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.remember
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.rememberTextMeasurer
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -85,7 +89,16 @@ internal fun DesktopNavigationBar(
             viewportWidth > 1600.dp -> 30.dp
             else -> 28.dp
         }
-        val trackWidth = ((iconSize + 20.dp + 64.dp * labelFraction) * items.size + 8.dp).coerceAtMost(maxWidth)
+        // Room for the widest label, not a fixed 64dp: "Calendar" ran past it
+        // and was cut to "Calend…" when the bar expanded.
+        val labelMeasurer = rememberTextMeasurer()
+        val labelStyle = MaterialTheme.typography.labelLarge.copy(fontWeight = FontWeight.Medium)
+        val density = LocalDensity.current
+        val labelRoom = remember(items.map { it.label }, labelStyle, density) {
+            val widest = items.maxOf { labelMeasurer.measure(it.label, labelStyle, maxLines = 1).size.width }
+            maxOf(64.dp, with(density) { widest.toDp() } + 12.dp)
+        }
+        val trackWidth = ((iconSize + 20.dp + labelRoom * labelFraction) * items.size + 8.dp).coerceAtMost(maxWidth)
         JellyNavigationBar(
             items = items,
             labelFraction = labelFraction,

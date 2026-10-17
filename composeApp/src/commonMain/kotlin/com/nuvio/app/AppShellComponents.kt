@@ -77,6 +77,7 @@ import com.nuvio.app.features.home.HomeScreen
 import com.nuvio.app.features.home.MetaPreview
 import com.nuvio.app.features.library.LibraryItem
 import com.nuvio.app.features.library.LibraryScreen
+import com.nuvio.app.features.calendar.CalendarScreen
 import com.nuvio.app.features.library.LibrarySection
 import com.nuvio.app.features.library.LibrarySortOption
 import com.nuvio.app.features.player.PlayerBackReleaseGuard
@@ -282,6 +283,25 @@ internal fun AppTabHost(
                     onPreviewLongClick = actions.onPosterLongClick,
                     onDownloadsClick = actions.onDownloadsClick,
                     disintegrationRequest = state.libraryDisintegrationRequest,
+                )
+            }
+
+            AppScreenTab.Calendar -> {
+                CalendarScreen(
+                    modifier = Modifier.fillMaxSize(),
+                    topChromePadding = state.topChromePadding,
+                    onShowClick = { episode ->
+                        actions.onPosterClick?.invoke(
+                            MetaPreview(
+                                id = episode.showId,
+                                type = episode.showType,
+                                name = episode.showName,
+                                poster = episode.poster,
+                                banner = episode.backdrop,
+                                logo = episode.logo,
+                            ),
+                        )
+                    },
                 )
             }
 
