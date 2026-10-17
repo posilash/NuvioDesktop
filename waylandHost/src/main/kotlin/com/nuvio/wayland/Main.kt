@@ -1087,6 +1087,13 @@ fun main(args: Array<String>) {
     // surface is new and holds nothing, so "nothing changed" would leave the
     // window blank.
     var forceRepaint = true
+    // The presenter only learns the window's size when it presents, and the
+    // host presents only when something changed -- so a resize alone went
+    // unnoticed, and the compositor stretched the old frame until a hover
+    // happened to repaint. GLFW calls these on this thread, inside poll.
+    glfwSetFramebufferSizeCallback(window) { _, _, _ -> forceRepaint = true }
+    glfwSetWindowSizeCallback(window) { _, _, _ -> forceRepaint = true }
+    glfwSetWindowContentScaleCallback(window) { _, _, _ -> forceRepaint = true }
     // Which target image the Skia surface was built against.
     var presenterGeneration = 0
     var graphiteComposeCanvas: androidx.compose.ui.graphics.Canvas? = null
