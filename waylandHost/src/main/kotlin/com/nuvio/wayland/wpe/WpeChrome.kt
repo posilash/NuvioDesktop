@@ -187,6 +187,11 @@ class WpeChrome(
     }
 
     private fun init(pageUri: String) {
+        // WebKit 2.54 deadlocks the web process when it frees memory under
+        // system memory pressure: releaseMemory blocks the main thread on the
+        // compositor, which waits on an image only the main thread can fulfil.
+        // The page then froze for good soon after the chrome hid.
+        setEnv("WEBKIT_DISABLE_MEMORY_PRESSURE_MONITOR", "1")
         if (!allowGpu) {
             // Set before WebKit loads and before any web process is spawned;
             // children inherit the environment at fork.
@@ -244,6 +249,7 @@ class WpeChrome(
         check(!toplevel.equals(MemorySegment.NULL)) { "headless view came without a toplevel" }
         resize(width, height)
         fn(webkit, "wpe_view_focus_in", FunctionDescriptor.ofVoid(ADDRESS)).invokeExact(view)
+
 
         // The page's transport: webkit.messageHandlers.player.postMessage(...)
         // -- the same handler name and payload shape the stock GTK bridge
