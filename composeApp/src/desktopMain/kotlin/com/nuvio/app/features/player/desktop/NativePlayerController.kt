@@ -50,7 +50,10 @@ internal typealias NativePlayerCreate = (
 
 internal class NativePlayerController(
     private val host: NativePlayerHost,
-    private val nativeCreate: NativePlayerCreate = NativePlayerBridge::create,
+    private val nativeCreate: NativePlayerCreate = { hostViewPtr, source, headers, playWhenReady, positionMs, controlsUrl, decoder, rtx, sink ->
+        NativePlayerBridge.ensureLoaded()
+        NativePlayerBridge.create(hostViewPtr, source, headers, playWhenReady, positionMs, controlsUrl, decoder, rtx, sink)
+    },
     private val nativeDispose: (Long) -> Unit = NativePlayerBridge::dispose,
     private val nativeSeekTo: (Long, Long) -> Unit = NativePlayerBridge::seekTo,
     private val isHostDisplayable: () -> Boolean = { host.isDisplayable },
@@ -536,6 +539,8 @@ internal class NativePlayerController(
                 }
             }
             "toggleFullscreen" -> {
+                if (onEvent(type, value)) 
+                    return
                 if (DesktopPlayerPictureInPicture.isEnabled) {
                     DesktopPlayerPictureInPicture.toggle()
                 } else {
@@ -1260,6 +1265,10 @@ internal fun PlayerControlsState.toControlsJson(isFullscreen: Boolean): String =
         append(',')
         appendJsonField("playbackSpeedLabel", playbackSpeedLabel)
         append(',')
+        appendJsonField("holdToSpeedEnabled", holdToSpeedEnabled)
+        append(',')
+        appendJsonField("holdToSpeedValue", holdToSpeedValue)
+        append(',')
         appendJsonField("isFullscreen", isFullscreen)
         append(',')
         appendJsonField("volumeLevel", volumeLevel)
@@ -1521,6 +1530,8 @@ internal fun PlayerControlsState.toControlsJson(isFullscreen: Boolean): String =
         append(',')
         appendJsonField("positionMs", positionMs)
         append(',')
+        appendJsonField("bufferedPositionMs", bufferedPositionMs)
+        append(',')
         appendJsonField("sourceIsLoading", sourceIsLoading)
         append(',')
         appendJsonArrayField("sourceFilters", sourceFilters) { appendFilterItemJson(it) }
@@ -1611,6 +1622,7 @@ internal fun PlayerControlsState.nativeControlsStructureKey(): PlayerControlsSta
         isLoading = false,
         durationMs = 0L,
         positionMs = 0L,
+        bufferedPositionMs = 0L,
     )
 
 private fun StringBuilder.appendJsonField(name: String, value: String) {
@@ -1630,6 +1642,8 @@ private fun StringBuilder.appendJsonField(name: String, value: Float?) {
     append('"').append(name).append("\":")
     if (value == null || value.isNaN() || value.isInfinite()) {
         append("null")
+    } else if (name == "holdToSpeedValue") {
+        append(value.coerceIn(1f, 4f))
     } else {
         append(value.coerceIn(0f, 1f))
     }

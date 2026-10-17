@@ -78,8 +78,8 @@ class Mpv private constructor(private val handle: MemorySegment, private val are
         const val MPV_RENDER_PARAM_ADVANCED_CONTROL = 10
         const val MPV_RENDER_PARAM_NEXT_FRAME_INFO = 11
         const val MPV_RENDER_PARAM_BLOCK_FOR_TARGET_TIME = 12
-        const val MPV_RENDER_PARAM_VULKAN_INIT_PARAMS = 21
-        const val MPV_RENDER_PARAM_VULKAN_FBO = 22
+        const val MPV_RENDER_PARAM_VULKAN_INIT_PARAMS = 1000
+        const val MPV_RENDER_PARAM_VULKAN_FBO = 1001
 
         const val MPV_RENDER_UPDATE_FRAME = 1L
 

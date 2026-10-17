@@ -419,6 +419,8 @@ class WaylandVideoHost(
         }
         val duration = mpv.cachedDouble("duration") ?: 0.0
         val position = mpv.cachedDouble("time-pos") ?: 0.0
+        // The stock bridge's buffer bar value: cached-ahead time, never behind.
+        val bufferedPosition = maxOf(mpv.cachedDouble("demuxer-cache-time") ?: position, position, 0.0)
         val volumeLevel = ((mpv.cachedDouble("volume") ?: 100.0) / 100.0).coerceIn(0.0, MAX_VOLUME_LEVEL.toDouble())
         val paused = mpv.cachedBoolean("pause") ?: false
         val loading = isLoadingNow()
@@ -426,8 +428,8 @@ class WaylandVideoHost(
             if (it.size == 2) Pair(it[0] + "]", "[" + it[1]) else Pair("[]", "[]")
         }
         val script =
-            "window.playerUpdate&&window.playerUpdate({duration:%.3f,position:%.3f,volumeLevel:%.3f,paused:%s,loading:%s,audioTracks:%s,subtitleTracks:%s})"
-                .format(java.util.Locale.ROOT, duration, position, volumeLevel, paused, loading, audio, subs.removeSuffix(","))
+            "window.playerUpdate&&window.playerUpdate({duration:%.3f,position:%.3f,bufferedPosition:%.3f,volumeLevel:%.3f,paused:%s,loading:%s,audioTracks:%s,subtitleTracks:%s})"
+                .format(java.util.Locale.ROOT, duration, position, bufferedPosition, volumeLevel, paused, loading, audio, subs.removeSuffix(","))
         if (updatePushes++ % 10 == 0L &&
             System.getProperty("nuvio.wayland.videoLog")?.toBoolean() == true
         ) {

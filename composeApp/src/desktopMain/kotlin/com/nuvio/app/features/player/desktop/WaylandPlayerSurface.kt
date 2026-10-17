@@ -217,6 +217,8 @@ internal fun WaylandPlayerSurface(
                         }
                     }
                     "toggleFullscreen" -> com.nuvio.app.core.ui.toggleFullscreenAction()
+                    // Hold-to-speed; stock's controller sets it directly too.
+                    "setPlaybackSpeed" -> bridge.setSpeed(value.toFloat())
                     // The chrome sends a level, not a percentage: 1.0 is 100% and
                     // the boosted half of the slider runs to 2.0.
                     "volumeChange" ->
