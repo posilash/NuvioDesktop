@@ -47,9 +47,14 @@ prepare() {
 NUVIO_SUPABASE_URL=${_supabase_url}
 NUVIO_SUPABASE_ANON_KEY=${_supabase_anon_key}
 NUVIO_SUPABASE_FALLBACK_URL=${_supabase_fallback_url}
-TRAKT_CLIENT_ID=
-TRAKT_CLIENT_SECRET=
 EOF
+	# Trakt, Simkl, MDBList and the rest are compiled in too, and official
+	# builds take them from a CI secret. Kept out of this public file: they
+	# come from a private one when present, or those integrations stay off.
+	local keys="${NUVIO_KEYS_FILE:-${HOME}/.config/nuvio-build/keys.properties}"
+	if [[ -f "${keys}" ]]; then
+		cat "${keys}" >>local.properties
+	fi
 
 	# Skia's GrGLMakeNativeInterface() checks glXGetCurrentContext(), which is
 	# always null under Wayland, and the host dies at DirectContext.makeGL.
