@@ -40,7 +40,6 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import dev.chrisbanes.haze.HazeState
-import com.nuvio.app.isDesktop
 import dev.chrisbanes.haze.hazeEffect
 import org.jetbrains.compose.resources.DrawableResource
 import org.jetbrains.compose.resources.painterResource
@@ -141,7 +140,6 @@ fun NuvioNavigationBar(
     modifier: Modifier = Modifier,
     scrollState: NuvioNavBarScrollState? = null,
     hazeState: HazeState? = null,
-    backdrop: NuvioBackdropState? = null,
     navBarStyle: NavBarStyle = NavBarStyle.ADAPTIVE,
     contentPadding: PaddingValues = floatingNavigationBarPadding(),
     compactSize: Boolean = false,
@@ -179,13 +177,7 @@ fun NuvioNavigationBar(
             .fillMaxWidth()
             .clip(RoundedCornerShape(NuvioTokens.Radius.full))
             .then(
-                if (isDesktop && backdrop != null) {
-                    Modifier.nuvioBackdropEffect(
-                        state = backdrop,
-                        blurRadius = 24.dp,
-                        tint = Color.Transparent,
-                    )
-                } else if (hazeState != null && !isDesktop) {
+                if (hazeState != null) {
                     Modifier.hazeEffect(state = hazeState) {
                         blurRadius = 24.dp
                     }
@@ -193,11 +185,7 @@ fun NuvioNavigationBar(
                     Modifier
                 },
             )
-            .background(
-                Color(0xFF1C1C1E).copy(
-                    alpha = if (hazeState != null || backdrop != null) 0.55f else 0.82f,
-                ),
-            )
+            .background(Color(0xFF1C1C1E).copy(alpha = if (hazeState != null) 0.55f else 0.82f))
 
         Box(modifier = pillModifier) {
             Row(

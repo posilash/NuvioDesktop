@@ -62,8 +62,6 @@ import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.zIndex
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
-import com.nuvio.app.core.ui.NuvioBackdropState
-import com.nuvio.app.core.ui.nuvioBackdropEffect
 import com.nuvio.app.core.ui.DisintegrationRequest
 import com.nuvio.app.core.ui.LocalNuvioNavBarScrollState
 import com.nuvio.app.core.ui.NuvioLoadingIndicator
@@ -337,7 +335,6 @@ internal fun TabletFloatingTopBar(
     navBarStyleSetting: NavBarStyle = NavBarStyle.ADAPTIVE,
     isHeroEnabled: Boolean = true,
     hazeState: HazeState? = null,
-    backdrop: NuvioBackdropState? = null,
     scrollState: NuvioNavBarScrollState? = null,
     windowWidth: Dp? = null,
     modifier: Modifier = Modifier,
@@ -482,13 +479,7 @@ internal fun TabletFloatingTopBar(
         val pillModifier = Modifier
             .clip(chipShape)
             .then(
-                if (isFrosted && isDesktop && backdrop != null) {
-                    Modifier.nuvioBackdropEffect(
-                        state = backdrop,
-                        blurRadius = 14.dp,
-                        tint = Color.Transparent,
-                    )
-                } else if (isFrosted && hazeState != null && !isDesktop) {
+                if (isFrosted && hazeState != null) {
                     Modifier.hazeEffect(state = hazeState) {
                         blurRadius = 14.dp
                     }
@@ -617,7 +608,6 @@ internal fun TabletFloatingTopBar(
                                 onPopupStateChanged = { isProfileSwitcherOpen = it },
                                 avatarSize = avatarSize,
                                 hazeState = hazeState,
-                                backdrop = backdrop,
                                 popupAlignment = Alignment.TopCenter,
                             )
                         },

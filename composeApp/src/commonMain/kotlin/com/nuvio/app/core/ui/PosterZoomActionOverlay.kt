@@ -61,7 +61,6 @@ import androidx.compose.ui.unit.min
 import coil3.compose.AsyncImage
 import dev.chrisbanes.haze.HazeInputScale
 import dev.chrisbanes.haze.HazeState
-import com.nuvio.app.isDesktop
 import dev.chrisbanes.haze.hazeEffect
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
@@ -170,7 +169,6 @@ fun NuvioPosterZoomActionOverlay(
     anchor: PosterZoomAnchor?,
     actions: List<PosterZoomOverlayAction>,
     hazeState: HazeState,
-    backdrop: NuvioBackdropState? = null,
     onDismissed: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
@@ -281,21 +279,7 @@ fun NuvioPosterZoomActionOverlay(
         Box(
             modifier = Modifier
                 .fillMaxSize()
-                .then(
-                    if (isDesktop && backdrop != null) {
-                        Modifier.nuvioBackdropEffect(
-                            state = backdrop,
-                            blurRadius = 36.dp,
-                            tint = Color.Black.copy(
-                                alpha = (scrim.value * 0.35f).coerceIn(0f, 1f),
-                            ),
-                        )
-                    } else {
-                        Modifier
-                    },
-                )
                 .hazeEffect(state = hazeState) {
-                    blurEnabled = !isDesktop
                     blurRadius = 36.dp
                     inputScale = HazeInputScale.Auto
                     noiseFactor = 0f

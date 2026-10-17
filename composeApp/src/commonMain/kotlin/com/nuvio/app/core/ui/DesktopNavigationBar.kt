@@ -34,7 +34,6 @@ import com.nuvio.app.core.ui.jelly.JellyNavigationBar
 import com.nuvio.app.features.settings.NavBarStyle
 import dev.chrisbanes.haze.HazeState
 import dev.chrisbanes.haze.hazeEffect
-import com.nuvio.app.isDesktop
 
 @Composable
 internal fun DesktopNavigationBar(
@@ -42,7 +41,6 @@ internal fun DesktopNavigationBar(
     modifier: Modifier = Modifier,
     scrollState: NuvioNavBarScrollState? = null,
     hazeState: HazeState? = null,
-    backdrop: NuvioBackdropState? = null,
     contentPadding: PaddingValues = PaddingValues(top = 10.dp, bottom = 8.dp),
     navBarStyle: NavBarStyle = NavBarStyle.ADAPTIVE,
     isHeroEnabled: Boolean = false,
@@ -111,13 +109,7 @@ internal fun DesktopNavigationBar(
                 modifier = Modifier.matchParentSize()
                     .clip(RoundedCornerShape(50))
                     .then(
-                        if (isFrosted && isDesktop && backdrop != null) {
-                            Modifier.nuvioBackdropEffect(
-                                state = backdrop,
-                                blurRadius = 14.dp,
-                                tint = Color.Transparent,
-                            )
-                        } else if (isFrosted && hazeState != null && !isDesktop) {
+                        if (isFrosted && hazeState != null) {
                             Modifier.hazeEffect(state = hazeState) { blurRadius = 14.dp }
                         } else {
                             Modifier

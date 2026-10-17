@@ -57,9 +57,6 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import com.nuvio.app.core.ui.nuvio
-import com.nuvio.app.core.ui.NuvioBackdropState
-import com.nuvio.app.core.ui.nuvioBackdropEffect
-import com.nuvio.app.isDesktop
 import dev.chrisbanes.haze.HazeState
 import dev.chrisbanes.haze.HazeTint
 import dev.chrisbanes.haze.hazeEffect
@@ -74,7 +71,6 @@ internal fun ProfilePopupContent(
     hoveredProfileIndex: Int?,
     pinProfile: NuvioProfile?,
     hazeState: HazeState?,
-    backdrop: NuvioBackdropState? = null,
     opensBelow: Boolean,
     availableHeight: Dp?,
     modifier: Modifier = Modifier,
@@ -113,13 +109,7 @@ internal fun ProfilePopupContent(
                     .shadow(12.dp, shape)
                     .clip(shape)
                     .then(
-                        if (isDesktop && backdrop != null) {
-                            Modifier.nuvioBackdropEffect(
-                                state = backdrop,
-                                blurRadius = 24.dp,
-                                tint = Color(0xFF1C1C1E).copy(alpha = 0.55f),
-                            )
-                        } else if (hazeState != null && !isDesktop) {
+                        if (hazeState != null) {
                             Modifier.hazeEffect(hazeState) {
                                 blurRadius = 24.dp
                                 backgroundColor = Color(0xFF1C1C1E)

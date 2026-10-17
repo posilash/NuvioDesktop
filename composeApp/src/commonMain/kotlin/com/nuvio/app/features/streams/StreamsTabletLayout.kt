@@ -57,9 +57,6 @@ import com.nuvio.app.core.ui.shimmer
 import com.nuvio.app.isIos
 import com.nuvio.app.isDesktop
 import dev.chrisbanes.haze.HazeInputScale
-import com.nuvio.app.core.ui.nuvioBackdropEffect
-import com.nuvio.app.core.ui.nuvioBackdropSource
-import com.nuvio.app.core.ui.rememberNuvioBackdropState
 import dev.chrisbanes.haze.hazeEffect
 import dev.chrisbanes.haze.hazeSource
 import dev.chrisbanes.haze.rememberHazeState
@@ -114,9 +111,6 @@ internal fun TabletStreamsLayout(
         return
     }
 
-    // Desktop-only body (non-desktop returned above), and haze's blur reaches a
-    // Compose internal this build does not have, so the backdrop does it here.
-    val backdrop = rememberNuvioBackdropState()
     val hazeState = rememberHazeState()
     val opacity = com.nuvio.app.core.ui.NuvioTokens.Opacity
     val tabletBackdrop = remember(background, poster) {
@@ -167,8 +161,7 @@ internal fun TabletStreamsLayout(
             modifier = Modifier
                 .fillMaxSize()
                 .background(if (useWideArtworkFrame) wideFadeColor else colorScheme.background)
-                .hazeSource(state = hazeState)
-                .nuvioBackdropSource(backdrop),
+                .hazeSource(state = hazeState),
         ) {
             if (tabletBackdrop != null) {
                 AsyncImage(
@@ -253,11 +246,11 @@ internal fun TabletStreamsLayout(
                 modifier = Modifier
                     .fillMaxSize()
                     .clip(RoundedCornerShape(24.dp))
-                    .nuvioBackdropEffect(
-                        state = backdrop,
-                        blurRadius = 56.dp,
-                        tint = Color.Black.copy(alpha = 0.36f),
-                    ),
+                    .hazeEffect(state = hazeState) {
+                        inputScale = HazeInputScale.Fixed(0.66f)
+                        blurRadius = 56.dp
+                    }
+                    .background(Color.Black.copy(alpha = 0.36f)),
             ) {
                 Column(
                     modifier = Modifier
@@ -324,8 +317,6 @@ private fun LegacyTabletStreamsLayout(
     modifier: Modifier = Modifier,
 ) {
     val hazeState = rememberHazeState()
-    // haze's blur cannot run on 1.12; this stands in for it on desktop.
-    val backdrop = rememberNuvioBackdropState()
     val tabletBackdrop = remember(background, poster) {
         background ?: poster
     }
@@ -353,8 +344,7 @@ private fun LegacyTabletStreamsLayout(
         Box(
             modifier = Modifier
                 .fillMaxSize()
-                .hazeSource(state = hazeState)
-                .then(if (isDesktop) Modifier.nuvioBackdropSource(backdrop) else Modifier),
+                .hazeSource(state = hazeState),
         ) {
             if (tabletBackdrop != null) {
                 AsyncImage(
@@ -430,22 +420,11 @@ private fun LegacyTabletStreamsLayout(
                     modifier = Modifier
                         .fillMaxSize()
                         .clip(RoundedCornerShape(24.dp))
-                        .then(
-                            if (isDesktop) {
-                                Modifier.nuvioBackdropEffect(
-                                    state = backdrop,
-                                    blurRadius = 56.dp,
-                                    tint = Color.Black.copy(alpha = 0.36f),
-                                )
-                            } else {
-                                Modifier
-                                    .hazeEffect(state = hazeState) {
-                                        inputScale = HazeInputScale.Fixed(0.66f)
-                                        blurRadius = 56.dp
-                                    }
-                                    .background(Color.Black.copy(alpha = 0.36f))
-                            },
-                        ),
+                        .hazeEffect(state = hazeState) {
+                            inputScale = HazeInputScale.Fixed(0.66f)
+                            blurRadius = 56.dp
+                        }
+                        .background(Color.Black.copy(alpha = 0.36f)),
                 ) {
                     Column(
                         modifier = Modifier

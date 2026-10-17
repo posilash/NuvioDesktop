@@ -70,7 +70,6 @@ import com.nuvio.app.core.sync.AppForegroundMonitor
 import com.nuvio.app.core.sync.AppVisibility
 import com.nuvio.app.core.sync.ProfileSettingsSync
 import com.nuvio.app.core.sync.SyncManager
-import com.nuvio.app.core.ui.nuvioBackdropSource
 import com.nuvio.app.core.ui.DisintegrationRequestController
 import com.nuvio.app.core.ui.NativeTabBridge
 import com.nuvio.app.core.ui.NuvioCardDepthSurface
@@ -293,7 +292,6 @@ internal fun MainAppContent(
         var selectedPosterActionTarget by remember { mutableStateOf<PosterActionTarget?>(null) }
         var selectedPosterAnchor by remember { mutableStateOf<PosterZoomAnchor?>(null) }
         val posterOverlayHazeState = rememberHazeState()
-        val posterOverlayBackdrop = com.nuvio.app.core.ui.rememberNuvioBackdropState()
         var selectedContinueWatchingForActions by remember { mutableStateOf<ContinueWatchingItem?>(null) }
         var selectedContinueWatchingZoomAnchor by remember { mutableStateOf<PosterZoomAnchor?>(null) }
         val libraryDisintegrationRequests = remember { DisintegrationRequestController<String>() }
@@ -1343,13 +1341,6 @@ internal fun MainAppContent(
                     .then(
                         if (selectedPosterActionTarget != null || selectedContinueWatchingZoomAnchor != null) {
                             Modifier.hazeSource(state = posterOverlayHazeState)
-                                .then(
-                                    if (isDesktop) {
-                                        Modifier.nuvioBackdropSource(posterOverlayBackdrop)
-                                    } else {
-                                        Modifier
-                                    },
-                                )
                         } else {
                             Modifier
                         },
@@ -1963,7 +1954,6 @@ internal fun MainAppContent(
                             ),
                         ),
                         hazeState = posterOverlayHazeState,
-                        backdrop = posterOverlayBackdrop,
                         onDismissed = {
                             selectedPosterActionTarget = null
                             selectedPosterAnchor = null
@@ -2034,7 +2024,6 @@ internal fun MainAppContent(
                                 )
                             },
                             hazeState = posterOverlayHazeState,
-                            backdrop = posterOverlayBackdrop,
                             onDismissed = {
                                 selectedContinueWatchingForActions = null
                                 selectedContinueWatchingZoomAnchor = null

@@ -45,8 +45,6 @@ import com.nuvio.app.core.ui.DesktopNavigationBar
 import com.nuvio.app.core.ui.FloatingNavigationBar
 import com.nuvio.app.core.ui.FloatingNavigationItem
 import com.nuvio.app.core.ui.PlatformBackHandler
-import com.nuvio.app.core.ui.nuvioBackdropSource
-import com.nuvio.app.core.ui.rememberNuvioBackdropState
 import com.nuvio.app.core.ui.rememberNuvioNavBarScrollState
 import com.nuvio.app.features.home.HomeCatalogSettingsRepository
 import com.nuvio.app.features.profiles.NuvioProfile
@@ -118,7 +116,6 @@ internal fun MainTabsDestination(
             navBarScrollState.switchToTab(selectedTab)
         }
         val navBarHazeState = rememberHazeState()
-        val navBarBackdrop = rememberNuvioBackdropState()
         val navBarStyleSetting by remember { ThemeSettingsRepository.navBarStyle }.collectAsStateWithLifecycle()
         val homeCatalogSettingsUiState by remember { HomeCatalogSettingsRepository.uiState }.collectAsStateWithLifecycle()
 
@@ -185,7 +182,6 @@ internal fun MainTabsDestination(
                         onProfileSelected = onProfileSelected,
                         onAddProfileRequested = onAddProfileRequested,
                         hazeState = navBarHazeState,
-                        backdrop = navBarBackdrop,
                         onPopupStateChanged = { isTopProfileSwitcherOpen = it },
                         avatarSize = if (isDesktop && screenWidth < 800.dp) 26 else if (isDesktop && screenWidth > 1600.dp) 30 else 28,
                         popupBelowAnchor = isDesktop || isTabletLayout,
@@ -264,13 +260,6 @@ internal fun MainTabsDestination(
                         modifier = Modifier
                             .fillMaxSize()
                             .then(if (requiresNavBarHaze) Modifier.hazeSource(state = navBarHazeState) else Modifier)
-                            .then(
-                                if (isDesktop && requiresNavBarHaze) {
-                                    Modifier.nuvioBackdropSource(navBarBackdrop)
-                                } else {
-                                    Modifier
-                                },
-                            )
                             .then(if (shouldAttachNestedScroll) Modifier.nestedScroll(navBarScrollState.nestedScrollConnection) else Modifier)
                             .padding(innerPadding)
                             .padding(start = contentStartPadding),
@@ -301,7 +290,6 @@ internal fun MainTabsDestination(
                         navBarStyleSetting = navBarStyleSetting,
                         isHeroEnabled = homeCatalogSettingsUiState.heroEnabled,
                         hazeState = navBarHazeState,
-                        backdrop = navBarBackdrop,
                         scrollState = navBarScrollState,
                         windowWidth = screenWidth,
                     )
@@ -333,7 +321,6 @@ internal fun MainTabsDestination(
                         ),
                         scrollState = navBarScrollState,
                         hazeState = navBarHazeState,
-                        backdrop = navBarBackdrop,
                         navBarStyle = navBarStyleSetting,
                         isHeroEnabled = homeCatalogSettingsUiState.heroEnabled,
                         profileSwitcherOpen = isTopProfileSwitcherOpen,

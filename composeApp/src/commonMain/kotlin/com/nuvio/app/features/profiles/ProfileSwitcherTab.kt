@@ -84,9 +84,6 @@ import androidx.compose.ui.window.Popup
 import androidx.compose.ui.window.PopupProperties
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import dev.chrisbanes.haze.hazeEffect
-import com.nuvio.app.core.ui.NuvioBackdropState
-import com.nuvio.app.core.ui.nuvioBackdropEffect
-import com.nuvio.app.isDesktop
 import com.nuvio.app.core.ui.NuvioAsyncImage as AsyncImage
 import com.nuvio.app.core.ui.NuvioTokens
 import com.nuvio.app.core.ui.nuvio
@@ -111,7 +108,6 @@ fun ProfileSwitcherTab(
     onPopupStateChanged: ((Boolean) -> Unit)? = null,
     avatarSize: Int = 28,
     hazeState: HazeState? = null,
-    backdrop: NuvioBackdropState? = null,
     popupAlignment: Alignment = Alignment.BottomCenter,
     modifier: Modifier = Modifier,
     popupBelowAnchor: Boolean = false,
@@ -301,7 +297,6 @@ fun ProfileSwitcherTab(
                     hoveredProfileIndex = dragTargetProfileIndex,
                     pinProfile = pinProfile,
                     hazeState = hazeState,
-                    backdrop = backdrop,
                     opensBelow = opensBelow,
                     availableHeight = availableHeight,
                     modifier = Modifier.graphicsLayer {
