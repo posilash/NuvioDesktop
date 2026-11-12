@@ -15,13 +15,18 @@ import com.nuvio.app.features.player.AudioTrack
 import com.nuvio.app.features.player.ParentalWarning
 import com.nuvio.app.features.player.PlayerControlsAction
 import com.nuvio.app.features.player.PlayerControlsState
+import com.nuvio.app.features.player.PlayerChapter
+import com.nuvio.app.features.player.PlayerSettingsRepository
 import com.nuvio.app.features.player.PlayerEngineController
+import com.nuvio.app.features.player.PlayerMediaInfo
+import com.nuvio.app.features.player.mpvMediaInfo
 import com.nuvio.app.features.player.PlayerPlaybackSnapshot
 import com.nuvio.app.features.player.PlayerResizeMode
 import com.nuvio.app.features.player.SUBTITLE_DELAY_MAX_MS
 import com.nuvio.app.features.player.findPreferredAudioTrackIndex
 import com.nuvio.app.features.player.SUBTITLE_DELAY_MIN_MS
 import com.nuvio.app.features.player.SubtitleColorSwatches
+import com.nuvio.app.features.player.SubtitleFontResolver
 import com.nuvio.app.features.player.SubtitleOutlineColorSwatches
 import com.nuvio.app.features.player.SubtitleStyleState
 import com.nuvio.app.features.player.SubtitleTrack
@@ -107,6 +112,7 @@ internal class NativePlayerController(
     private var releaseTimedOut: Boolean = false
     private var terminalReleaseFailure: String? = null
     private var controlsState = PlayerControlsState()
+    private var pictureInPictureActive = false
     @Volatile
     private var currentVolumeLevel = rememberedVolumeLevel.coerceDesktopPlayerVolumeLevel()
     private var pendingSubtitleDelayMs: Int? = null
@@ -514,8 +520,20 @@ internal class NativePlayerController(
         }
     }
 
+    @Synchronized
     fun setResizeMode(mode: PlayerResizeMode) {
         rememberedResizeMode = mode
+        applyResizeMode()
+    }
+
+    @Synchronized
+    fun setPictureInPictureActive(active: Boolean) {
+        pictureInPictureActive = active
+        applyResizeMode()
+    }
+
+    private fun applyResizeMode() {
+        val mode = desktopEffectiveResizeMode(rememberedResizeMode, pictureInPictureActive)
         handle.takeIf { it != 0L }?.let { current ->
             NativePlayerBridge.setResizeMode(
                 handle = current,
@@ -694,6 +712,7 @@ internal class NativePlayerController(
         return runCatching {
             val isLoading = NativePlayerBridge.isLoading(current)
             val isEnded = NativePlayerBridge.isEnded(current)
+            val videoSize = desktopMpvVideoSize { name -> NativePlayerBridge.stringProperty(current, name) }
             PlayerPlaybackSnapshot(
                 isLoading = isLoading,
                 isPlaying = !NativePlayerBridge.isPaused(current) && !isLoading && !isEnded,
@@ -702,6 +721,8 @@ internal class NativePlayerController(
                 positionMs = NativePlayerBridge.positionMs(current),
                 bufferedPositionMs = NativePlayerBridge.bufferedPositionMs(current),
                 playbackSpeed = NativePlayerBridge.speed(current),
+                videoWidth = videoSize.width,
+                videoHeight = videoSize.height,
             )
         }.getOrDefault(PlayerPlaybackSnapshot(isLoading = true))
     }
@@ -996,6 +1017,25 @@ internal class NativePlayerController(
             )
         }
 
+    override suspend fun getChapters(): List<PlayerChapter> {
+        if (!PlayerSettingsRepository.uiState.value.androidExoChaptersEnabled) return emptyList()
+        val current = handle.takeIf { it != 0L } ?: return emptyList()
+        val count = NativePlayerBridge.stringProperty(current, "chapter-list/count").toIntOrNull() ?: return emptyList()
+        return (0 until count).mapNotNull { index ->
+            val seconds = NativePlayerBridge.stringProperty(current, "chapter-list/$index/time").toDoubleOrNull()
+                ?: return@mapNotNull null
+            PlayerChapter(
+                startMs = (seconds * 1000.0).toLong(),
+                title = NativePlayerBridge.stringProperty(current, "chapter-list/$index/title").takeIf { it.isNotBlank() },
+            )
+        }
+    }
+
+    override suspend fun getMediaInfo(): PlayerMediaInfo {
+        val current = handle.takeIf { it != 0L } ?: return PlayerMediaInfo()
+        return mpvMediaInfo { name -> NativePlayerBridge.stringProperty(current, name).takeIf { it.isNotBlank() } }
+    }
+
     override fun getSubtitleTracks(): List<SubtitleTrack> =
         decodeTracks { NativePlayerBridge.subtitleTracksJson(it) }.map { track ->
             SubtitleTrack(
@@ -1013,6 +1053,7 @@ internal class NativePlayerController(
         }
 
     override fun applyAudioLanguagePreferences(languages: List<String>) {
+        handle.takeIf { it != 0L }?.let { NativePlayerBridge.setAudioLanguages(it, languages.joinToString(",")) }
         val trackIndex = findPreferredAudioTrackIndex(getAudioTracks(), languages)
         if (trackIndex >= 0) selectAudioTrack(trackIndex)
     }
@@ -1074,6 +1115,10 @@ internal class NativePlayerController(
         applyPendingSubtitleSettings()
     }
 
+    override fun setSubtitleVisible(visible: Boolean) {
+        handle.takeIf { it != 0L }?.let { NativePlayerBridge.setSubtitleVisible(it, visible) }
+    }
+
     override fun setSubtitleDelayMs(delayMs: Int) {
         val clamped = delayMs.coerceIn(SUBTITLE_DELAY_MIN_MS, SUBTITLE_DELAY_MAX_MS)
         pendingSubtitleDelayMs = clamped
@@ -1112,6 +1157,14 @@ internal class NativePlayerController(
             subPos = style.toMpvSubtitlePosition(),
             useLibass = useLibass,
             stripSdh = style.stripSdh,
+        )
+        val shadowAlpha = if (style.appearance.shadowEnabled) (style.appearance.shadowOpacity * 255 / 100) else 0
+        NativePlayerBridge.setSubtitleAppearance(
+            handle = handle,
+            font = SubtitleFontResolver.mpvFontName(style.appearance.fontId),
+            fontsDir = SubtitleFontResolver.fontsDir(),
+            shadowColor = "#" + shadowAlpha.toHexByte() + "000000",
+            shadowOffset = if (style.appearance.shadowEnabled) style.appearance.shadowSize.toFloat() else 0f,
         )
     }
 
@@ -1378,8 +1431,6 @@ internal fun PlayerControlsState.toControlsJson(isFullscreen: Boolean, onImageRe
         append(',')
         appendJsonField("subtitleStyleTabLabel", subtitleStyleTabLabel)
         append(',')
-        appendJsonField("customSubtitleStyleLabel", customSubtitleStyleLabel)
-        append(',')
         appendJsonField("forcedLabel", forcedLabel)
         append(',')
         appendJsonField("noneLabel", noneLabel)
@@ -1413,6 +1464,36 @@ internal fun PlayerControlsState.toControlsJson(isFullscreen: Boolean, onImageRe
         appendJsonField("textOpacityLabel", textOpacityLabel)
         append(',')
         appendJsonField("outlineColorLabel", outlineColorLabel)
+        append(',')
+        appendJsonField("fontLabel", fontLabel)
+        append(',')
+        appendJsonField("backgroundColorLabel", backgroundColorLabel)
+        append(',')
+        appendJsonField("backgroundOpacityLabel", backgroundOpacityLabel)
+        append(',')
+        appendJsonField("fontImportLabel", fontImportLabel)
+        append(',')
+        appendJsonField("fontImportHint", fontImportHint)
+        append(',')
+        appendJsonField("fontImportError", fontImportError)
+        append(',')
+        appendJsonField("doneLabel", doneLabel)
+        append(',')
+        appendJsonField("fontRemoveLabel", fontRemoveLabel)
+        append(',')
+        appendJsonField("subtitleFontImportFailed", subtitleFontImportFailed)
+        append(',')
+        appendJsonField("shadowLabel", shadowLabel)
+        append(',')
+        appendJsonField("shadowOpacityLabel", shadowOpacityLabel)
+        append(',')
+        appendJsonField("shadowSizeLabel", shadowSizeLabel)
+        append(',')
+        appendJsonArrayField("subtitleFonts", subtitleFonts) {
+            append("{\"id\":").append(it.id.toJsonString())
+            append(",\"label\":").append(it.label.toJsonString())
+            append('}')
+        }
         append(',')
         appendJsonField("noSubtitleLinesFoundLabel", noSubtitleLinesFoundLabel)
         append(',')
@@ -1599,8 +1680,6 @@ internal fun PlayerControlsState.toControlsJson(isFullscreen: Boolean, onImageRe
         append(',')
         appendJsonField("useCustomSubtitles", useCustomSubtitles)
         append(',')
-        appendJsonField("customSubtitleStylingEnabled", customSubtitleStylingEnabled)
-        append(',')
         appendJsonField("subtitleDelayMs", subtitleDelayMs)
         append(',')
         appendJsonField("hasSelectedAddonSubtitle", hasSelectedAddonSubtitle)
@@ -1626,6 +1705,47 @@ internal fun PlayerControlsState.toControlsJson(isFullscreen: Boolean, onImageRe
         appendJsonField("notificationMessage", notificationMessage)
         append(',')
         appendJsonField("notificationToken", notificationToken)
+        append(',')
+        appendJsonArrayField("badges", badges) {
+            append("{\"name\":").append(it.name.toJsonString())
+            append(",\"imageUrl\":").append(it.imageURL.toJsonString())
+            append(",\"tagColor\":").append(it.tagColor.toJsonString())
+            append(",\"tagStyle\":").append(it.tagStyle.toJsonString())
+            append(",\"borderColor\":").append(it.borderColor.toJsonString())
+            append('}')
+        }
+        append(',')
+        appendJsonArrayField("chapters", chapters) {
+            append("{\"startMs\":").append(it.startMs)
+            append(",\"title\":").append(it.title.toJsonString())
+            append('}')
+        }
+        append(',')
+        appendJsonField("chaptersLabel", chaptersLabel)
+        append(',')
+        appendJsonField("chaptersPanelTitle", chaptersPanelTitle)
+        append(',')
+        appendJsonField("chapterRemainingTemplate", chapterRemainingTemplate)
+        append(',')
+        appendJsonField("autoSyncedLabel", autoSyncedLabel)
+        append(',')
+        appendJsonField("streamInfoLabel", streamInfoLabel)
+        append(',')
+        appendJsonArrayField("streamInfoSections", streamInfoSections) { section ->
+            append("{\"title\":").append(section.title.toJsonString())
+            append(",\"logo\":").append((section.logo ?: "").toJsonString())
+            append(",\"name\":").append((section.name ?: "").toJsonString())
+            append(",\"subtitle\":").append((section.subtitle ?: "").toJsonString())
+            append(",\"description\":").append((section.description ?: "").toJsonString())
+            append(",\"items\":[")
+            section.items.forEachIndexed { index, item ->
+                if (index > 0) append(',')
+                append("{\"label\":").append(item.label.toJsonString())
+                append(",\"value\":").append(item.value.toJsonString())
+                append('}')
+            }
+            append("]}")
+        }
         append(",\"party\":")
         append(partyJson.encodeToString(PlayerControlPartyState.serializer(), party.withWebviewImages(onImageReady)))
         append('}')
@@ -1828,6 +1948,8 @@ private fun StringBuilder.appendSubtitleOptionItemJson(item: PlayerControlSubtit
     appendJsonField("metadata", item.metadata)
     append(',')
     appendJsonField("isSelected", item.isSelected)
+    append(',')
+    appendJsonField("isAutoSynced", item.isAutoSynced)
     append('}')
 }
 
@@ -1857,6 +1979,8 @@ private fun StringBuilder.appendSubtitleStyleJson(style: SubtitleStyleState) {
     append(',')
     appendJsonField("outlineColor", style.outlineColor.toStorageHexString())
     append(',')
+    appendJsonField("backgroundColor", style.backgroundColor.toStorageHexString())
+    append(',')
     appendJsonField("outlineEnabled", style.outlineEnabled)
     append(',')
     appendJsonField("bold", style.bold)
@@ -1864,6 +1988,14 @@ private fun StringBuilder.appendSubtitleStyleJson(style: SubtitleStyleState) {
     appendJsonField("fontSizeSp", style.fontSizeSp)
     append(',')
     appendJsonField("bottomOffset", style.bottomOffset)
+    append(',')
+    appendJsonField("fontId", style.appearance.fontId)
+    append(',')
+    appendJsonField("shadowEnabled", style.appearance.shadowEnabled)
+    append(',')
+    appendJsonField("shadowOpacity", style.appearance.shadowOpacity)
+    append(',')
+    appendJsonField("shadowSize", style.appearance.shadowSize)
     append('}')
 }
 

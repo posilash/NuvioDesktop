@@ -51,6 +51,7 @@ internal actual object PlayerSettingsStorage {
     private const val preferredSubtitleLanguageKey = "preferred_subtitle_language"
     private const val secondaryPreferredSubtitleLanguageKey = "secondary_preferred_subtitle_language"
     private const val subtitleTextColorKey = "subtitle_text_color"
+    private const val subtitleAppearanceKey = "subtitle_appearance"
     private const val subtitleBackgroundColorKey = "subtitle_background_color"
     private const val subtitleOutlineColorKey = "subtitle_outline_color"
     private const val subtitleOutlineEnabledKey = "subtitle_outline_enabled"
@@ -65,9 +66,18 @@ internal actual object PlayerSettingsStorage {
     private const val streamReuseLastLinkEnabledKey = "stream_reuse_last_link_enabled"
     private const val streamReuseLastLinkCacheHoursKey = "stream_reuse_last_link_cache_hours"
     private const val androidPlaybackEngineKey = "android_playback_engine"
+    private const val autoSwitchPlaybackEngineOnErrorKey = "auto_switch_playback_engine_on_error"
     private const val androidLibmpvVideoOutputKey = "android_libmpv_video_output"
     private const val androidLibmpvHardwareDecodingEnabledKey = "android_libmpv_hardware_decoding_enabled"
     private const val androidLibmpvYuv420pEnabledKey = "android_libmpv_yuv420p_enabled"
+    private const val androidExoChaptersEnabledKey = "android_exo_chapters_enabled"
+    private const val rememberAudioDelayPerDeviceKey = "remember_audio_delay_per_device"
+    private const val persistAudioAmplificationKey = "persist_audio_amplification"
+    private const val audioAmplificationDbKey = "audio_amplification_db"
+    private const val downmixEnabledKey = "downmix_enabled"
+    private const val audioOutputChannelsKey = "audio_output_channels"
+    private const val maintainOriginalAudioOnDownmixKey = "maintain_original_audio_on_downmix"
+    private const val centerMixLevelDbKey = "center_mix_level_db"
     private const val decoderPriorityKey = "decoder_priority"
     private const val mapDV7ToHevcKey = "map_dv7_to_hevc"
     private const val tunnelingEnabledKey = "tunneling_enabled"
@@ -92,6 +102,8 @@ internal actual object PlayerSettingsStorage {
     private const val nextEpisodeThresholdMinutesBeforeEndKey = "next_episode_threshold_minutes_before_end_v2"
     private const val useLibassKey = "use_libass"
     private const val libassRenderTypeKey = "libass_render_type"
+    private const val libassRenderScaleKey = "libass_render_scale"
+    private const val libassRenderModeKey = "libass_render_mode"
     private const val iosVideoOutputPresetKey = "ios_video_output_preset"
     private const val iosToneMappingModeKey = "ios_tone_mapping_mode"
     private const val iosTargetPrimariesKey = "ios_target_primaries"
@@ -127,6 +139,7 @@ internal actual object PlayerSettingsStorage {
         preferredSubtitleLanguageKey,
         secondaryPreferredSubtitleLanguageKey,
         subtitleTextColorKey,
+        subtitleAppearanceKey,
         subtitleBackgroundColorKey,
         subtitleOutlineColorKey,
         subtitleOutlineEnabledKey,
@@ -141,9 +154,18 @@ internal actual object PlayerSettingsStorage {
         streamReuseLastLinkEnabledKey,
         streamReuseLastLinkCacheHoursKey,
         androidPlaybackEngineKey,
+        autoSwitchPlaybackEngineOnErrorKey,
         androidLibmpvVideoOutputKey,
         androidLibmpvHardwareDecodingEnabledKey,
         androidLibmpvYuv420pEnabledKey,
+        androidExoChaptersEnabledKey,
+        rememberAudioDelayPerDeviceKey,
+        persistAudioAmplificationKey,
+        audioAmplificationDbKey,
+        downmixEnabledKey,
+        audioOutputChannelsKey,
+        maintainOriginalAudioOnDownmixKey,
+        centerMixLevelDbKey,
         decoderPriorityKey,
         mapDV7ToHevcKey,
         tunnelingEnabledKey,
@@ -180,6 +202,8 @@ internal actual object PlayerSettingsStorage {
         nextEpisodeThresholdMinutesBeforeEndKey,
         useLibassKey,
         libassRenderTypeKey,
+        libassRenderScaleKey,
+        libassRenderModeKey,
         iosVideoOutputPresetKey,
         iosToneMappingModeKey,
         iosTargetPrimariesKey,
@@ -267,6 +291,8 @@ internal actual object PlayerSettingsStorage {
     actual fun saveSecondaryPreferredSubtitleLanguage(language: String?) = saveOptionalString(secondaryPreferredSubtitleLanguageKey, language)
     actual fun loadSubtitleTextColor(): String? = loadString(subtitleTextColorKey)
     actual fun saveSubtitleTextColor(colorHex: String) = saveString(subtitleTextColorKey, colorHex)
+    actual fun loadSubtitleAppearance(): String? = loadString(subtitleAppearanceKey)
+    actual fun saveSubtitleAppearance(value: String) = saveString(subtitleAppearanceKey, value)
     actual fun loadSubtitleBackgroundColor(): String? = loadString(subtitleBackgroundColorKey)
     actual fun saveSubtitleBackgroundColor(colorHex: String) = saveString(subtitleBackgroundColorKey, colorHex)
     actual fun loadSubtitleOutlineColor(): String? = loadString(subtitleOutlineColorKey)
@@ -295,6 +321,8 @@ internal actual object PlayerSettingsStorage {
     actual fun saveStreamReuseLastLinkCacheHours(hours: Int) = saveInt(streamReuseLastLinkCacheHoursKey, hours)
     actual fun loadAndroidPlaybackEngine(): String? = loadString(androidPlaybackEngineKey)
     actual fun saveAndroidPlaybackEngine(engine: String) = saveString(androidPlaybackEngineKey, engine)
+    actual fun loadAutoSwitchPlaybackEngineOnError(): Boolean? = loadBoolean(autoSwitchPlaybackEngineOnErrorKey)
+    actual fun saveAutoSwitchPlaybackEngineOnError(enabled: Boolean) = saveBoolean(autoSwitchPlaybackEngineOnErrorKey, enabled)
     actual fun loadAndroidLibmpvVideoOutput(): String? = loadString(androidLibmpvVideoOutputKey)
     actual fun saveAndroidLibmpvVideoOutput(output: String) = saveString(androidLibmpvVideoOutputKey, output)
     actual fun loadAndroidLibmpvHardwareDecodingEnabled(): Boolean? = loadBoolean(androidLibmpvHardwareDecodingEnabledKey)
@@ -302,6 +330,22 @@ internal actual object PlayerSettingsStorage {
         saveBoolean(androidLibmpvHardwareDecodingEnabledKey, enabled)
     actual fun loadAndroidLibmpvYuv420pEnabled(): Boolean? = loadBoolean(androidLibmpvYuv420pEnabledKey)
     actual fun saveAndroidLibmpvYuv420pEnabled(enabled: Boolean) = saveBoolean(androidLibmpvYuv420pEnabledKey, enabled)
+    actual fun loadAndroidExoChaptersEnabled(): Boolean? = loadBoolean(androidExoChaptersEnabledKey)
+    actual fun saveAndroidExoChaptersEnabled(enabled: Boolean) = saveBoolean(androidExoChaptersEnabledKey, enabled)
+    actual fun loadRememberAudioDelayPerDevice(): Boolean? = loadBoolean(rememberAudioDelayPerDeviceKey)
+    actual fun saveRememberAudioDelayPerDevice(enabled: Boolean) = saveBoolean(rememberAudioDelayPerDeviceKey, enabled)
+    actual fun loadPersistAudioAmplification(): Boolean? = loadBoolean(persistAudioAmplificationKey)
+    actual fun savePersistAudioAmplification(enabled: Boolean) = saveBoolean(persistAudioAmplificationKey, enabled)
+    actual fun loadAudioAmplificationDb(): Int? = loadInt(audioAmplificationDbKey)
+    actual fun saveAudioAmplificationDb(db: Int) = saveInt(audioAmplificationDbKey, db)
+    actual fun loadDownmixEnabled(): Boolean? = loadBoolean(downmixEnabledKey)
+    actual fun saveDownmixEnabled(enabled: Boolean) = saveBoolean(downmixEnabledKey, enabled)
+    actual fun loadAudioOutputChannels(): String? = loadString(audioOutputChannelsKey)
+    actual fun saveAudioOutputChannels(value: String) = saveString(audioOutputChannelsKey, value)
+    actual fun loadMaintainOriginalAudioOnDownmix(): Boolean? = loadBoolean(maintainOriginalAudioOnDownmixKey)
+    actual fun saveMaintainOriginalAudioOnDownmix(enabled: Boolean) = saveBoolean(maintainOriginalAudioOnDownmixKey, enabled)
+    actual fun loadCenterMixLevelDb(): Int? = loadInt(centerMixLevelDbKey)
+    actual fun saveCenterMixLevelDb(db: Int) = saveInt(centerMixLevelDbKey, db)
     actual fun loadDecoderPriority(): Int? = loadInt(decoderPriorityKey)
     actual fun saveDecoderPriority(priority: Int) = saveInt(decoderPriorityKey, priority)
     actual fun loadMapDV7ToHevc(): Boolean? = loadBoolean(mapDV7ToHevcKey)
@@ -352,6 +396,10 @@ internal actual object PlayerSettingsStorage {
     actual fun saveUseLibass(enabled: Boolean) = saveBoolean(useLibassKey, enabled)
     actual fun loadLibassRenderType(): String? = loadString(libassRenderTypeKey)
     actual fun saveLibassRenderType(renderType: String) = saveString(libassRenderTypeKey, renderType)
+    actual fun loadLibassRenderScale(): String? = loadString(libassRenderScaleKey)
+    actual fun saveLibassRenderScale(scale: String) = saveString(libassRenderScaleKey, scale)
+    actual fun loadLibassRenderMode(): String? = loadString(libassRenderModeKey)
+    actual fun saveLibassRenderMode(mode: String) = saveString(libassRenderModeKey, mode)
     actual fun loadIosVideoOutputPreset(): String? = loadString(iosVideoOutputPresetKey)
     actual fun saveIosVideoOutputPreset(preset: String) = saveString(iosVideoOutputPresetKey, preset)
     actual fun loadIosToneMappingMode(): String? = loadString(iosToneMappingModeKey)
@@ -417,6 +465,7 @@ internal actual object PlayerSettingsStorage {
         loadPreferredSubtitleLanguage()?.let { put(preferredSubtitleLanguageKey, encodeSyncString(it)) }
         loadSecondaryPreferredSubtitleLanguage()?.let { put(secondaryPreferredSubtitleLanguageKey, encodeSyncString(it)) }
         loadSubtitleTextColor()?.let { put(subtitleTextColorKey, encodeSyncString(it)) }
+        loadSubtitleAppearance()?.let { put(subtitleAppearanceKey, encodeSyncString(it)) }
         loadSubtitleBackgroundColor()?.let { put(subtitleBackgroundColorKey, encodeSyncString(it)) }
         loadSubtitleOutlineColor()?.let { put(subtitleOutlineColorKey, encodeSyncString(it)) }
         loadSubtitleOutlineEnabled()?.let { put(subtitleOutlineEnabledKey, encodeSyncBoolean(it)) }
@@ -431,11 +480,20 @@ internal actual object PlayerSettingsStorage {
         loadStreamReuseLastLinkEnabled()?.let { put(streamReuseLastLinkEnabledKey, encodeSyncBoolean(it)) }
         loadStreamReuseLastLinkCacheHours()?.let { put(streamReuseLastLinkCacheHoursKey, encodeSyncInt(it)) }
         loadAndroidPlaybackEngine()?.let { put(androidPlaybackEngineKey, encodeSyncString(it)) }
+        loadAutoSwitchPlaybackEngineOnError()?.let { put(autoSwitchPlaybackEngineOnErrorKey, encodeSyncBoolean(it)) }
         loadAndroidLibmpvVideoOutput()?.let { put(androidLibmpvVideoOutputKey, encodeSyncString(it)) }
         loadAndroidLibmpvHardwareDecodingEnabled()?.let {
             put(androidLibmpvHardwareDecodingEnabledKey, encodeSyncBoolean(it))
         }
         loadAndroidLibmpvYuv420pEnabled()?.let { put(androidLibmpvYuv420pEnabledKey, encodeSyncBoolean(it)) }
+        loadAndroidExoChaptersEnabled()?.let { put(androidExoChaptersEnabledKey, encodeSyncBoolean(it)) }
+        loadRememberAudioDelayPerDevice()?.let { put(rememberAudioDelayPerDeviceKey, encodeSyncBoolean(it)) }
+        loadPersistAudioAmplification()?.let { put(persistAudioAmplificationKey, encodeSyncBoolean(it)) }
+        loadAudioAmplificationDb()?.let { put(audioAmplificationDbKey, encodeSyncInt(it)) }
+        loadDownmixEnabled()?.let { put(downmixEnabledKey, encodeSyncBoolean(it)) }
+        loadAudioOutputChannels()?.let { put(audioOutputChannelsKey, encodeSyncString(it)) }
+        loadMaintainOriginalAudioOnDownmix()?.let { put(maintainOriginalAudioOnDownmixKey, encodeSyncBoolean(it)) }
+        loadCenterMixLevelDb()?.let { put(centerMixLevelDbKey, encodeSyncInt(it)) }
         loadDecoderPriority()?.let { put(decoderPriorityKey, encodeSyncInt(it)) }
         loadMapDV7ToHevc()?.let { put(mapDV7ToHevcKey, encodeSyncBoolean(it)) }
         loadTunnelingEnabled()?.let { put(tunnelingEnabledKey, encodeSyncBoolean(it)) }
@@ -463,6 +521,8 @@ internal actual object PlayerSettingsStorage {
         loadNextEpisodeThresholdMinutesBeforeEnd()?.let { put(nextEpisodeThresholdMinutesBeforeEndKey, encodeSyncFloat(it)) }
         loadUseLibass()?.let { put(useLibassKey, encodeSyncBoolean(it)) }
         loadLibassRenderType()?.let { put(libassRenderTypeKey, encodeSyncString(it)) }
+        loadLibassRenderScale()?.let { put(libassRenderScaleKey, encodeSyncString(it)) }
+        loadLibassRenderMode()?.let { put(libassRenderModeKey, encodeSyncString(it)) }
         loadIosVideoOutputPreset()?.let { put(iosVideoOutputPresetKey, encodeSyncString(it)) }
         loadIosToneMappingMode()?.let { put(iosToneMappingModeKey, encodeSyncString(it)) }
         loadIosTargetPrimaries()?.let { put(iosTargetPrimariesKey, encodeSyncString(it)) }
@@ -500,6 +560,7 @@ internal actual object PlayerSettingsStorage {
         payload.decodeSyncString(preferredSubtitleLanguageKey)?.let(::savePreferredSubtitleLanguage)
         payload.decodeSyncString(secondaryPreferredSubtitleLanguageKey)?.let(::saveSecondaryPreferredSubtitleLanguage)
         payload.decodeSyncString(subtitleTextColorKey)?.let(::saveSubtitleTextColor)
+        payload.decodeSyncString(subtitleAppearanceKey)?.let(::saveSubtitleAppearance)
         payload.decodeSyncString(subtitleBackgroundColorKey)?.let(::saveSubtitleBackgroundColor)
         payload.decodeSyncString(subtitleOutlineColorKey)?.let(::saveSubtitleOutlineColor)
         payload.decodeSyncBoolean(subtitleOutlineEnabledKey)?.let(::saveSubtitleOutlineEnabled)
@@ -514,10 +575,19 @@ internal actual object PlayerSettingsStorage {
         payload.decodeSyncBoolean(streamReuseLastLinkEnabledKey)?.let(::saveStreamReuseLastLinkEnabled)
         payload.decodeSyncInt(streamReuseLastLinkCacheHoursKey)?.let(::saveStreamReuseLastLinkCacheHours)
         payload.decodeSyncString(androidPlaybackEngineKey)?.let(::saveAndroidPlaybackEngine)
+        payload.decodeSyncBoolean(autoSwitchPlaybackEngineOnErrorKey)?.let(::saveAutoSwitchPlaybackEngineOnError)
         payload.decodeSyncString(androidLibmpvVideoOutputKey)?.let(::saveAndroidLibmpvVideoOutput)
         payload.decodeSyncBoolean(androidLibmpvHardwareDecodingEnabledKey)
             ?.let(::saveAndroidLibmpvHardwareDecodingEnabled)
         payload.decodeSyncBoolean(androidLibmpvYuv420pEnabledKey)?.let(::saveAndroidLibmpvYuv420pEnabled)
+        payload.decodeSyncBoolean(androidExoChaptersEnabledKey)?.let(::saveAndroidExoChaptersEnabled)
+        payload.decodeSyncBoolean(rememberAudioDelayPerDeviceKey)?.let(::saveRememberAudioDelayPerDevice)
+        payload.decodeSyncBoolean(persistAudioAmplificationKey)?.let(::savePersistAudioAmplification)
+        payload.decodeSyncInt(audioAmplificationDbKey)?.let(::saveAudioAmplificationDb)
+        payload.decodeSyncBoolean(downmixEnabledKey)?.let(::saveDownmixEnabled)
+        payload.decodeSyncString(audioOutputChannelsKey)?.let(::saveAudioOutputChannels)
+        payload.decodeSyncBoolean(maintainOriginalAudioOnDownmixKey)?.let(::saveMaintainOriginalAudioOnDownmix)
+        payload.decodeSyncInt(centerMixLevelDbKey)?.let(::saveCenterMixLevelDb)
         payload.decodeSyncInt(decoderPriorityKey)?.let(::saveDecoderPriority)
         payload.decodeSyncBoolean(mapDV7ToHevcKey)?.let(::saveMapDV7ToHevc)
         payload.decodeSyncBoolean(tunnelingEnabledKey)?.let(::saveTunnelingEnabled)
@@ -546,6 +616,8 @@ internal actual object PlayerSettingsStorage {
         payload.decodeSyncFloat(nextEpisodeThresholdMinutesBeforeEndKey)?.let(::saveNextEpisodeThresholdMinutesBeforeEnd)
         payload.decodeSyncBoolean(useLibassKey)?.let(::saveUseLibass)
         payload.decodeSyncString(libassRenderTypeKey)?.let(::saveLibassRenderType)
+        payload.decodeSyncString(libassRenderScaleKey)?.let(::saveLibassRenderScale)
+        payload.decodeSyncString(libassRenderModeKey)?.let(::saveLibassRenderMode)
         payload.decodeSyncString(iosVideoOutputPresetKey)?.let(::saveIosVideoOutputPreset)
         payload.decodeSyncString(iosToneMappingModeKey)?.let(::saveIosToneMappingMode)
         payload.decodeSyncString(iosTargetPrimariesKey)?.let(::saveIosTargetPrimaries)

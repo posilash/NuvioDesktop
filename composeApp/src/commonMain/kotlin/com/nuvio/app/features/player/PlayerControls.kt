@@ -61,6 +61,10 @@ import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalLayoutDirection
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.graphics.Brush
+import androidx.compose.material.icons.automirrored.rounded.Toc
+import androidx.compose.ui.draw.drawWithContent
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.painter.Painter
 import androidx.compose.ui.graphics.vector.ImageVector
@@ -79,6 +83,7 @@ import com.nuvio.app.core.ui.accentBrush
 import com.nuvio.app.core.ui.appIconPainter
 import com.nuvio.app.core.ui.gradientMask
 import com.nuvio.app.core.ui.nuvioTypeScale
+import com.nuvio.app.features.streams.StreamBadge
 import nuvio.composeapp.generated.resources.*
 import org.jetbrains.compose.resources.stringResource
 import com.nuvio.app.core.i18n.localizedEpisodeTitle
@@ -100,6 +105,7 @@ internal fun PlayerControlsShell(
     showRemainingTime: Boolean = false,
     onRuntimeClick: () -> Unit = {},
     releaseInfo: String? = null,
+    badges: List<StreamBadge> = emptyList(),
     hideDetails: Boolean = false,
     onNextEpisodeClick: (() -> Unit)? = null,
     onInteraction: () -> Unit = {},
@@ -118,6 +124,8 @@ internal fun PlayerControlsShell(
     onVideoSettingsClick: (() -> Unit)? = null,
     onSourcesClick: (() -> Unit)? = null,
     onEpisodesClick: (() -> Unit)? = null,
+    chapters: List<PlayerChapter> = emptyList(),
+    onChaptersClick: (() -> Unit)? = null,
     onOpenInExternalPlayer: (() -> Unit)? = null,
     onSubmitIntroClick: (() -> Unit)? = null,
     onSwitchEngineClick: (() -> Unit)? = null,
@@ -129,7 +137,54 @@ internal fun PlayerControlsShell(
     onScrubFinished: (Long) -> Unit,
     horizontalSafePadding: androidx.compose.ui.unit.Dp,
     modifier: Modifier = Modifier,
+    foldLayout: Boolean = false,
+    gestureController: PlayerGestureController? = null,
+    onWake: () -> Unit = {},
 ) {
+    if (foldLayout) {
+        FoldControls(
+            title = title,
+            seasonNumber = seasonNumber,
+            episodeNumber = episodeNumber,
+            episodeTitle = episodeTitle,
+            playbackSnapshot = playbackSnapshot,
+            displayedPositionMs = displayedPositionMs,
+            badges = badges,
+            resizeMode = resizeMode,
+            showRemainingTime = showRemainingTime,
+            onRuntimeClick = onRuntimeClick,
+            onInteraction = onInteraction,
+            onBack = onBack,
+            onLockToggle = onLockToggle,
+            onPartyClick = onPartyClick,
+            partyActive = partyActive,
+            onNextEpisodeClick = onNextEpisodeClick,
+            onTogglePlayback = onTogglePlayback,
+            onSeekBack = onSeekBack,
+            onSeekForward = onSeekForward,
+            onScrubChange = onScrubChange,
+            onScrubFinished = onScrubFinished,
+            onSubtitleClick = onSubtitleClick,
+            onAudioClick = onAudioClick,
+            onSourcesClick = onSourcesClick,
+            onEpisodesClick = onEpisodesClick,
+            onChaptersClick = onChaptersClick,
+            chapters = chapters,
+            onSpeedClick = onSpeedClick,
+            onResizeModeClick = onResizeModeClick,
+            onVideoSettingsClick = onVideoSettingsClick,
+            onOpenInExternalPlayer = onOpenInExternalPlayer,
+            onStreamInfoClick = onStreamInfoClick,
+            onSubmitIntroClick = onSubmitIntroClick,
+            onSwitchEngineClick = onSwitchEngineClick,
+            gestureController = gestureController,
+            dimmed = !showPlaybackControls,
+            onWake = onWake,
+            horizontalSafePadding = horizontalSafePadding,
+            modifier = modifier,
+        )
+        return
+    }
     val density = LocalDensity.current
     var timelineHeight by remember { mutableStateOf(0.dp) }
     BoxWithConstraints(modifier = modifier.fillMaxSize()) {
@@ -212,6 +267,7 @@ internal fun PlayerControlsShell(
                         onBack = onBack,
                         onPartyClick = onPartyClick,
                         partyActive = partyActive,
+                        onSwitchEngineClick = onSwitchEngineClick,
                         modifier = Modifier
                             .align(Alignment.TopEnd)
                             .windowInsetsPadding(WindowInsets.safeContent.only(WindowInsetsSides.Top))
@@ -267,6 +323,8 @@ internal fun PlayerControlsShell(
                     onAudioClick = onAudioClick,
                     onSourcesClick = onSourcesClick,
                     onEpisodesClick = onEpisodesClick,
+                    chapters = chapters,
+                    onChaptersClick = onChaptersClick,
                     modifier = Modifier
                         .align(Alignment.BottomCenter)
                         .fillMaxWidth()
@@ -290,12 +348,11 @@ internal fun PlayerControlsShell(
                             episodeNumber = episodeNumber,
                             episodeTitle = episodeTitle,
                             releaseInfo = releaseInfo,
-                            streamTitle = streamTitle,
-                            providerName = providerName,
-                            isPlaying = playbackSnapshot.isPlaying,
                             metrics = metrics,
+                            badges = badges,
                         )
                     }
+                    PlayerChapterTitle(chapters = chapters, positionMs = displayedPositionMs)
                     PlayerTimeline(
                         snapshot = playbackSnapshot,
                         displayedPositionMs = displayedPositionMs,
@@ -304,6 +361,7 @@ internal fun PlayerControlsShell(
                             onInteraction()
                             onScrubFinished(it)
                         },
+                        chapters = chapters,
                     )
                     PlayerControlActions(
                         playbackSnapshot = playbackSnapshot,
@@ -316,8 +374,8 @@ internal fun PlayerControlsShell(
                         onAudioClick = onAudioClick,
                         onSourcesClick = onSourcesClick,
                         onEpisodesClick = onEpisodesClick,
+                        onChaptersClick = onChaptersClick,
                         onNextEpisodeClick = onNextEpisodeClick,
-                        onSwitchEngineClick = onSwitchEngineClick,
                         onSpeedClick = onSpeedClick,
                         onResizeModeClick = onResizeModeClick,
                         onVideoSettingsClick = onVideoSettingsClick,
@@ -640,6 +698,8 @@ private fun ProgressControls(
     onAudioClick: () -> Unit,
     onSourcesClick: (() -> Unit)? = null,
     onEpisodesClick: (() -> Unit)? = null,
+    chapters: List<PlayerChapter> = emptyList(),
+    onChaptersClick: (() -> Unit)? = null,
     modifier: Modifier = Modifier,
 ) {
     val aspectRatioPainter = appIconPainter(AppIconResource.PlayerAspectRatio)
@@ -649,12 +709,18 @@ private fun ProgressControls(
     val episodesPainter = appIconPainter(AppIconResource.PlayerEpisodes)
 
     Column(modifier = modifier) {
+        PlayerChapterTitle(
+            chapters = chapters,
+            positionMs = displayedPositionMs,
+            modifier = Modifier.padding(horizontal = 14.dp),
+        )
         PlayerSeekBar(
             durationMs = playbackSnapshot.durationMs,
             displayedPositionMs = displayedPositionMs,
             metrics = metrics,
             onScrubChange = onScrubChange,
             onScrubFinished = onScrubFinished,
+            chapters = chapters,
         )
         Row(
             modifier = Modifier.fillMaxWidth(),
@@ -694,6 +760,13 @@ private fun ProgressControls(
                         painter = audioPainter,
                         onClick = onAudioClick,
                     )
+                    if (onChaptersClick != null) {
+                        PlayerActionPillButton(
+                            label = stringResource(Res.string.compose_player_chapters),
+                            icon = Icons.AutoMirrored.Rounded.Toc,
+                            onClick = onChaptersClick,
+                        )
+                    }
                     if (onSourcesClick != null) {
                         PlayerActionPillButton(
                             label = stringResource(Res.string.compose_player_sources),
@@ -722,12 +795,15 @@ internal fun PlayerSeekBar(
     onScrubChange: (Long) -> Unit,
     onScrubFinished: (Long) -> Unit,
     modifier: Modifier = Modifier,
+    chapters: List<PlayerChapter> = emptyList(),
 ) {
     val seekDurationMs = durationMs.coerceAtLeast(1L)
     val seekDescription = stringResource(Res.string.player_seek_position)
     // A tap fires change and finish in one frame, before displayedPositionMs
     // recomposes, so finishing with it seeks straight back. Track the scrub here.
     val lastScrubbedMs = remember { mutableStateOf(-1L) }
+    val seekState = remember(seekDurationMs) { SliderState(trackRange = 0f..seekDurationMs.toFloat()) }
+    seekState.value = displayedPositionMs.coerceIn(0L, seekDurationMs).toFloat()
     Column(modifier = modifier) {
         Slider(
             modifier = Modifier
@@ -735,7 +811,7 @@ internal fun PlayerSeekBar(
                 .height(metrics.sliderTouchHeight)
                 .graphicsLayer(scaleY = metrics.sliderScaleY)
                 .semantics { contentDescription = seekDescription },
-            value = displayedPositionMs.coerceIn(0L, seekDurationMs).toFloat(),
+            state = seekState,
             onValueChange = { value ->
                 lastScrubbedMs.value = value.toLong()
                 onScrubChange(value.toLong())
@@ -746,8 +822,7 @@ internal fun PlayerSeekBar(
                 onScrubFinished(target.coerceIn(0L, seekDurationMs))
             },
             enabled = durationMs > 0L,
-            valueRange = 0f..seekDurationMs.toFloat(),
-            track = { sliderState -> PlayerProgressTrack(sliderState) },
+            track = { sliderState -> PlayerProgressTrack(sliderState, chapters, durationMs) },
         )
         Row(
             modifier = Modifier
@@ -764,7 +839,11 @@ internal fun PlayerSeekBar(
 }
 
 @Composable
-private fun PlayerProgressTrack(sliderState: SliderState) {
+private fun PlayerProgressTrack(
+    sliderState: SliderState,
+    chapters: List<PlayerChapter> = emptyList(),
+    durationMs: Long = 0L,
+) {
     val palette = MaterialTheme.themePalette
     val inactiveTrackColors = SliderDefaults.colors(
         activeTrackColor = Color.Transparent,
@@ -777,7 +856,22 @@ private fun PlayerProgressTrack(sliderState: SliderState) {
         disabledInactiveTrackColor = Color.Transparent,
     )
 
-    Box {
+    Box(
+        modifier = Modifier.drawWithContent {
+            drawContent()
+            if (durationMs <= 0L) return@drawWithContent
+            val markWidth = 2.dp.toPx()
+            chapters.forEach { chapter ->
+                val fraction = chapter.startMs.toFloat() / durationMs
+                if (fraction <= 0f || fraction >= 1f) return@forEach
+                drawRect(
+                    color = Color.Black.copy(alpha = 0.6f),
+                    topLeft = Offset(size.width * fraction - markWidth / 2f, 0f),
+                    size = Size(markWidth, size.height),
+                )
+            }
+        },
+    ) {
         SliderDefaults.Track(
             sliderState = sliderState,
             colors = inactiveTrackColors,

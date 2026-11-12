@@ -17,6 +17,7 @@ import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import nuvio.composeapp.generated.resources.Res
+import nuvio.composeapp.generated.resources.player_engine_switching_automatic_message
 import nuvio.composeapp.generated.resources.player_engine_switching_manual_message
 import kotlin.math.abs
 import kotlin.time.TimeSource
@@ -63,6 +64,14 @@ internal val PlayerScreenRuntime.activePlaybackKey: PlaybackKey
         seasonNumber = activeSeasonNumber,
         episodeNumber = activeEpisodeNumber,
         playbackEngine = playbackEngineOverride,
+    )
+
+internal val PlayerScreenRuntime.sourcePlaybackKey: PlaybackKey
+    get() = PlaybackKey(
+        sourceIdentity = activePlaybackIdentity,
+        videoId = activeVideoId,
+        seasonNumber = activeSeasonNumber,
+        episodeNumber = activeEpisodeNumber,
     )
 
 internal val PlayerScreenRuntime.playbackSession: WatchProgressPlaybackSession
@@ -126,6 +135,16 @@ internal fun PlayerScreenRuntime.currentLaunch(launch: PlayerLaunch): PlayerLaun
 }
 
 internal fun PlayerScreenRuntime.resetIdentityStateIfNeeded() {
+    val sourceIdentity = sourcePlaybackKey
+    if (lastResetSourcePlaybackIdentity != sourceIdentity) {
+        lastResetSourcePlaybackIdentity = sourceIdentity
+        engineFailoverTriggered = false
+        engineFailoverDisarmed = false
+        engineFailoverSourceIdentity = null
+        playbackEngineOverride = null
+        autoFetchedAddonSubtitlesForKey = null
+    }
+
     val identity = activePlaybackKey
     if (lastResetPlaybackIdentity != identity) {
         lastResetPlaybackIdentity = identity
@@ -138,7 +157,6 @@ internal fun PlayerScreenRuntime.resetIdentityStateIfNeeded() {
         lastProgressPersistEpochMs = 0L
         previousIsPlaying = false
         pendingSeekScrobbleRestart = false
-        autoFetchedAddonSubtitlesForKey = null
         resetTrackSelectionState()
     }
 
@@ -167,6 +185,14 @@ private fun PlayerScreenRuntime.resetTrackSelectionState() {
     selectedSubtitleIndex = -1
     selectedAddonSubtitleId = null
     useCustomSubtitles = false
+}
+
+internal fun PlayerScreenRuntime.resetAddonSubtitlesIfSourceChanged() {
+    val sourceIdentity = sourcePlaybackKey
+    if (lastAddonSubtitleSourceIdentity == sourceIdentity) return
+    lastAddonSubtitleSourceIdentity = sourceIdentity
+    SubtitleRepository.clear()
+    autoFetchedAddonSubtitlesForKey = null
 }
 
 internal fun PlayerScreenRuntime.currentPlaybackProgressPercent(
@@ -437,21 +463,79 @@ internal fun PlayerScreenRuntime.persistPlaybackProgressTick() {
     )
 }
 
+internal val AndroidPlaybackEngine.switchTarget: AndroidPlaybackEngine
+    get() = if (this == AndroidPlaybackEngine.Libmpv) AndroidPlaybackEngine.ExoPlayer else AndroidPlaybackEngine.Libmpv
+
 internal fun PlayerScreenRuntime.switchPlaybackEngine() {
-    val engine = playerController?.playbackEngine ?: return
-    val target = if (engine == AndroidPlaybackEngine.Libmpv) AndroidPlaybackEngine.ExoPlayer else AndroidPlaybackEngine.Libmpv
+    val target = playerController?.playbackEngine?.switchTarget ?: return
     flushWatchProgress()
     if (initialSeekApplied) {
         activeInitialPositionMs = playbackSnapshot.positionMs.coerceAtLeast(0L)
         activeInitialProgressFraction = null
     }
+    // Capture the current track selection so it can be restored on the new engine.
+    rememberCurrentTrackPreferenceForEngineSwitch(target)
     playbackEngineOverride = target
+    // A manual switch is an explicit user decision: never let the automatic engine
+    // failover drag the user back to the engine they just switched away from.
+    engineFailoverDisarmed = true
     showGestureFeedback(
         GestureFeedbackState(
             messageRes = Res.string.player_engine_switching_manual_message,
             messageArgs = listOf(target.label),
         ),
     )
+}
+
+internal fun PlayerScreenRuntime.refreshStreamInfo() {
+    refreshTracks()
+    val controller = playerController ?: return
+    scope.launch { streamMediaInfo = controller.getMediaInfo() }
+}
+
+/**
+ * Switches to the opposite playback engine after a playback error, when the
+ * "auto-switch engine on playback error" setting is enabled. Applies whichever engine is
+ * selected; fires at most once per source, after the engine's own retries, and never after a
+ * manual engine switch.
+ *
+ * @return true when the failover was started and the caller should swallow the error.
+ */
+internal fun PlayerScreenRuntime.maybeFailoverPlaybackEngine(
+    resolvedAutoEngine: AndroidPlaybackEngine?,
+): Boolean {
+    if (!playerSettingsUiState.autoSwitchPlaybackEngineOnError) return false
+    if (engineFailoverDisarmed) return false
+    val sourceIdentity = activePlaybackIdentity
+    if (engineFailoverSourceIdentity == sourceIdentity) return false
+
+    val current = playerController?.playbackEngine
+        ?: playbackEngineOverride
+        ?: resolvedAutoEngine
+        ?: playerSettingsUiState.androidPlaybackEngine
+    val target = if (current == AndroidPlaybackEngine.Libmpv) {
+        AndroidPlaybackEngine.ExoPlayer
+    } else {
+        AndroidPlaybackEngine.Libmpv
+    }
+
+    engineFailoverTriggered = true
+    engineFailoverSourceIdentity = sourceIdentity
+    flushWatchProgress()
+    if (initialSeekApplied) {
+        activeInitialPositionMs = playbackSnapshot.positionMs.coerceAtLeast(0L)
+        activeInitialProgressFraction = null
+    }
+    // Capture the current track selection so it can be restored on the new engine.
+    rememberCurrentTrackPreferenceForEngineSwitch(target)
+    playbackEngineOverride = target
+    showGestureFeedback(
+        GestureFeedbackState(
+            messageRes = Res.string.player_engine_switching_automatic_message,
+            messageArgs = listOf(target.label),
+        ),
+    )
+    return true
 }
 
 internal fun PlayerScreenRuntime.openStreamInfo() {

@@ -92,7 +92,9 @@ internal object NativePlayerBridge {
     external fun speed(handle: Long): Float
     external fun audioTracksJson(handle: Long): String
     external fun subtitleTracksJson(handle: Long): String
+    external fun stringProperty(handle: Long, name: String): String
     external fun selectAudioTrack(handle: Long, trackId: Int)
+    external fun setAudioLanguages(handle: Long, languages: String)
     external fun selectSubtitleTrack(handle: Long, trackId: Int)
     external fun addSubtitleUrl(handle: Long, url: String)
     external fun clearExternalSubtitles(handle: Long)
@@ -114,6 +116,7 @@ internal object NativePlayerBridge {
     )
     external fun setMacosWindowFullscreen(windowViewPtr: Long, fullscreen: Boolean)
 
+    external fun setSubtitleVisible(handle: Long, visible: Boolean)
     external fun setSubtitleDelayMs(handle: Long, delayMs: Int)
     external fun applySubtitleStyle(
         handle: Long,
@@ -126,6 +129,13 @@ internal object NativePlayerBridge {
         subPos: Int,
         useLibass: Boolean,
         stripSdh: Boolean,
+    )
+    external fun setSubtitleAppearance(
+        handle: Long,
+        font: String,
+        fontsDir: String,
+        shadowColor: String,
+        shadowOffset: Float,
     )
     external fun warmupWebView2(controlsPageUrl: String): Boolean
     external fun shutdownWebView2Warmup()

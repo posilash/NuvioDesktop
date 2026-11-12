@@ -11,6 +11,8 @@ import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.calculateEndPadding
+import androidx.compose.foundation.layout.calculateStartPadding
 import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
@@ -22,6 +24,7 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -52,8 +55,11 @@ import com.nuvio.app.core.ui.expandingWideArtworkWidthDp
 import com.nuvio.app.core.ui.dominantBackdropBlendColor
 import com.nuvio.app.core.ui.nuvioDesktopDragScroll
 import com.kmpalette.extensions.painter.rememberPainterDominantColorState
+import androidx.compose.ui.platform.LocalLayoutDirection
 import com.nuvio.app.core.ui.platformPhysicalTopInset
 import com.nuvio.app.core.ui.shimmer
+import com.nuvio.app.core.ui.LocalOnBackdrop
+import com.nuvio.app.core.ui.LocalVerticalBarPadding
 import com.nuvio.app.isIos
 import com.nuvio.app.isDesktop
 import dev.chrisbanes.haze.HazeInputScale
@@ -62,6 +68,7 @@ import dev.chrisbanes.haze.hazeSource
 import dev.chrisbanes.haze.rememberHazeState
 import nuvio.composeapp.generated.resources.*
 import org.jetbrains.compose.resources.stringResource
+import com.nuvio.app.core.i18n.localizedEpisodeTitle
 
 @Composable
 internal fun TabletStreamsLayout(
@@ -382,11 +389,14 @@ private fun LegacyTabletStreamsLayout(
             )
         }
 
+        val verticalBar = LocalVerticalBarPadding.current
+        val layoutDirection = LocalLayoutDirection.current
         Row(modifier = Modifier.fillMaxSize()) {
             Box(
                 modifier = Modifier
                     .weight(0.4f)
                     .fillMaxHeight()
+                    .padding(start = verticalBar.calculateStartPadding(layoutDirection))
                     .padding(24.dp),
                 contentAlignment = Alignment.Center,
             ) {
@@ -410,6 +420,7 @@ private fun LegacyTabletStreamsLayout(
                 modifier = Modifier
                     .weight(0.6f)
                     .fillMaxHeight()
+                    .padding(end = verticalBar.calculateEndPadding(layoutDirection))
                     .padding(
                         top = if (isIos) platformPhysicalTopInset() + 60.dp else 60.dp,
                         end = 12.dp,
@@ -426,42 +437,44 @@ private fun LegacyTabletStreamsLayout(
                         }
                         .background(Color.Black.copy(alpha = 0.36f)),
                 ) {
-                    Column(
-                        modifier = Modifier
-                            .fillMaxSize()
-                            .padding(16.dp),
-                    ) {
-                        if ((resumePositionMs != null && resumePositionMs > 0L) || (resumeProgressFraction != null && resumeProgressFraction > 0f)) {
-                            ResumeBanner(
-                                positionMs = resumePositionMs,
-                                progressFraction = resumeProgressFraction,
-                                modifier = Modifier.padding(bottom = 8.dp),
+                    CompositionLocalProvider(LocalOnBackdrop provides true) {
+                        Column(
+                            modifier = Modifier
+                                .fillMaxSize()
+                                .padding(16.dp),
+                        ) {
+                            if ((resumePositionMs != null && resumePositionMs > 0L) || (resumeProgressFraction != null && resumeProgressFraction > 0f)) {
+                                ResumeBanner(
+                                    positionMs = resumePositionMs,
+                                    progressFraction = resumeProgressFraction,
+                                    modifier = Modifier.padding(bottom = 8.dp),
+                                )
+                            }
+
+                            ProviderFilterRow(
+                                groups = uiState.groups,
+                                selectedFilter = uiState.selectedFilter,
+                                onFilterSelected = { addonId -> StreamsRepository.selectFilter(addonId) },
+                                onRefresh = onRefresh,
+                            )
+
+                            ActiveScrapersStatusBlock(
+                                groups = uiState.groups,
+                                modifier = Modifier.padding(bottom = 4.dp),
+                            )
+
+                            StreamList(
+                                uiState = uiState,
+                                debridEnabled = debridEnabled,
+                                appendInstantServiceToDefaultName = appendInstantServiceToDefaultName,
+                                onStreamSelected = onStreamSelected,
+                                onStreamLongPress = onStreamLongPress,
+                                onStreamSecondaryClick = onStreamSecondaryClick,
+                                resumePositionMs = resumePositionMs,
+                                resumeProgressFraction = resumeProgressFraction,
+                                modifier = Modifier.weight(1f),
                             )
                         }
-
-                        ProviderFilterRow(
-                            groups = uiState.groups,
-                            selectedFilter = uiState.selectedFilter,
-                            onFilterSelected = { addonId -> StreamsRepository.selectFilter(addonId) },
-                            onRefresh = onRefresh,
-                        )
-
-                        ActiveScrapersStatusBlock(
-                            groups = uiState.groups,
-                            modifier = Modifier.padding(bottom = 4.dp),
-                        )
-
-                        StreamList(
-                            uiState = uiState,
-                            debridEnabled = debridEnabled,
-                            appendInstantServiceToDefaultName = appendInstantServiceToDefaultName,
-                            onStreamSelected = onStreamSelected,
-                            onStreamLongPress = onStreamLongPress,
-                            onStreamSecondaryClick = onStreamSecondaryClick,
-                            resumePositionMs = resumePositionMs,
-                            resumeProgressFraction = resumeProgressFraction,
-                            modifier = Modifier.weight(1f),
-                        )
                     }
                 }
             }
@@ -579,7 +592,9 @@ private fun TabletEpisodeInfoPanel(
                 Res.string.streams_episode_title_with_name,
                 seasonNumber,
                 episodeNumber,
-                episodeTitle?.takeIf { it.isNotBlank() } ?: stringResource(Res.string.streams_episode_fallback_title),
+                localizedEpisodeTitle(episodeTitle, episodeNumber)
+                    ?: episodeTitle?.takeIf { it.isNotBlank() }
+                    ?: stringResource(Res.string.streams_episode_fallback_title),
             ),
             style = MaterialTheme.typography.bodyLarge.copy(
                 fontSize = 16.sp,

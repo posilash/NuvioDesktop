@@ -1,5 +1,6 @@
 package com.nuvio.app.features.details.components
 
+import com.nuvio.app.core.ui.NuvioDesktopAnimation
 import androidx.compose.animation.AnimatedContent
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
@@ -51,6 +52,7 @@ import androidx.compose.ui.graphics.graphicsLayer
 import com.nuvio.app.core.ui.NuvioDesktopImageScaling
 import com.nuvio.app.core.ui.NuvioAsyncImage as AsyncImage
 import com.nuvio.app.core.ui.desktopPageHorizontalPaddingForWidth
+import com.nuvio.app.core.ui.featherArtwork
 import com.nuvio.app.core.ui.heroStretchHeight
 import com.nuvio.app.core.ui.heroStretchZoom
 import com.nuvio.app.features.details.MetaDetails
@@ -58,6 +60,8 @@ import com.nuvio.app.features.tmdb.originalTmdbImageUrl
 import com.nuvio.app.isDesktop
 import nuvio.composeapp.generated.resources.*
 import org.jetbrains.compose.resources.stringResource
+import com.nuvio.app.core.ui.LocalVerticalBarPadding
+import com.nuvio.app.core.ui.verticalBarWidth
 
 @Composable
 fun DetailHero(
@@ -74,6 +78,7 @@ fun DetailHero(
     heroTrailerPlayWhenReady: () -> Boolean = { false },
     heroTrailerMuted: Boolean = true,
     heroGradientColor: Color? = null,
+    cinematicBackground: Boolean = false,
     onBackdropLoaded: (Painter, ImageBitmap?) -> Unit = { _, _ -> },
     onHeroTrailerMuteToggle: () -> Unit = {},
     onHeroTrailerReady: () -> Unit = {},
@@ -84,7 +89,7 @@ fun DetailHero(
     BoxWithConstraints(
         modifier = modifier.fillMaxWidth(),
     ) {
-        val heroHeight = detailHeroHeight(maxWidth, viewportHeight, isTablet)
+        val heroHeight = detailHeroHeight(maxWidth - verticalBarWidth(), viewportHeight, isTablet)
         val foregroundHorizontalPadding = if (isDesktop) {
             desktopPageHorizontalPaddingForWidth(maxWidth.value)
         } else if (isTablet) {
@@ -123,60 +128,69 @@ fun DetailHero(
                     .fillMaxSize(),
                 contentAlignment = Alignment.BottomCenter,
             ) {
-                val imageUrl = meta.background ?: meta.poster
-                val backdropScale = if (isTablet) 1f else 1.08f
-                if (imageUrl != null) {
-                    AsyncImage(
-                        model = if (isDesktop) originalTmdbImageUrl(imageUrl) else imageUrl,
-                        contentDescription = meta.name,
-                        modifier = Modifier
-                            .align(Alignment.TopCenter)
-                            .fillMaxWidth()
-                            .height(heroHeight)
-                            .heroStretchZoom(stretchPx)
-                            .graphicsLayer {
-                                translationY = scrollOffset() * 0.5f
-                                scaleX = backdropScale
-                                scaleY = backdropScale
+                Box(
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .then(if (cinematicBackground) Modifier.featherArtwork() else Modifier),
+                ) {
+                    val imageUrl = meta.background ?: meta.poster
+                    val backdropScale = if (isTablet) 1f else 1.08f
+                    if (imageUrl != null) {
+                        AsyncImage(
+                            model = if (isDesktop) originalTmdbImageUrl(imageUrl) else imageUrl,
+                            contentDescription = meta.name,
+                            desktopAnimation = NuvioDesktopAnimation.Always,
+                            modifier = Modifier
+                                .align(Alignment.TopCenter)
+                                .fillMaxWidth()
+                                .height(heroHeight)
+                                .heroStretchZoom(stretchPx)
+                                .graphicsLayer {
+                                    translationY = scrollOffset() * 0.5f
+                                    scaleX = backdropScale
+                                    scaleY = backdropScale
+                                },
+                            alignment = if (isTablet) Alignment.TopCenter else Alignment.Center,
+                            contentScale = ContentScale.Crop,
+                            desktopImageScaling = NuvioDesktopImageScaling.Disabled,
+                            onSuccess = { state ->
+                                onBackdropLoaded(
+                                    state.painter,
+                                    loadedBackdropImageBitmap(state.result),
+                                )
                             },
-                        alignment = if (isTablet) Alignment.TopCenter else Alignment.Center,
-                        contentScale = ContentScale.Crop,
-                        desktopImageScaling = NuvioDesktopImageScaling.Disabled,
-                        onSuccess = { state ->
-                            onBackdropLoaded(
-                                state.painter,
-                                loadedBackdropImageBitmap(state.result),
-                            )
-                        },
-                    )
-                } else {
-                    Box(
-                        modifier = Modifier
-                            .fillMaxSize()
-                            .background(MaterialTheme.colorScheme.surface),
-                    )
+                        )
+                    } else {
+                        Box(
+                            modifier = Modifier
+                                .fillMaxSize()
+                                .background(MaterialTheme.colorScheme.surface),
+                        )
+                    }
+                    if (heroTrailerSourceUrl != null) {
+                        HeroTrailerPlayerSurface(
+                            sourceUrl = heroTrailerSourceUrl,
+                            sourceAudioUrl = heroTrailerSourceAudioUrl,
+                            playWhenReady = heroTrailerPlayWhenReady(),
+                            muted = heroTrailerMuted,
+                            modifier = Modifier
+                                .align(Alignment.TopCenter)
+                                .fillMaxWidth()
+                                .height(heroHeight)
+                                .heroStretchZoom(stretchPx)
+                                .graphicsLayer {
+                                    alpha = trailerAlpha
+                                    translationY = scrollOffset() * 0.5f
+                                    scaleX = backdropScale
+                                    scaleY = backdropScale
+                                },
+                            onReady = onHeroTrailerReady,
+                            onEnded = onHeroTrailerEnded,
+                            onError = onHeroTrailerError,
+                        )
+                    }
                 }
                 if (heroTrailerSourceUrl != null) {
-                    HeroTrailerPlayerSurface(
-                        sourceUrl = heroTrailerSourceUrl,
-                        sourceAudioUrl = heroTrailerSourceAudioUrl,
-                        playWhenReady = heroTrailerPlayWhenReady(),
-                        muted = heroTrailerMuted,
-                        modifier = Modifier
-                            .align(Alignment.TopCenter)
-                            .fillMaxWidth()
-                            .height(heroHeight)
-                            .heroStretchZoom(stretchPx)
-                            .graphicsLayer {
-                                alpha = trailerAlpha
-                                translationY = scrollOffset() * 0.5f
-                                scaleX = backdropScale
-                                scaleY = backdropScale
-                            },
-                        onReady = onHeroTrailerReady,
-                        onEnded = onHeroTrailerEnded,
-                        onError = onHeroTrailerError,
-                    )
                     Box(
                         modifier = Modifier
                             .fillMaxSize()
@@ -191,6 +205,7 @@ fun DetailHero(
                         targetState = heroTrailerMuted,
                         modifier = Modifier
                             .align(Alignment.TopEnd)
+                            .padding(LocalVerticalBarPadding.current)
                             .padding(
                                 top = heroChromeTopPadding,
                                 end = if (isDesktop) foregroundHorizontalPadding else if (isTablet) 32.dp else 22.dp,
@@ -218,25 +233,27 @@ fun DetailHero(
                     }
                 }
 
-                Box(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .height(if (isTablet) 360.dp else 320.dp)
-                        .align(Alignment.BottomCenter)
-                        .background(
-                            Brush.verticalGradient(
-                                colorStops = arrayOf(
-                                    0.00f to Color.Transparent,
-                                    0.16f to bottomGradientColor.copy(alpha = 0.04f),
-                                    0.32f to bottomGradientColor.copy(alpha = 0.14f),
-                                    0.50f to bottomGradientColor.copy(alpha = 0.34f),
-                                    0.68f to bottomGradientColor.copy(alpha = 0.62f),
-                                    0.84f to bottomGradientColor.copy(alpha = 0.84f),
-                                    1.00f to bottomGradientColor,
+                if (!cinematicBackground) {
+                    Box(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .height(if (isTablet) 360.dp else 320.dp)
+                            .align(Alignment.BottomCenter)
+                            .background(
+                                Brush.verticalGradient(
+                                    colorStops = arrayOf(
+                                        0.00f to Color.Transparent,
+                                        0.16f to bottomGradientColor.copy(alpha = 0.04f),
+                                        0.32f to bottomGradientColor.copy(alpha = 0.14f),
+                                        0.50f to bottomGradientColor.copy(alpha = 0.34f),
+                                        0.68f to bottomGradientColor.copy(alpha = 0.62f),
+                                        0.84f to bottomGradientColor.copy(alpha = 0.84f),
+                                        1.00f to bottomGradientColor,
+                                    ),
                                 ),
                             ),
-                        ),
-                )
+                    )
+                }
 
                 Column(
                     modifier = Modifier

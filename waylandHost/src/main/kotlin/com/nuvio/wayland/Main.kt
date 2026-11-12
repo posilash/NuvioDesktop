@@ -704,7 +704,10 @@ fun main(args: Array<String>) {
             }
             println("content: player smoke harness")
         } else {
-            scene.setContent { com.nuvio.app.App() }
+            scene.setContent {
+                com.nuvio.app.core.ui.DesktopBackDispatcher.Install()
+                com.nuvio.app.App()
+            }
             println("content: real Nuvio app")
         }
     } else {

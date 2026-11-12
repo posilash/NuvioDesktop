@@ -8,23 +8,27 @@ import androidx.compose.animation.fadeOut
 import androidx.compose.animation.shrinkVertically
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.Image
+import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.FlowRow
+import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.getValue
 import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -88,15 +92,21 @@ fun DetailMetaInfo(
         val ageBadge = meta.ageRating?.trim()?.takeIf { it.isNotBlank() }
         val validImdbRating = meta.imdbRating
             ?.takeIf { showOverallRatings && !isMdbListActive }
-            ?.takeIf { raw -> raw.toDoubleOrNull()?.let { it > 0.0 } == true }
+            ?.toDoubleOrNull()
+            ?.takeIf { it > 0.0 }
+            ?.let(::formatOneDecimal)
+        val ratingMedia = remember(meta) { meta.ratingReference() }
+        val ratingState by rememberRatingState(ratingMedia)
         val hasMetaRow = releaseLine != null ||
             runtimeText != null ||
             ageBadge != null ||
-            validImdbRating != null
+            validImdbRating != null ||
+            ratingState.isAvailable
         if (hasMetaRow) {
-            Row(
-                verticalAlignment = Alignment.CenterVertically,
+            FlowRow(
                 horizontalArrangement = Arrangement.spacedBy(14.dp),
+                verticalArrangement = Arrangement.spacedBy(8.dp),
+                itemVerticalAlignment = Alignment.CenterVertically,
             ) {
                 releaseLine?.let { line ->
                     Text(
@@ -125,10 +135,7 @@ fun DetailMetaInfo(
                     Row(
                         verticalAlignment = Alignment.CenterVertically,
                     ) {
-                        ImdbRatingSourceLabel(
-                            storeTextStyle = imdbTextStyle,
-                            storeTextColor = MaterialTheme.colorScheme.onSurfaceVariant,
-                        )
+                        ImdbRatingSourceLabel(storeTextStyle = imdbTextStyle)
                         Spacer(modifier = Modifier.width(5.dp))
                         Text(
                             text = validImdbRating,
@@ -136,6 +143,13 @@ fun DetailMetaInfo(
                             color = ImdbYellow,
                         )
                     }
+                }
+                if (ratingState.isAvailable) {
+                    DetailRating(
+                        media = ratingMedia,
+                        title = meta.name,
+                        state = ratingState,
+                    )
                 }
             }
         }
@@ -181,23 +195,36 @@ internal fun DetailRatingsRow(
     modifier: Modifier = Modifier,
     horizontalScrollPadding: Dp = 0.dp,
 ) {
-    val orderedRatings = remember(ratings) {
-        val bySource = ratings.associateBy { it.source }
-        ratingVisuals.mapNotNull { visuals ->
-            bySource[visuals.source]?.let { rating -> visuals to rating }
-        }
-    }
-
-    if (orderedRatings.isEmpty()) return
     val scrollState = rememberScrollState()
 
-    Row(
+    RatingsRow(
+        ratings = ratings,
         modifier = modifier
             .nuvioHorizontalScrollBleed(horizontalScrollPadding)
             .fillMaxWidth()
             .nuvioDesktopDragScroll(scrollState)
             .horizontalScroll(scrollState)
             .padding(horizontal = horizontalScrollPadding),
+    )
+}
+
+@Composable
+internal fun RatingsRow(
+    ratings: List<MetaExternalRating>,
+    modifier: Modifier = Modifier,
+    maxItems: Int = Int.MAX_VALUE,
+) {
+    val orderedRatings = remember(ratings, maxItems) {
+        val bySource = ratings.associateBy { it.source }
+        ratingVisuals.mapNotNull { visuals ->
+            bySource[visuals.source]?.let { rating -> visuals to rating }
+        }.take(maxItems)
+    }
+
+    if (orderedRatings.isEmpty()) return
+
+    Row(
+        modifier = modifier,
         verticalAlignment = Alignment.CenterVertically,
         horizontalArrangement = Arrangement.spacedBy(14.dp),
     ) {
@@ -210,10 +237,7 @@ internal fun DetailRatingsRow(
                 verticalAlignment = Alignment.CenterVertically,
             ) {
                 if (visuals.source == PROVIDER_IMDB && !AppFeaturePolicy.imdbRatingLogoEnabled) {
-                    ImdbRatingSourceLabel(
-                        storeTextStyle = ratingTextStyle,
-                        storeTextColor = visuals.valueColor,
-                    )
+                    ImdbRatingSourceLabel(storeTextStyle = ratingTextStyle)
                 } else {
                     val logoHeight = when (rating.rottenTomatoesStatus) {
                         RottenTomatoesStatus.CERTIFIED_FRESH, RottenTomatoesStatus.VERIFIED_HOT -> 24.dp
@@ -239,32 +263,14 @@ internal fun DetailRatingsRow(
 @Composable
 internal fun ImdbRatingSourceLabel(
     storeTextStyle: TextStyle,
-    storeTextColor: Color,
+    storeTextColor: Color = MaterialTheme.colorScheme.onSurfaceVariant,
 ) {
     if (AppFeaturePolicy.imdbRatingLogoEnabled) {
-        if (isDesktop) {
-            Image(
-                painter = painterResource(Res.drawable.rating_imdb),
-                contentDescription = stringResource(Res.string.source_imdb),
-                modifier = Modifier.size(width = 30.dp, height = 16.dp),
-            )
-        } else {
-            Surface(
-                shape = RoundedCornerShape(4.dp),
-                color = ImdbYellow,
-            ) {
-                Text(
-                    text = stringResource(Res.string.source_imdb),
-                    modifier = Modifier.padding(horizontal = 4.dp, vertical = 2.dp),
-                    style = MaterialTheme.typography.labelMedium.copy(
-                        fontSize = 10.sp,
-                        fontWeight = FontWeight.Black,
-                        letterSpacing = 0.sp,
-                    ),
-                    color = ImdbBlack,
-                )
-            }
-        }
+        Image(
+            painter = painterResource(Res.drawable.rating_imdb),
+            contentDescription = stringResource(Res.string.source_imdb),
+            modifier = Modifier.size(width = 30.dp, height = 16.dp),
+        )
     } else {
         Text(
             text = stringResource(Res.string.source_imdb),
@@ -299,28 +305,47 @@ internal fun MetaLabelValueRow(
 internal fun DetailHeroMetaBadge(
     text: String,
     contentColor: Color = MaterialTheme.colorScheme.onSurfaceVariant,
+    secondaryText: String? = null,
 ) {
-    Box(
+    val borderColor = contentColor.copy(alpha = 0.55f)
+    Row(
         modifier = Modifier
-            .border(
-                border = BorderStroke(1.dp, contentColor.copy(alpha = 0.55f)),
-                shape = RoundedCornerShape(6.dp),
-            )
-            .padding(horizontal = 8.dp, vertical = 4.dp),
-        contentAlignment = Alignment.Center,
+            .border(BorderStroke(1.dp, borderColor), MetaBadgeShape)
+            .padding(MetaBadgePadding),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(8.dp),
     ) {
-        Text(
-            text = text,
-            style = MaterialTheme.typography.labelMedium,
-            color = contentColor,
-            maxLines = 1,
-            overflow = TextOverflow.Ellipsis,
-        )
+        MetaBadgeText(text = text, color = contentColor)
+        secondaryText?.let { secondary ->
+            Box(
+                modifier = Modifier
+                    .width(1.dp)
+                    .height(12.dp)
+                    .background(borderColor),
+            )
+            MetaBadgeText(text = secondary, color = contentColor)
+        }
     }
 }
 
+internal val MetaBadgeShape = RoundedCornerShape(6.dp)
+internal val MetaBadgePadding = PaddingValues(horizontal = 8.dp, vertical = 4.dp)
+
+@Composable
+private fun MetaBadgeText(
+    text: String,
+    color: Color,
+) {
+    Text(
+        text = text,
+        style = MaterialTheme.typography.labelMedium,
+        color = color,
+        maxLines = 1,
+        overflow = TextOverflow.Ellipsis,
+    )
+}
+
 internal val ImdbYellow = Color(0xFFF5C518)
-private val ImdbBlack = Color(0xFF000000)
 
 private data class RatingVisuals(
     val source: String,
@@ -409,7 +434,7 @@ private val ratingVisuals = listOf(
     ),
 )
 
-private fun formatOneDecimal(value: Double): String {
+internal fun formatOneDecimal(value: Double): String {
     val rounded = (value * 10.0).roundToInt()
     val whole = rounded / 10
     val decimal = (rounded % 10).absoluteValue

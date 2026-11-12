@@ -19,6 +19,8 @@ interface NuvioPlayerBridge {
     fun pause()
     fun seekTo(positionMs: Long)
     fun seekBy(offsetMs: Long)
+    fun setSystemControlHandler(handler: PlayerSystemControlHandler?)
+    fun getKeepsPlaybackInBackground(): Boolean
     fun retry()
     fun updateNowPlayingMetadata(
         title: String,
@@ -62,9 +64,15 @@ interface NuvioPlayerBridge {
     fun applyAudioLanguagePreferences(languages: List<String>)
     fun selectSubtitleTrack(trackId: Int)
     fun setSubtitleUrl(url: String)
+    /**
+     * Loads the local subtitle file at [path] in place of the external track loaded from
+     * [replacedUrl], keeping that track's title and language. Earlier AutoSync copies are dropped.
+     */
+    fun replaceExternalSubtitle(replacedUrl: String, path: String)
     fun clearExternalSubtitle()
     fun clearExternalSubtitleAndSelect(trackId: Int)
     fun setSubtitleDelayMs(delayMs: Int)
+    fun setSubtitleTextHandler(handler: SubtitleTextHandler?)
     fun applySubtitleStyle(
         textColor: String,
         backgroundColor: String,
@@ -74,6 +82,7 @@ interface NuvioPlayerBridge {
         fontSize: Float,
         subPos: Int,
         stripSdh: Boolean,
+        styledOverlay: Boolean,
     )
     fun getIsLoading(): Boolean
     fun getIsPlaying(): Boolean
@@ -85,6 +94,10 @@ interface NuvioPlayerBridge {
     fun getErrorMessage(): String
     fun getProperty(name: String): String
     fun destroy()
+}
+
+fun interface SubtitleTextHandler {
+    fun onTextChanged(text: String)
 }
 
 /**

@@ -1,5 +1,6 @@
 package com.nuvio.app.features.details.components
 
+import com.nuvio.app.core.ui.rememberAnimatedArtworkAnimation
 import androidx.compose.animation.AnimatedContent
 import androidx.compose.animation.Crossfade
 import androidx.compose.animation.animateContentSize
@@ -67,6 +68,7 @@ import com.nuvio.app.core.i18n.localizedSeasonEpisodeCode
 import com.nuvio.app.core.ui.NuvioAnimatedWatchedBadge
 import com.nuvio.app.core.ui.NuvioCardDepthSurface
 import com.nuvio.app.core.ui.NuvioProgressBar
+import com.nuvio.app.core.ui.backdropControlColor
 import com.nuvio.app.core.ui.nuvioCardDepth
 import com.nuvio.app.core.ui.nuvioDesktopDragScroll
 import com.nuvio.app.core.ui.nuvioHorizontalScrollBleed
@@ -93,6 +95,7 @@ import org.jetbrains.compose.resources.painterResource
 import org.jetbrains.compose.resources.stringResource
 import kotlin.math.absoluteValue
 import kotlin.math.roundToInt
+import com.nuvio.app.core.i18n.localizedEpisodeTitle
 
 private val log = Logger.withTag("SeriesContent")
 
@@ -530,7 +533,7 @@ private fun SeasonTextChipScrollRow(
                     .clip(RoundedCornerShape(sizing.seasonChipRadius))
                     .background(
                         if (isSelected) {
-                            MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.6f)
+                            backdropControlColor(MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.6f))
                         } else {
                             Color.Transparent
                         },
@@ -844,6 +847,7 @@ private fun EpisodeHorizontalCard(
                     .fillMaxSize()
                     .then(if (shouldBlurArtwork) Modifier.blur(18.dp) else Modifier),
                 contentScale = ContentScale.Crop,
+                desktopAnimation = rememberAnimatedArtworkAnimation(),
             )
         }
 
@@ -869,6 +873,13 @@ private fun EpisodeHorizontalCard(
                 .padding(metrics.contentPadding),
         )
 
+        EpisodeAvailabilityBadge(
+            video = video,
+            modifier = Modifier
+                .align(if (isWatched) Alignment.TopStart else Alignment.TopEnd)
+                .padding(metrics.contentPadding),
+        )
+
         Column(
             modifier = Modifier
                 .align(Alignment.BottomStart)
@@ -891,7 +902,7 @@ private fun EpisodeHorizontalCard(
             )
 
             Text(
-                text = video.title,
+                text = localizedEpisodeTitle(video.title, video.episode) ?: video.title,
                 style = MaterialTheme.typography.titleMedium.copy(
                     fontSize = metrics.titleTextSize,
                     fontWeight = FontWeight.ExtraBold,
@@ -1232,6 +1243,7 @@ private fun EpisodeListCard(
                             .fillMaxSize()
                             .then(if (shouldBlurArtwork) Modifier.blur(18.dp) else Modifier),
                         contentScale = ContentScale.Crop,
+                        desktopAnimation = rememberAnimatedArtworkAnimation(),
                     )
                 } else {
                     Box(
@@ -1259,6 +1271,21 @@ private fun EpisodeListCard(
                         .align(Alignment.TopEnd)
                         .padding(8.dp),
                 )
+
+                EpisodeAvailabilityBadge(
+                    video = video,
+                    modifier = Modifier
+                        .align(Alignment.BottomStart)
+                        .padding(
+                            start = 8.dp,
+                            end = 8.dp,
+                            bottom = if (progressEntry != null && progressEntry.durationMs > 0L && !progressEntry.isCompleted) {
+                                24.dp
+                            } else {
+                                8.dp
+                            },
+                        ),
+                )
             }
 
             Column(
@@ -1274,7 +1301,7 @@ private fun EpisodeListCard(
                 verticalArrangement = Arrangement.spacedBy(sizing.contentSpacing),
             ) {
                 Text(
-                    text = video.title,
+                    text = localizedEpisodeTitle(video.title, video.episode) ?: video.title,
                     style = MaterialTheme.typography.titleMedium.copy(
                         fontSize = sizing.titleTextSize,
                         fontWeight = FontWeight.Bold,
