@@ -615,6 +615,9 @@ class WaylandVideoHost(
         mpv.setProperty("sub-delay", (delayMs / 1000.0).toString())
     }
 
+    override fun property(name: String): String? = mpv.getProperty(name)
+    override fun setProperty(name: String, value: String) = mpv.setProperty(name, value)
+
     override fun setResizeMode(mode: com.nuvio.app.features.player.PlayerResizeMode) {
         // Same mapping as the stock bridges: Fill and Zoom both crop, only
         // Stretch drops the aspect ratio.

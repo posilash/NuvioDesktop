@@ -1214,7 +1214,7 @@ private fun resolveTrackId(index: Int, tracks: List<NativeMpvTrack>): Int? =
         }
     } ?: tracks.getOrNull(index)?.id?.toIntOrNull()
 
-private fun Color.toMpvColorString(): String {
+internal fun Color.toMpvColorString(): String {
     val alphaInt = (alpha * 255f).toInt().coerceIn(0, 255)
     val redInt = (red * 255f).toInt().coerceIn(0, 255)
     val greenInt = (green * 255f).toInt().coerceIn(0, 255)
@@ -1228,13 +1228,13 @@ private fun Color.toMpvColorString(): String {
     }
 }
 
-private fun SubtitleStyleState.toMpvSubtitlePosition(): Int =
+internal fun SubtitleStyleState.toMpvSubtitlePosition(): Int =
     (100 - (bottomOffset / 2)).coerceIn(0, 150)
 
-private fun SubtitleStyleState.toMpvSubtitleFontSize(): Float =
+internal fun SubtitleStyleState.toMpvSubtitleFontSize(): Float =
     (fontSizeSp * 3f).coerceIn(18f, 96f)
 
-private fun Int.toHexByte(): String {
+internal fun Int.toHexByte(): String {
     val digits = "0123456789ABCDEF"
     val value = coerceIn(0, 255)
     return buildString {

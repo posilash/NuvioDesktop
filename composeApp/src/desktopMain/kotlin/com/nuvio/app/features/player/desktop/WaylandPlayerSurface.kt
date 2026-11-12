@@ -10,15 +10,26 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.getValue
 import androidx.compose.ui.Modifier
+import com.nuvio.app.features.autosync.AutoSyncMpvCoordinator
+import com.nuvio.app.features.autosync.DesktopAutoSyncMpvPlatform
+import com.nuvio.app.features.autosync.withAutoSyncMessage
 import com.nuvio.app.features.player.AudioTrack
+import com.nuvio.app.features.player.sanitizePlaybackHeaders
+import com.nuvio.app.features.player.PlayerChapter
+import com.nuvio.app.features.player.PlayerMediaInfo
+import com.nuvio.app.features.player.PlayerSettingsRepository
+import com.nuvio.app.features.player.mpvMediaInfo
 import com.nuvio.app.features.player.PlayerEngineController
 import com.nuvio.app.features.player.PlayerPlaybackSnapshot
 import com.nuvio.app.features.player.PlayerResizeMode
+import com.nuvio.app.features.player.SubtitleFontResolver
 import com.nuvio.app.features.player.SubtitleStyleState
 import com.nuvio.app.features.player.SubtitleTrack
 import com.nuvio.app.features.player.findPreferredAudioTrackIndex
@@ -60,6 +71,35 @@ internal fun WaylandPlayerSurface(
     var imagesReady by remember { mutableIntStateOf(0) }
     val onImageReady: () -> Unit = { imagesReady++ }
 
+    // AutoSync of external subtitles, wired as stock's NativePlayerSurface
+    // does: it wraps the controller, and its messages ride the chrome's own
+    // notification, since a toast from the scene would sit under the chrome.
+    val latestExternalSubtitles = rememberUpdatedState(externalSubtitles)
+    val latestPlayerControlsState = rememberUpdatedState(playerControlsState)
+    val autoSyncScope = rememberCoroutineScope()
+    val autoSyncPlatform = remember {
+        DesktopAutoSyncMpvPlatform(
+            currentNotificationToken = { latestPlayerControlsState.value.notificationToken },
+        )
+    }
+    val playbackHeaders = remember(sourceHeaders) { sanitizePlaybackHeaders(sourceHeaders) }
+    val autoSyncCoordinator = remember(sourceUrl, playbackHeaders, autoSyncScope) {
+        AutoSyncMpvCoordinator(
+            scope = autoSyncScope,
+            sourceUrl = sourceUrl,
+            sourceHeaders = playbackHeaders,
+            getSubtitleHeaders = { subtitleUrl ->
+                latestExternalSubtitles.value.firstOrNull { it.url == subtitleUrl }?.headers.orEmpty()
+            },
+            getPreferredLanguage = { PlayerSettingsRepository.uiState.value.preferredSubtitleLanguage },
+            platform = autoSyncPlatform,
+        )
+    }
+    DisposableEffect(autoSyncCoordinator) {
+        onDispose { autoSyncCoordinator.dispose() }
+    }
+    val controlsState = playerControlsState.withAutoSyncMessage(autoSyncPlatform.message)
+
     if (bridge == null) {
         // Should not happen: PlatformPlayerSurface only routes here when a
         // delegate is installed. Fail loudly rather than showing a black box.
@@ -93,7 +133,7 @@ internal fun WaylandPlayerSurface(
         // effect below re-pushes the identical payload a dispatch later,
         // which is a no-op for the page but keeps the dedup honest.
         if (WaylandVideoBridge.webChromeActive) {
-            bridge.pushControlsJson(playerControlsState.withVolume(bridge).toControlsJson(fullscreenNow, onImageReady))
+            bridge.pushControlsJson(controlsState.withVolume(bridge).toControlsJson(fullscreenNow, onImageReady))
         }
         // The runtime tracks whether the resume position was actually applied
         // and re-requests it until told. open() passed it to mpv above.
@@ -107,6 +147,10 @@ internal fun WaylandPlayerSurface(
     }
 
     val controller = remember(bridge) { WaylandPlayerController(bridge) }
+    val readyController = remember(controller, autoSyncCoordinator) {
+        // setSubtitleUri replaces the external subtitles, so the retimed copy takes the original's place.
+        autoSyncCoordinator.wrap(controller) { _, path -> controller.setSubtitleUri(path) }
+    }
     LaunchedEffect(sourceUrl) {
         // Deliberately asynchronous, not in the DisposableEffect above: the
         // player runtime resets its controller from a source-keyed
@@ -117,7 +161,7 @@ internal fun WaylandPlayerSurface(
         // controller while playback runs fine. Runtime effects launch first
         // (they compose first), so delivering from a coroutine here orders
         // this after the reset.
-        onControllerReady(controller)
+        onControllerReady(readyController)
         var lastError: String? = null
         var lastPushed: PlayerPlaybackSnapshot? = null
         while (true) {
@@ -205,7 +249,7 @@ internal fun WaylandPlayerSurface(
         // sets volumeLevel -- it is the platform's to report -- so keying off
         // the raw state means the key never moves when the volume does, and
         // the page keeps whatever number it was first told.
-        val stateWithVolume = playerControlsState.withVolume(bridge)
+        val stateWithVolume = controlsState.withVolume(bridge)
         val structureKey = stateWithVolume.nativeControlsStructureKey()
         LaunchedEffect(structureKey, isFullscreen, imagesReady) {
             bridge.pushControlsJson(stateWithVolume.toControlsJson(isFullscreen, onImageReady))
@@ -316,9 +360,12 @@ private class WaylandPlayerController(
         bridge.selectAudioTrack(id)
     }
 
-    // Same matching as the stock controller: the first preference any track
+    // Same as the stock controller: mpv gets the languages too, so its own
+    // pick covers untagged tracks; then the first preference any track
     // satisfies wins, by exact language or a regional variant of it.
     override fun applyAudioLanguagePreferences(languages: List<String>) {
+        bridge.setProperty("alang", languages.joinToString(","))
+        bridge.setProperty("aid", "auto")
         val index = findPreferredAudioTrackIndex(getAudioTracks(), languages)
         if (index >= 0) selectAudioTrack(index)
     }
@@ -336,10 +383,54 @@ private class WaylandPlayerController(
         selectSubtitleTrack(trackIndex)
     }
 
-    // Subtitle styling comes from the user's own mpv.conf, which the host
-    // loads; the app's style panel is not mapped onto it.
-    override fun applySubtitleStyle(style: SubtitleStyleState, useLibass: Boolean) {}
+    // The same properties stock's Linux bridge sets (applySubtitleStyle and
+    // setSubtitleAppearance in player_bridge.cpp). They override the user's
+    // mpv.conf styling whenever the style panel applies.
+    override fun applySubtitleStyle(style: SubtitleStyleState, useLibass: Boolean) {
+        val background = style.backgroundColor.toMpvColorString()
+        bridge.setProperty("sub-ass-override", "scale")
+        bridge.setProperty("sub-color", style.textColor.toMpvColorString())
+        bridge.setProperty("sub-border-color", style.outlineColor.toMpvColorString())
+        bridge.setProperty("sub-back-color", background)
+        bridge.setProperty(
+            "sub-border-style",
+            if (background.startsWith("#00")) "outline-and-shadow" else "background-box",
+        )
+        bridge.setProperty("sub-border-size", (if (style.outlineEnabled) style.outlineWidth.toFloat() else 0f).toString())
+        bridge.setProperty("sub-bold", if (style.bold) "yes" else "no")
+        bridge.setProperty("sub-font-size", style.toMpvSubtitleFontSize().toString())
+        bridge.setProperty("sub-pos", style.toMpvSubtitlePosition().toString())
+        bridge.setProperty("sub-filter-sdh", if (style.stripSdh) "yes" else "no")
+        bridge.setProperty("sub-filter-sdh-harder", if (style.stripSdh) "yes" else "no")
+        val fontsDir = SubtitleFontResolver.fontsDir()
+        if (fontsDir.isNotEmpty()) bridge.setProperty("sub-fonts-dir", fontsDir)
+        bridge.setProperty("sub-font", SubtitleFontResolver.mpvFontName(style.appearance.fontId))
+        val shadowAlpha = if (style.appearance.shadowEnabled) style.appearance.shadowOpacity * 255 / 100 else 0
+        bridge.setProperty("sub-shadow-color", "#" + shadowAlpha.toHexByte() + "000000")
+        bridge.setProperty(
+            "sub-shadow-offset",
+            (if (style.appearance.shadowEnabled) style.appearance.shadowSize.toFloat() else 0f).toString(),
+        )
+    }
     override fun setSubtitleDelayMs(delayMs: Int) = bridge.setSubtitleDelayMs(delayMs)
+
+    override fun setSubtitleVisible(visible: Boolean) =
+        bridge.setProperty("sub-visibility", if (visible) "yes" else "no")
+
+    override suspend fun getChapters(): List<PlayerChapter> {
+        if (!PlayerSettingsRepository.uiState.value.androidExoChaptersEnabled) return emptyList()
+        val count = bridge.property("chapter-list/count")?.toIntOrNull() ?: return emptyList()
+        return (0 until count).mapNotNull { index ->
+            val seconds = bridge.property("chapter-list/$index/time")?.toDoubleOrNull() ?: return@mapNotNull null
+            PlayerChapter(
+                startMs = (seconds * 1000.0).toLong(),
+                title = bridge.property("chapter-list/$index/title")?.takeIf { it.isNotBlank() },
+            )
+        }
+    }
+
+    override suspend fun getMediaInfo(): PlayerMediaInfo =
+        mpvMediaInfo { name -> bridge.property(name)?.takeIf { it.isNotBlank() } }
 }
 
 /** Stock's null-volume fill, against the Wayland bridge instead of the handle. */

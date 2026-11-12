@@ -58,6 +58,14 @@ object WaylandVideoBridge {
         fun selectSubtitleTrack(id: Int)
         fun setSubtitleDelayMs(delayMs: Int)
 
+        /**
+         * Raw mpv properties, for what stock reads and writes through its
+         * native bridge one property at a time (chapters, media info,
+         * subtitle visibility, audio languages). Null when unavailable.
+         */
+        fun property(name: String): String? = null
+        fun setProperty(name: String, value: String) {}
+
         /** Map the app's resize mode onto the video's scaling behaviour. */
         fun setResizeMode(mode: com.nuvio.app.features.player.PlayerResizeMode)
         fun stop()
